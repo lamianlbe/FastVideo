@@ -208,6 +208,30 @@ class FastVideoArgs:
     ltx2_refine_audio_noise_path: str | None = None
     ltx2_legacy_native_noise_order: bool = False
     ltx2_use_distilled_sigmas: bool = True
+    # Per-stage sigma schedule overrides. When set, these take precedence
+    # over the distilled/computed schedules. Each list must be strictly
+    # decreasing and end at 0.0 (e.g. [1.0, 0.955, ..., 0.121, 0.0]).
+    ltx2_stage1_sigmas: list[float] | None = None
+    ltx2_stage2_sigmas: list[float] | None = None
+    # Per-stage sampler. Stage 1 accepts "euler" | "euler_ancestral";
+    # stage 2 (refine) additionally accepts "euler_ancestral_cfg_pp".
+    # The ancestral formulas follow ComfyUI's rectified-flow variants
+    # (sample_euler_ancestral_RF / sample_euler_ancestral_cfg_pp) since
+    # LTX-2 is a CONST/RF model there. Note: euler_ancestral_cfg_pp runs
+    # an extra unconditional forward every step even at guidance_scale=1
+    # (matching ComfyUI's disable_cfg1_optimization behaviour).
+    ltx2_sampler: str = "euler"
+    ltx2_refine_sampler: str = "euler"
+    ltx2_sampler_eta: float = 1.0
+    ltx2_sampler_s_noise: float = 1.0
+    # Reference token conditioning (port of the ComfyUI 10s-nodes
+    # LTXReferenceEnable/Conditioning mechanism): the reference image is
+    # VAE-encoded and prepended to the video token sequence as a clean
+    # attention-level identity reference. Empty path disables it.
+    ltx2_reference_image_path: str = ""
+    ltx2_reference_strength: float = 1.0
+    ltx2_reference_position_mode: str = "reference"
+    ltx2_reference_zero_timesteps: bool = False
 
     # model paths for correct deallocation
     model_paths: dict[str, str] = field(default_factory=dict)
@@ -257,6 +281,7 @@ class FastVideoArgs:
         self._apply_ltx2_vae_overrides()
         self._resolve_refine_args()
         self._apply_transformer_quant()
+        self._validate_ltx2_sampler_args()
         self.check_fastvideo_args()
 
     def _apply_transformer_quant(self) -> None:
@@ -284,6 +309,32 @@ class FastVideoArgs:
         # the explicit setter wins.
         if getattr(dit_config, "quant_config", None) is None:
             dit_config.quant_config = tq
+
+    def _validate_ltx2_sampler_args(self) -> None:
+        for name in ("ltx2_stage1_sigmas", "ltx2_stage2_sigmas"):
+            sigmas = getattr(self, name)
+            if sigmas is None:
+                continue
+            sigmas = [float(s) for s in sigmas]
+            setattr(self, name, sigmas)
+            if len(sigmas) < 2:
+                raise ValueError(f"{name} needs at least 2 values, got {sigmas}")
+            if any(b >= a for a, b in zip(sigmas, sigmas[1:], strict=False)):
+                raise ValueError(f"{name} must be strictly decreasing, got {sigmas}")
+            if sigmas[-1] != 0.0:
+                raise ValueError(f"{name} must end at 0.0, got {sigmas}")
+            if sigmas[0] > 1.0:
+                raise ValueError(f"{name} values must be <= 1.0, got {sigmas}")
+
+        stage1_choices = ("euler", "euler_ancestral")
+        stage2_choices = ("euler", "euler_ancestral", "euler_ancestral_cfg_pp")
+        if self.ltx2_sampler not in stage1_choices:
+            raise ValueError(f"ltx2_sampler must be one of {stage1_choices}, got {self.ltx2_sampler!r}")
+        if self.ltx2_refine_sampler not in stage2_choices:
+            raise ValueError(f"ltx2_refine_sampler must be one of {stage2_choices}, got {self.ltx2_refine_sampler!r}")
+        if self.ltx2_reference_position_mode not in ("reference", "prefix_continuous"):
+            raise ValueError("ltx2_reference_position_mode must be 'reference' or 'prefix_continuous', "
+                             f"got {self.ltx2_reference_position_mode!r}")
 
     def _resolve_refine_args(self) -> None:
         """Map generic refine_* args to LTX-2-specific refine fields."""

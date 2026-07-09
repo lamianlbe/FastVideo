@@ -150,6 +150,91 @@ def _distilled_subset_sigmas(
     return subset_sigmas, list(best_indices)
 
 
+def get_ancestral_step(sigma_from: float, sigma_to: float, eta: float = 1.0) -> tuple[float, float]:
+    """ComfyUI k-diffusion ``get_ancestral_step`` (verbatim math).
+
+    Returns ``(sigma_down, sigma_up)``: the noise level to step down to and
+    the amount of fresh noise to add for an ancestral step.
+    """
+    if not eta:
+        return sigma_to, 0.0
+    sigma_up = min(sigma_to, eta * (sigma_to**2 * (sigma_from**2 - sigma_to**2) / sigma_from**2)**0.5)
+    sigma_down = (sigma_to**2 - sigma_up**2)**0.5
+    return sigma_down, sigma_up
+
+
+def euler_ancestral_rf_step(
+    x: torch.Tensor,
+    denoised: torch.Tensor,
+    sigma: float,
+    sigma_next: float,
+    *,
+    eta: float,
+    s_noise: float,
+    noise: torch.Tensor | None,
+) -> torch.Tensor:
+    """One step of ComfyUI's ``sample_euler_ancestral_RF``.
+
+    LTX-2 is a rectified-flow (CONST) model in ComfyUI terms
+    (``x_t = (1 - sigma) * x0 + sigma * noise``), so ``euler_ancestral``
+    routes to the RF variant there; these are its exact per-step formulas.
+    ``denoised`` is the x0 prediction.
+    """
+    if sigma_next == 0.0:
+        return denoised
+    downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * eta
+    sigma_down = sigma_next * downstep_ratio
+    alpha_ip1 = 1.0 - sigma_next
+    alpha_down = 1.0 - sigma_down
+    renoise_coeff = (sigma_next**2 - sigma_down**2 * alpha_ip1**2 / alpha_down**2)**0.5
+    ratio = sigma_down / sigma
+    x = ratio * x + (1.0 - ratio) * denoised
+    if eta > 0:
+        if noise is None:
+            raise ValueError("euler_ancestral_rf_step needs a noise tensor when eta > 0")
+        x = (alpha_ip1 / alpha_down) * x + noise * s_noise * renoise_coeff
+    return x
+
+
+def euler_ancestral_cfg_pp_step(
+    x: torch.Tensor,
+    denoised: torch.Tensor,
+    uncond_denoised: torch.Tensor,
+    sigma: float,
+    sigma_next: float,
+    *,
+    eta: float,
+    s_noise: float,
+    noise: torch.Tensor | None,
+) -> torch.Tensor:
+    """One step of ComfyUI's ``sample_euler_ancestral_cfg_pp`` for CONST models.
+
+    CFG++ decouples the position term (``alpha_t * denoised``, the post-CFG
+    conditional x0) from the direction term (``d`` built from the raw
+    unconditional x0). For CONST models the half-logSNR factors reduce to
+    ``alpha = 1 - sigma``. Note that ComfyUI forces the unconditional pass
+    even at cfg=1 (``disable_cfg1_optimization=True``), so this sampler is
+    never equivalent to plain euler_ancestral.
+    """
+    if sigma_next == 0.0:
+        return denoised
+    if sigma >= 1.0:
+        raise ValueError("euler_ancestral_cfg_pp is undefined at sigma >= 1.0 for rectified-flow "
+                         "models (alpha = 1 - sigma hits 0; ComfyUI silently produces inf/NaN "
+                         "there). Start the sigma schedule below 1.0, e.g. 0.99.")
+    alpha_s = 1.0 - sigma
+    alpha_t = 1.0 - sigma_next
+    d = (x - alpha_s * uncond_denoised) / sigma
+    sigma_down, sigma_up = get_ancestral_step(sigma / alpha_s, sigma_next / alpha_t, eta=eta)
+    sigma_down = alpha_t * sigma_down
+    x = alpha_t * denoised + sigma_down * d
+    if eta > 0 and s_noise > 0:
+        if noise is None:
+            raise ValueError("euler_ancestral_cfg_pp_step needs a noise tensor when eta > 0 and s_noise > 0")
+        x = x + alpha_t * noise * s_noise * sigma_up
+    return x
+
+
 class LTX2DenoisingStage(PipelineStage):
     """Run the LTX-2 denoising loop over the sigma schedule."""
 
@@ -161,6 +246,7 @@ class LTX2DenoisingStage(PipelineStage):
         num_inference_steps_override: int | None = None,
         force_guidance_scale: float | None = None,
         initial_audio_latents_key: str | None = "ltx2_audio_latents",
+        sampler: str = "euler",
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -168,6 +254,9 @@ class LTX2DenoisingStage(PipelineStage):
         self.num_inference_steps_override = num_inference_steps_override
         self.force_guidance_scale = force_guidance_scale
         self.initial_audio_latents_key = initial_audio_latents_key
+        if sampler not in ("euler", "euler_ancestral", "euler_ancestral_cfg_pp"):
+            raise ValueError(f"Unknown LTX-2 sampler {sampler!r}")
+        self.sampler = sampler
 
     def forward(
         self,
@@ -211,11 +300,22 @@ class LTX2DenoisingStage(PipelineStage):
             cfg_scale_audio = effective_guidance_scale
             use_cfg = effective_guidance_scale > 1.0
 
+        sampler = self.sampler
+        sampler_eta = float(fastvideo_args.ltx2_sampler_eta)
+        sampler_s_noise = float(fastvideo_args.ltx2_sampler_s_noise)
+        # CFG++ needs the raw unconditional x0 every step for its direction
+        # term, even at guidance_scale=1 (matching ComfyUI's
+        # disable_cfg1_optimization behaviour).
+        need_uncond = sampler == "euler_ancestral_cfg_pp"
+
         neg_prompt_embeds = None
         neg_prompt_mask = None
-        if use_cfg:
+        if use_cfg or need_uncond:
             if batch.negative_prompt_embeds is not None and batch.negative_prompt_embeds:
                 neg_prompt_embeds = batch.negative_prompt_embeds[0]
+            elif need_uncond:
+                raise ValueError("euler_ancestral_cfg_pp requires negative prompt embeddings for its "
+                                 "unconditional pass; provide a negative_prompt (an empty string works).")
             else:
                 logger.warning("[LTX2] CFG requested but negative_prompt_embeds missing; "
                                "falling back to no-CFG for this stage.")
@@ -234,13 +334,19 @@ class LTX2DenoisingStage(PipelineStage):
         target_dtype = torch.bfloat16
         autocast_enabled = (target_dtype != torch.float32) and not fastvideo_args.disable_autocast
 
-        if self.sigmas_override is not None:
+        # Stage-2 refine passes an explicit ``sigmas_override`` at
+        # construction time; stage 1 (sigmas_override=None) can be overridden
+        # by the user via ``ltx2_stage1_sigmas``.
+        sigmas_override = self.sigmas_override
+        if sigmas_override is None and fastvideo_args.ltx2_stage1_sigmas is not None:
+            sigmas_override = fastvideo_args.ltx2_stage1_sigmas
+        if sigmas_override is not None:
             sigmas = torch.tensor(
-                self.sigmas_override,
+                sigmas_override,
                 device=latents.device,
                 dtype=torch.float32,
             )
-            logger.info("[LTX2] Using override sigma schedule, %s", self.sigmas_override)
+            logger.info("[LTX2] Using override sigma schedule, %s", sigmas_override)
         else:
             # Use distilled hardcoded schedule (or subsets) when enabled.
             use_distilled_sigmas = (fastvideo_args.ltx2_use_distilled_sigmas
@@ -472,6 +578,47 @@ class LTX2DenoisingStage(PipelineStage):
                            "is unavailable; disabling VSA metadata for this run.")
         vsa_metadata_builder = (VideoSparseAttentionMetadataBuilder() if use_vsa else None)
 
+        # Reference token conditioning (attention-level identity reference):
+        # a clean reference latent is prepended to the video token sequence
+        # inside the transformer forward. Stage 1 and stage 2 carry
+        # separately-encoded latents (different resolutions).
+        ref_key = ("ltx2_reference_latent_stage2"
+                   if self.sigmas_override is not None else "ltx2_reference_latent_stage1")
+        ref_latent = batch.extra.get(ref_key)
+        extra_transformer_kwargs: dict = {}
+        if isinstance(ref_latent, torch.Tensor):
+            if wants_vsa_metadata:
+                raise ValueError("LTX-2 reference token conditioning is incompatible with "
+                                 "VIDEO_SPARSE_ATTN / SAGE_ATTN_THREE: the VSA tile grid assumes "
+                                 "seq_len == F*H*W. Use FLASH_ATTN or TORCH_SDPA instead.")
+            extra_transformer_kwargs = {
+                "ref_latent": ref_latent.to(device=latents.device, dtype=target_dtype),
+                "ref_zero_timesteps": fastvideo_args.ltx2_reference_zero_timesteps,
+                "ref_position_mode": fastvideo_args.ltx2_reference_position_mode,
+            }
+            logger.info("[LTX2] Reference token conditioning active (%s, mode=%s)", ref_key,
+                        fastvideo_args.ltx2_reference_position_mode)
+
+        # Fresh-noise generator for the ancestral samplers. Seeded with an
+        # offset so the ancestral draws don't replay the initial-latent
+        # noise stream.
+        ancestral_generator: torch.Generator | None = None
+        if sampler != "euler" and sampler_eta > 0:
+            if batch.seed is not None:
+                ancestral_generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed) + 1)
+            elif batch.generator is not None:
+                candidate = (batch.generator[0] if isinstance(batch.generator, list) else batch.generator)
+                if candidate.device.type == latents.device.type:
+                    ancestral_generator = candidate
+
+        def _ancestral_noise(like: torch.Tensor) -> torch.Tensor:
+            return torch.randn(
+                like.shape,
+                generator=ancestral_generator,
+                device=like.device,
+                dtype=torch.float32,
+            )
+
         for step_index in tqdm(range(len(sigmas) - 1)):
             sigma = sigmas[step_index]
             sigma_next = sigmas[step_index + 1]
@@ -513,41 +660,48 @@ class LTX2DenoisingStage(PipelineStage):
                         video_sigma=sigma_batch,
                         audio_sigma=sigma_batch,
                         video_position_offset_sec=video_position_offset_sec,
+                        **extra_transformer_kwargs,
                     )
                 if isinstance(pos_outputs, tuple):
                     pos_denoised, pos_audio = pos_outputs
                 else:
                     pos_denoised = pos_outputs
                     pos_audio = None
+
+                # Pass 2: unconditional (negative prompt) forward. Needed for
+                # text CFG and, independently, for CFG++'s direction term
+                # (which wants the raw unconditional x0 even at cfg=1).
+                uncond_denoised = None
+                uncond_audio = None
+                if (do_guidance and do_cfg_text) or need_uncond:
+                    with _nvtx_range("ltx2.denoise.pass.neg"):
+                        neg_outputs = self.transformer(
+                            hidden_states=latent_model_input,
+                            encoder_hidden_states=neg_prompt_embeds,
+                            encoder_attention_mask=neg_prompt_mask,
+                            timestep=timestep,
+                            audio_hidden_states=audio_latents,
+                            audio_encoder_hidden_states=audio_context_n,
+                            audio_timestep=audio_timestep,
+                            video_sigma=sigma_batch,
+                            audio_sigma=sigma_batch,
+                            video_position_offset_sec=video_position_offset_sec,
+                            **extra_transformer_kwargs,
+                        )
+                    if isinstance(neg_outputs, tuple):
+                        uncond_denoised, uncond_audio = neg_outputs
+                    else:
+                        uncond_denoised = neg_outputs
+                        uncond_audio = None
+
                 if do_guidance:
                     # Defaults: (pos - pos) = 0 under each scale.
-                    neg_denoised = pos_denoised
-                    neg_audio = pos_audio
+                    neg_denoised = (uncond_denoised if uncond_denoised is not None else pos_denoised)
+                    neg_audio = uncond_audio if uncond_audio is not None else pos_audio
                     mod_denoised = pos_denoised
                     mod_audio = pos_audio
                     ptb_denoised = pos_denoised
                     ptb_audio = pos_audio
-
-                    # Pass 2: text CFG (negative prompt)
-                    if do_cfg_text:
-                        with _nvtx_range("ltx2.denoise.pass.neg"):
-                            neg_outputs = self.transformer(
-                                hidden_states=latent_model_input,
-                                encoder_hidden_states=neg_prompt_embeds,
-                                encoder_attention_mask=neg_prompt_mask,
-                                timestep=timestep,
-                                audio_hidden_states=audio_latents,
-                                audio_encoder_hidden_states=audio_context_n,
-                                audio_timestep=audio_timestep,
-                                video_sigma=sigma_batch,
-                                audio_sigma=sigma_batch,
-                                video_position_offset_sec=video_position_offset_sec,
-                            )
-                        if isinstance(neg_outputs, tuple):
-                            neg_denoised, neg_audio = neg_outputs
-                        else:
-                            neg_denoised = neg_outputs
-                            neg_audio = None
 
                     # Pass 3: Modality-isolated (skip cross-modal attn)
                     if do_mod:
@@ -564,6 +718,7 @@ class LTX2DenoisingStage(PipelineStage):
                                 audio_sigma=sigma_batch,
                                 skip_cross_modal_attn=True,
                                 video_position_offset_sec=video_position_offset_sec,
+                                **extra_transformer_kwargs,
                             )
                         if isinstance(mod_outputs, tuple):
                             mod_denoised, mod_audio = mod_outputs
@@ -587,6 +742,7 @@ class LTX2DenoisingStage(PipelineStage):
                                 skip_video_self_attn_blocks=(stg_blocks_video if do_stg_video else None),
                                 skip_audio_self_attn_blocks=(stg_blocks_audio if do_stg_audio else None),
                                 video_position_offset_sec=video_position_offset_sec,
+                                **extra_transformer_kwargs,
                             )
                         if isinstance(ptb_outputs, tuple):
                             ptb_denoised, ptb_audio = ptb_outputs
@@ -623,25 +779,89 @@ class LTX2DenoisingStage(PipelineStage):
                     denoise_mask=video_denoise_mask,
                     clean_latent=video_clean_latent,
                 )
+                if need_uncond and uncond_denoised is not None:
+                    uncond_denoised = post_process_ltx2_denoised(
+                        denoised=uncond_denoised,
+                        denoise_mask=video_denoise_mask,
+                        clean_latent=video_clean_latent,
+                    )
             if (audio_clean_latent is not None and audio_denoise_mask is not None and pos_audio is not None):
                 pos_audio = post_process_ltx2_denoised(
                     denoised=pos_audio,
                     denoise_mask=audio_denoise_mask,
                     clean_latent=audio_clean_latent,
                 )
+                if need_uncond and uncond_audio is not None:
+                    uncond_audio = post_process_ltx2_denoised(
+                        denoised=uncond_audio,
+                        denoise_mask=audio_denoise_mask,
+                        clean_latent=audio_clean_latent,
+                    )
 
             sigma_value = sigma.to(torch.float32) if isinstance(sigma, torch.Tensor) else torch.tensor(
                 float(sigma),
                 device=latents.device,
                 dtype=torch.float32,
             )
+            sigma_f = float(sigma_value)
+            sigma_next_f = float(sigma_next)
             dt = sigma_next - sigma
             with _nvtx_range("ltx2.denoise.scheduler_update"):
-                velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)
-                latents = (latents.float() + velocity.float() * dt).to(latents.dtype)
-                if pos_audio is not None and audio_latents is not None:
-                    audio_velocity = ((audio_latents.float() - pos_audio.float()) / sigma_value).to(audio_latents.dtype)
-                    audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+                if sampler == "euler":
+                    velocity = ((latents.float() - pos_denoised.float()) / sigma_value).to(latents.dtype)
+                    latents = (latents.float() + velocity.float() * dt).to(latents.dtype)
+                    if pos_audio is not None and audio_latents is not None:
+                        audio_velocity = ((audio_latents.float() - pos_audio.float()) / sigma_value).to(
+                            audio_latents.dtype)
+                        audio_latents = (audio_latents.float() + audio_velocity.float() * dt).to(audio_latents.dtype)
+                elif sampler == "euler_ancestral":
+                    draw = sampler_eta > 0 and sigma_next_f > 0
+                    latents = euler_ancestral_rf_step(
+                        latents.float(),
+                        pos_denoised.float(),
+                        sigma_f,
+                        sigma_next_f,
+                        eta=sampler_eta,
+                        s_noise=sampler_s_noise,
+                        noise=_ancestral_noise(latents) if draw else None,
+                    ).to(latents.dtype)
+                    if pos_audio is not None and audio_latents is not None:
+                        audio_latents = euler_ancestral_rf_step(
+                            audio_latents.float(),
+                            pos_audio.float(),
+                            sigma_f,
+                            sigma_next_f,
+                            eta=sampler_eta,
+                            s_noise=sampler_s_noise,
+                            noise=_ancestral_noise(audio_latents) if draw else None,
+                        ).to(audio_latents.dtype)
+                else:  # euler_ancestral_cfg_pp
+                    if uncond_denoised is None:
+                        raise RuntimeError("euler_ancestral_cfg_pp step reached without an unconditional "
+                                           "prediction; this is a bug in the pass gating.")
+                    draw = (sampler_eta > 0 and sampler_s_noise > 0 and sigma_next_f > 0)
+                    latents = euler_ancestral_cfg_pp_step(
+                        latents.float(),
+                        pos_denoised.float(),
+                        uncond_denoised.float(),
+                        sigma_f,
+                        sigma_next_f,
+                        eta=sampler_eta,
+                        s_noise=sampler_s_noise,
+                        noise=_ancestral_noise(latents) if draw else None,
+                    ).to(latents.dtype)
+                    if pos_audio is not None and audio_latents is not None:
+                        audio_uncond = (uncond_audio if uncond_audio is not None else pos_audio)
+                        audio_latents = euler_ancestral_cfg_pp_step(
+                            audio_latents.float(),
+                            pos_audio.float(),
+                            audio_uncond.float(),
+                            sigma_f,
+                            sigma_next_f,
+                            eta=sampler_eta,
+                            s_noise=sampler_s_noise,
+                            noise=_ancestral_noise(audio_latents) if draw else None,
+                        ).to(audio_latents.dtype)
 
         batch.latents = latents
         if (batch.return_continuation_state and self.sigmas_override is not None):

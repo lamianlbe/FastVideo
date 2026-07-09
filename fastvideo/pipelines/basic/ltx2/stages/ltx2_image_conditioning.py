@@ -51,6 +51,11 @@ LTX2_CONTINUATION_STAGE2_LAST_LATENT_KEY = ("ltx2_continuation_stage2_last_laten
 LTX2_CONTINUATION_TARGET_FRAME_IDX = 0
 LTX2_CONTINUATION_STRENGTH = 1.0
 DEFAULT_LTX2_IMAGE_CRF = 33.0
+# Reference token conditioning: per-stage encoded reference latents,
+# consumed by LTX2DenoisingStage and prepended to the video token
+# sequence inside the transformer forward.
+LTX2_REFERENCE_LATENT_STAGE1_KEY = "ltx2_reference_latent_stage1"
+LTX2_REFERENCE_LATENT_STAGE2_KEY = "ltx2_reference_latent_stage2"
 
 
 @dataclass
@@ -293,6 +298,46 @@ def _insert_conditioning_latent(
         dtype=clean_latent.dtype,
     )
     denoise_mask[:, :, frame_idx:end_idx] = 1.0 - float(strength)
+
+
+def build_ltx2_reference_latent(
+    *,
+    vae: torch.nn.Module,
+    image_path: str,
+    height: int,
+    width: int,
+    strength: float,
+    image_crf: float,
+    out_device: torch.device,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Encode a reference image into a clean latent for token-prefix
+    conditioning (port of the ComfyUI LTXReferenceConditioning node).
+
+    The image is resized/center-cropped to the target stage resolution in
+    pixel space so the reference RoPE grid overlaps the target's, then
+    VAE-encoded (which lands it in the model's latent distribution — the
+    same normalization the i2v conditioning path uses) and scaled by
+    ``strength``.
+    """
+    vae_param = next(vae.parameters(), None)
+    encoder_dtype = vae_param.dtype if vae_param is not None else out_dtype
+    encoder_device = vae_param.device if vae_param is not None else out_device
+    image_tensor = load_ltx2_conditioning_image(
+        image_path=image_path,
+        height=height,
+        width=width,
+        dtype=encoder_dtype,
+        device=encoder_device,
+        image_crf=float(image_crf),
+    )
+    ref_latent = _extract_video_latent(vae, image_tensor).to(
+        device=out_device,
+        dtype=out_dtype,
+    )
+    if strength != 1.0:
+        ref_latent = ref_latent * float(strength)
+    return ref_latent
 
 
 def build_ltx2_image_conditioning(

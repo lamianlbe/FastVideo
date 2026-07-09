@@ -15,10 +15,9 @@ from fastvideo.logger import init_logger
 from fastvideo.models.dits.ltx2 import VideoLatentShape
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
-from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (LTX2_VIDEO_CLEAN_LATENT_KEY,
-                                                                           LTX2_VIDEO_DENOISE_MASK_KEY,
-                                                                           apply_ltx2_gaussian_noiser,
-                                                                           build_ltx2_image_conditioning)
+from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+    LTX2_REFERENCE_LATENT_STAGE1_KEY, LTX2_VIDEO_CLEAN_LATENT_KEY, LTX2_VIDEO_DENOISE_MASK_KEY,
+    apply_ltx2_gaussian_noiser, build_ltx2_image_conditioning, build_ltx2_reference_latent)
 from fastvideo.pipelines.stages.validators import StageValidators as V
 from fastvideo.pipelines.stages.validators import VerificationResult
 
@@ -219,6 +218,24 @@ class LTX2LatentPreparationStage(PipelineStage):
                 "[LTX2] Applied conditioning for stage-1: images=%d latent=%s.",
                 len(image_conditioning.images),
                 image_conditioning.latent_conditioned,
+            )
+
+        if fastvideo_args.ltx2_reference_image_path:
+            batch.extra[LTX2_REFERENCE_LATENT_STAGE1_KEY] = build_ltx2_reference_latent(
+                vae=self.vae,
+                image_path=fastvideo_args.ltx2_reference_image_path,
+                height=height,
+                width=width,
+                strength=fastvideo_args.ltx2_reference_strength,
+                image_crf=float(getattr(batch, "ltx2_image_crf", 0.0) or 0.0),
+                out_device=latents.device,
+                out_dtype=latents.dtype,
+            )
+            logger.info(
+                "[LTX2] Encoded stage-1 reference latent from %s at %dx%d.",
+                fastvideo_args.ltx2_reference_image_path,
+                width,
+                height,
             )
 
         batch.latents = latents

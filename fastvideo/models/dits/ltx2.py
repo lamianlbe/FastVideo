@@ -2912,8 +2912,23 @@ class LTX2Transformer3DModel(BaseDiT):
         skip_video_self_attn_blocks: list[int] | None = None,
         skip_audio_self_attn_blocks: list[int] | None = None,
         video_position_offset_sec: float = 0.0,
+        ref_latent: torch.Tensor | None = None,
+        ref_zero_timesteps: bool = False,
+        ref_position_mode: str = "reference",
         **kwargs,
     ) -> torch.Tensor:
+        # Reference token conditioning (attention-level identity reference,
+        # port of the ComfyUI 10s-nodes LTXReferenceEnable mechanism):
+        # ``ref_latent`` [B, C, F, H, W] is patchified with the shared
+        # patchifier and prepended to the video token sequence with its own
+        # RoPE positions; the prefix is stripped from the output before
+        # unpatchify. ``ref_position_mode="reference"`` overlaps the target's
+        # first frame temporally (uniform identity influence);
+        # ``"prefix_continuous"`` places the reference strictly before the
+        # target on the time axis (i2v-prior semantics).
+        # ``ref_zero_timesteps=False`` (default) makes the prefix inherit the
+        # target's token-0 per-token timestep, matching the ComfyUI patch's
+        # row-0 modulation replication.
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
         # Get SP parameters
@@ -2942,6 +2957,33 @@ class LTX2Transformer3DModel(BaseDiT):
         if video_sigma is None:
             video_sigma = timestep[:, 0] if timestep.ndim > 1 else timestep
 
+        # Prepend reference tokens (and matching per-token timesteps) before
+        # SP sharding so shards, positions, and timesteps stay index-aligned.
+        n_ref_tokens = 0
+        ref_shape = None
+        if ref_latent is not None:
+            if ref_position_mode not in ("reference", "prefix_continuous"):
+                raise ValueError(f"ref_position_mode must be 'reference' or 'prefix_continuous', "
+                                 f"got {ref_position_mode!r}")
+            ref_shape = VideoLatentShape.from_torch_shape(ref_latent.shape)
+            ref_tokens = self.patchifier.patchify(ref_latent.to(device=latents.device, dtype=latents.dtype))
+            if ref_tokens.shape[0] != latents.shape[0]:
+                if ref_tokens.shape[0] == 1:
+                    ref_tokens = ref_tokens.expand(latents.shape[0], -1, -1)
+                else:
+                    raise ValueError(f"ref_latent batch {ref_tokens.shape[0]} does not match "
+                                     f"video batch {latents.shape[0]} and cannot broadcast.")
+            n_ref_tokens = ref_tokens.shape[1]
+            latents = torch.cat([ref_tokens, latents], dim=1)
+            if timestep.ndim < 2:
+                raise ValueError("ref_latent requires a per-token timestep of shape [B, seq, ...], "
+                                 f"got {tuple(timestep.shape)}")
+            expand_shape = [-1, n_ref_tokens] + [-1] * (timestep.dim() - 2)
+            ref_timestep = timestep[:, :1].expand(*expand_shape)
+            if ref_zero_timesteps:
+                ref_timestep = torch.zeros_like(ref_timestep)
+            timestep = torch.cat([ref_timestep, timestep], dim=1)
+
         # Shard video latents and timestep across SP ranks
         video_original_seq_len = latents.shape[1]
         video_padded_seq_len = video_original_seq_len
@@ -2968,6 +3010,29 @@ class LTX2Transformer3DModel(BaseDiT):
         if video_position_offset_sec:
             positions[:, 0, ...] = positions[:, 0, ...] + float(video_position_offset_sec)
         positions = positions.to(hidden_states.dtype)
+
+        if n_ref_tokens > 0:
+            assert ref_shape is not None
+            ref_positions = self.patchifier.get_patch_grid_bounds(ref_shape, device=hidden_states.device)
+            ref_positions = _get_pixel_coords(
+                ref_positions,
+                DEFAULT_LTX2_SCALE_FACTORS,
+                fps=fps,
+                causal_fix=True,
+            )
+            if ref_position_mode == "prefix_continuous":
+                # Shift the reference strictly before the target on the time
+                # axis (its temporal span ends where the target begins).
+                ref_temporal_end = ref_positions[:, 0, :, 1].max()
+                ref_positions[:, 0, ...] = ref_positions[:, 0, ...] - ref_temporal_end
+            # "reference" mode: leave coords as-is so the reference overlaps
+            # the target's first frame temporally.
+            if video_position_offset_sec:
+                ref_positions[:, 0, ...] = (ref_positions[:, 0, ...] + float(video_position_offset_sec))
+            ref_positions = ref_positions.to(hidden_states.dtype)
+            if ref_positions.shape[0] != positions.shape[0]:
+                ref_positions = ref_positions.expand(positions.shape[0], -1, -1, -1)
+            positions = torch.cat([ref_positions, positions], dim=2)
 
         # Pad positions to match padded sequence length for SP cross-attention
         if sp_world_size > 1 and video_padded_seq_len > video_original_seq_len:
@@ -3079,6 +3144,11 @@ class LTX2Transformer3DModel(BaseDiT):
             video_out = sequence_model_parallel_all_gather_with_unpad(
                 video_out, video_original_seq_len, dim=1
             )
+
+        # Strip the reference token prefix so unpatchify sees exactly the
+        # target grid (seq == F*H*W of video_shape).
+        if n_ref_tokens > 0 and video_out is not None:
+            video_out = video_out[:, n_ref_tokens:, :]
 
         # Gather and unpad audio output
         if sp_world_size > 1 and audio_out is not None:

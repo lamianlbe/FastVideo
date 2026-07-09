@@ -36,10 +36,12 @@ from fastvideo.models.dits.ltx2 import AudioLatentShape, VideoLatentShape
 from fastvideo.models.upsamplers import upsample_video
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
     LTX2_CONTINUATION_STAGE1_LAST_LATENT_KEY,
+    LTX2_REFERENCE_LATENT_STAGE2_KEY,
     LTX2_VIDEO_CLEAN_LATENT_KEY,
     LTX2_VIDEO_DENOISE_MASK_KEY,
     apply_ltx2_gaussian_noiser,
     build_ltx2_image_conditioning,
+    build_ltx2_reference_latent,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
@@ -170,6 +172,26 @@ class LTX2UpsampleStage(PipelineStage):
         video_encoder = getattr(self.vae, "encoder", None)
         if video_encoder is None:
             raise ValueError("LTX-2 VAE encoder is required for latent upsampling.")
+
+        if fastvideo_args.ltx2_reference_image_path:
+            # Re-encode the reference at the stage-2 resolution so its RoPE
+            # grid overlaps the refined target's.
+            batch.extra[LTX2_REFERENCE_LATENT_STAGE2_KEY] = build_ltx2_reference_latent(
+                vae=self.vae,
+                image_path=fastvideo_args.ltx2_reference_image_path,
+                height=int(target_height),
+                width=int(target_width),
+                strength=fastvideo_args.ltx2_reference_strength,
+                image_crf=float(getattr(batch, "ltx2_image_crf", 0.0) or 0.0),
+                out_device=orig_device,
+                out_dtype=orig_dtype,
+            )
+            logger.info(
+                "[LTX2] Encoded stage-2 reference latent from %s at %dx%d.",
+                fastvideo_args.ltx2_reference_image_path,
+                int(target_width),
+                int(target_height),
+            )
 
         upsampler_module = getattr(self.upsampler, "model", self.upsampler)
         latents = upsample_video(latents, video_encoder, upsampler_module)

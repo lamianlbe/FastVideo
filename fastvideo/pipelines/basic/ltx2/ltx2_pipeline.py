@@ -62,38 +62,49 @@ class LTX2Pipeline(LoRAPipeline):
 
         self.add_stage(
             stage_name="denoising_stage",
-            stage=LTX2DenoisingStage(transformer=self.get_module("transformer"), ),
+            stage=LTX2DenoisingStage(
+                transformer=self.get_module("transformer"),
+                sampler=fastvideo_args.ltx2_sampler,
+            ),
         )
 
         if refine_enabled:
-            stage2_steps = fastvideo_args.ltx2_refine_num_inference_steps
-            # LTX-2 refine currently supports two explicitly tested step
-            # counts:
-            # - 3 steps: official distilled schedule
-            # - 2 steps: custom reduced schedule used for faster
-            #   experimentation
-            # Other values are intentionally rejected to avoid silent
-            # quality regressions.
-            if stage2_steps == 3:
-                # Official distilled stage-2 refine schedule.
-                stage2_sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
-            elif stage2_steps == 2:
-                # Reduced 2-step refine schedule (explicitly omits 0.725).
-                stage2_sigmas = [
-                    STAGE_2_DISTILLED_SIGMA_VALUES[0],
-                    STAGE_2_DISTILLED_SIGMA_VALUES[2],
-                    STAGE_2_DISTILLED_SIGMA_VALUES[3],
-                ]
+            if fastvideo_args.ltx2_stage2_sigmas is not None:
+                # User-supplied stage-2 schedule (validated in FastVideoArgs:
+                # strictly decreasing, ends at 0.0).
+                stage2_sigmas = list(fastvideo_args.ltx2_stage2_sigmas)
+                logger.info("[LTX2] Using user stage-2 sigma schedule, %s", stage2_sigmas)
             else:
-                logger.warning(
-                    "For LTX-2 refinement, "
-                    "ltx2_refine_num_inference_steps=%s is not a tested "
-                    "setting. Using denoising steps other than 2 or 3 "
-                    "may cause quality degradation.",
-                    stage2_steps,
-                )
-                raise ValueError("LTX-2 refinement supports only 2 or 3 denoising "
-                                 "steps.")
+                stage2_steps = fastvideo_args.ltx2_refine_num_inference_steps
+                # LTX-2 refine currently supports two explicitly tested step
+                # counts:
+                # - 3 steps: official distilled schedule
+                # - 2 steps: custom reduced schedule used for faster
+                #   experimentation
+                # Other values are intentionally rejected to avoid silent
+                # quality regressions (pass ltx2_stage2_sigmas for a fully
+                # custom schedule).
+                if stage2_steps == 3:
+                    # Official distilled stage-2 refine schedule.
+                    stage2_sigmas = STAGE_2_DISTILLED_SIGMA_VALUES
+                elif stage2_steps == 2:
+                    # Reduced 2-step refine schedule (explicitly omits 0.725).
+                    stage2_sigmas = [
+                        STAGE_2_DISTILLED_SIGMA_VALUES[0],
+                        STAGE_2_DISTILLED_SIGMA_VALUES[2],
+                        STAGE_2_DISTILLED_SIGMA_VALUES[3],
+                    ]
+                else:
+                    logger.warning(
+                        "For LTX-2 refinement, "
+                        "ltx2_refine_num_inference_steps=%s is not a tested "
+                        "setting. Using denoising steps other than 2 or 3 "
+                        "may cause quality degradation.",
+                        stage2_steps,
+                    )
+                    raise ValueError("LTX-2 refinement supports only 2 or 3 denoising "
+                                     "steps (or pass ltx2_stage2_sigmas for a custom "
+                                     "schedule).")
 
             transformer_refine = self.get_module("transformer_refine", self.get_module("transformer"))
 
@@ -125,6 +136,7 @@ class LTX2Pipeline(LoRAPipeline):
                     num_inference_steps_override=len(stage2_sigmas) - 1,
                     force_guidance_scale=(fastvideo_args.ltx2_refine_guidance_scale),
                     initial_audio_latents_key="ltx2_audio_latents",
+                    sampler=fastvideo_args.ltx2_refine_sampler,
                 ),
             )
 
