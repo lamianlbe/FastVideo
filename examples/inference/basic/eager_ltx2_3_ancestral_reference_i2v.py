@@ -58,8 +58,13 @@ OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/eager_i2v_test"))
 SEED = int(os.getenv("LTX23_SEED", "635141064074927"))  # workflow node 524
 
 # Workflow geometry (sliders 791/792/796, node 798: frames = 360 + 1).
+# These are the FINAL output dims; the refine pipeline runs stage 1 at half
+# res automatically. Both must be divisible by 64 (half res must satisfy the
+# VAE's /32 rule). NOTE: the ComfyUI sliders say 1024x1376, but node 893
+# (Resize v2, divisible_by=32) silently crops the half-res image 688 -> 672,
+# so the workflow's true output is 1024x1344 — replicated here explicitly.
 WIDTH = 1024
-HEIGHT = 1376
+HEIGHT = 1344
 NUM_FRAMES = int(os.getenv("LTX23_NUM_FRAMES", "361"))  # shrink (e.g. 121) for smoke tests
 FPS = 24
 
