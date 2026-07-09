@@ -1,54 +1,37 @@
 #!/usr/bin/env python3
-"""Eager (no torch.compile) FastVideo test run replicating the ComfyUI
-workflow `10Eros_10SNodes_I2V_Basic_DMD_V5` setting-for-setting.
+"""FastVideo test run replicating the ComfyUI two-pass I2V DMD workflow
+setting-for-setting, with eager/compile and bf16/NVFP4 toggles for A/B runs.
 
-Fill in IMAGE_PATH and PROMPT below (or set the LTX23_* env vars), then:
+    env -u LD_LIBRARY_PATH python eager_ltx2_3_ancestral_reference_i2v.py
 
-    env -u LD_LIBRARY_PATH python fastvideo_eager_i2v_test.py
+Toggles (env vars):
+    LTX23_COMPILE=1        torch.compile DiT + text encoder + VAE
+                           (fullgraph, inductor default mode). First-time
+                           compile is ~30-40 min on GB200/B200 and is cached
+                           in $TORCHINDUCTOR_CACHE_DIR — point that at a
+                           persistent volume on RunPod.
+    LTX23_QUANT=nvfp4|none NVFP4 linear quantization (default nvfp4).
+    LTX23_WARMUP_RUNS      untimed warmups before measuring (default 2 when
+                           compiling, else 0).
+    LTX23_MEASURED_RUNS    timed runs (default 2).
 
-Requires the `ltx23-ancestral-reference` branch of
-github.com:lamianlbe/FastVideo (ancestral samplers + per-stage sigmas +
-reference token conditioning).
+Workflow settings replicated: euler_ancestral stage 1 (9-step custom
+sigmas) / euler_ancestral_cfg_pp stage 2 ([0.92, 0.725, 0.421875, 0]),
+cfg=1, frame-0 image anchor at strength 1.0, reference token conditioning
+from the same image, CRF 35 preprocestsing, x2 (or x1.5 via
+LTX23_UPSAMPLER_PATH) two-stage refine.
 
-Workflow settings replicated
-----------------------------
-resolution   1024x1376 portrait (stage 1 auto-runs at half res, the x2
-             latent upsampler brings stage 2 back to full res — same
-             two-pass layout as the ComfyUI graph)
-frames/fps   361 frames @ 24 fps (slider 360 + 1; 8k+1 rule holds)
-stage 1      euler_ancestral, cfg=1,
-             sigmas 1.000,0.955,0.893,0.812,0.715,0.603,0.482,0.241,0.121,0
-stage 2      euler_ancestral_cfg_pp, cfg=1 (uncond pass still runs — CFG++
-             semantics), sigmas 0.92,0.725,0.421875,0
-i2v          input image anchored at frame 0, strength 1.0
-             (LTXVImgToVideoInplaceKJ equivalent)
-reference    same image injected as attention token prefix, strength 1.0,
-             position_mode="reference", timesteps inherited
-             (LTXReferenceEnable/Conditioning equivalent)
-img CRF      35 (LTXVPreprocess slider). NOTE: ComfyUI uses 35 for stage 1
-             and 30 for stage 2; FastVideo applies one value to both —
-             negligible difference, called out for completeness.
-audio        stage 1 generates, stage 2 refines it (TwoWaySwitch=2
-             equivalent — FastVideo's default refine behaviour)
-
-Upsampler
----------
-The converted 10Eros repo has no `spatial_upscaler/` subdir. Fetch the
-x2 spatial upsampler from FastVideo's official repo once:
-
+Upsampler: fetch once if the model repo lacks `spatial_upscaler/`:
     hf download FastVideo/LTX-2.3-Distilled-Diffusers \
         --include "spatial_upscaler/*" --local-dir <MODEL_PATH>
-
-or point LTX23_UPSAMPLER_PATH at any diffusers-format LTX2LatentUpsampler.
 """
 
 from __future__ import annotations
 
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
-from fastvideo.configs.pipelines.base import PipelineConfig
-from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
 
 # ---------------------------------------------------------------------------
 # Fill these in (env vars override).
@@ -61,12 +44,9 @@ PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT",
 OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/eager_i2v_test"))
 SEED = int(os.getenv("LTX23_SEED", "635141064074927"))  # workflow node 524
 
-# Workflow geometry (sliders 791/792/796, node 798: frames = 360 + 1).
-# These are the FINAL output dims; the refine pipeline runs stage 1 at half
-# res automatically. Both must be divisible by 64 (half res must satisfy the
-# VAE's /32 rule). NOTE: the ComfyUI sliders say 1024x1376, but node 893
-# (Resize v2, divisible_by=32) silently crops the half-res image 688 -> 672,
-# so the workflow's true output is 1024x1344 — replicated here explicitly.
+# Both dims must be divisible by 64 for the x2 refine (see notes in repo
+# history for the ComfyUI 1376 -> 1344 story); for the x1.5 upscaler each dim
+# must additionally be divisible by 96.
 WIDTH = 1344
 HEIGHT = 768
 NUM_FRAMES = int(os.getenv("LTX23_NUM_FRAMES", "241"))  # shrink (e.g. 121) for smoke tests
@@ -87,10 +67,29 @@ NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitl
                    "chinese, japanese, mutant, horror, 70's, film grain, cinematic, comedy, "
                    "stand-up ")
 
+COMPILE = os.getenv("LTX23_COMPILE", "0") == "1"
+QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | none
+WARMUP_RUNS = int(os.getenv("LTX23_WARMUP_RUNS", "2" if COMPILE else "0"))
+MEASURED_RUNS = int(os.getenv("LTX23_MEASURED_RUNS", "2"))
+
 os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", "FLASH_ATTN")
 os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
 
+if COMPILE:
+    import torch._inductor.config as _inductor
+
+    # shape_padding=False is mandatory on Blackwell: pad_mm otherwise hits a
+    # cuBLAS INVALID_VALUE crash in the refine path. The rest mirror the
+    # official basic_ltx2_3_distilled_i2v example.
+    _inductor.shape_padding = False
+    _inductor.conv_1x1_as_mm = True
+    _inductor.coordinate_descent_tuning = True
+    _inductor.coordinate_descent_check_all_directions = True
+    _inductor.epilogue_fusion = False
+
 from fastvideo import VideoGenerator  # noqa: E402  (after env setup)
+from fastvideo.configs.pipelines.base import PipelineConfig  # noqa: E402
+from fastvideo.layers.quantization.nvfp4_config import NVFP4Config  # noqa: E402
 from fastvideo.utils import maybe_download_model  # noqa: E402
 
 
@@ -110,11 +109,21 @@ def resolve_upsampler(model_root: str) -> str:
         "or set LTX23_UPSAMPLER_PATH.")
 
 
+def _collect_stage_times(result, stage_times: dict[str, list[float]], stage_order: OrderedDict) -> None:
+    logging_info = result.get("logging_info") if isinstance(result, dict) else None
+    stages = getattr(logging_info, "stages", None) if logging_info else None
+    if not stages:
+        return
+    for name, metrics in stages.items():
+        stage_order.setdefault(name, None)
+        stage_times.setdefault(name, []).append(float(metrics.get("execution_time", 0.0)))
+
+
 def main() -> None:
     if not Path(IMAGE_PATH).is_file():
         raise SystemExit(f"IMAGE_PATH not found: {IMAGE_PATH} (set LTX23_I2V_IMAGE)")
-    if "REPLACE ME" in PROMPT_BODY:
-        raise SystemExit("Set PROMPT_BODY in the script or the LTX23_I2V_PROMPT env var.")
+    if QUANT not in ("nvfp4", "none"):
+        raise SystemExit(f"LTX23_QUANT must be nvfp4 or none, got {QUANT}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     model_root = maybe_download_model(MODEL_PATH)
@@ -123,15 +132,35 @@ def main() -> None:
     print(f"upsampler: {upsampler_path}")
     print(f"image:     {IMAGE_PATH}")
     print(f"frames:    {NUM_FRAMES} @ {FPS} fps, {WIDTH}x{HEIGHT}")
+    print(f"mode:      compile={COMPILE} quant={QUANT} "
+          f"warmup={WARMUP_RUNS} measured={MEASURED_RUNS}")
+    if COMPILE:
+        print(f"inductor cache: {os.getenv('TORCHINDUCTOR_CACHE_DIR', '(default, not persistent!)')}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
-    pipeline_config.dit_config.quant_config = NVFP4Config()
+    pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
+
+    compile_kwargs: dict = {}
+    if COMPILE:
+        torch_compile_kwargs = {
+            "backend": "inductor",
+            "fullgraph": True,
+            "mode": "default",  # matches max-autotune on this pipeline, saves ~7 min cold compile
+            "dynamic": False,
+        }
+        compile_kwargs = dict(
+            enable_torch_compile=True,
+            enable_torch_compile_text_encoder=True,
+            enable_torch_compile_vae=True,
+            torch_compile_kwargs=torch_compile_kwargs,
+            torch_compile_kwargs_vae=torch_compile_kwargs,
+        )
 
     generator = VideoGenerator.from_pretrained(
         model_root,
         num_gpus=1,
         pipeline_config=pipeline_config,
-        # --- eager: no compile flags at all ---
+        **compile_kwargs,
         # --- two-stage refine (ComfyUI first pass + upscale pass) ---
         ltx2_refine_enabled=True,
         ltx2_refine_upsampler_path=upsampler_path,
@@ -155,38 +184,71 @@ def main() -> None:
         ltx2_vae_tiling=False,
     )
 
+    common_kwargs = dict(
+        prompt=PROMPT_BODY,
+        negative_prompt=NEGATIVE_PROMPT,             # node 537; feeds cfg_pp's uncond pass
+        guidance_scale=1.0,                          # cfg=1 in both SamplerCustom nodes
+        height=HEIGHT,
+        width=WIDTH,
+        num_frames=NUM_FRAMES,
+        fps=FPS,
+        num_inference_steps=len(STAGE1_SIGMAS) - 1,
+        # i2v: anchor input image at frame 0, full strength (node 772,
+        # Conditioning-Fidelity slider = 1.0).
+        ltx2_images=[(IMAGE_PATH, 0, 1.0)],
+        ltx2_image_crf=IMAGE_CRF,
+        # No STG / modality guidance in this workflow revision.
+        ltx2_stg_scale_video=0.0,
+        ltx2_stg_scale_audio=0.0,
+        ltx2_cfg_scale_video=1.0,
+        ltx2_cfg_scale_audio=1.0,
+        ltx2_modality_scale_video=1.0,
+        ltx2_modality_scale_audio=1.0,
+        save_video=True,
+    )
+
     try:
-        t0 = time.perf_counter()
-        result = generator.generate_video(
-            prompt=PROMPT_BODY,
-            negative_prompt=NEGATIVE_PROMPT,             # node 537; feeds cfg_pp's uncond pass
-            guidance_scale=1.0,                          # cfg=1 in both SamplerCustom nodes
-            height=HEIGHT,
-            width=WIDTH,
-            num_frames=NUM_FRAMES,
-            fps=FPS,
-            num_inference_steps=len(STAGE1_SIGMAS) - 1,
-            seed=SEED,
-            # i2v: anchor input image at frame 0, full strength (node 772,
-            # Conditioning-Fidelity slider = 1.0).
-            ltx2_images=[(IMAGE_PATH, 0, 1.0)],
-            ltx2_image_crf=IMAGE_CRF,
-            # No STG / modality guidance in this workflow revision.
-            ltx2_stg_scale_video=0.0,
-            ltx2_stg_scale_audio=0.0,
-            ltx2_cfg_scale_video=1.0,
-            ltx2_cfg_scale_audio=1.0,
-            ltx2_modality_scale_video=1.0,
-            ltx2_modality_scale_audio=1.0,
-            save_video=True,
-            output_path=str(OUTPUT_DIR / "eager_i2v_test.mp4"),
-        )
-        wall = time.perf_counter() - t0
-        print(f"\ndone in {wall:.1f}s (eager) -> {OUTPUT_DIR / 'eager_i2v_test.mp4'}")
-        if isinstance(result, dict) and result.get("logging_info") is not None:
-            stages = getattr(result["logging_info"], "stages", None) or {}
-            for name, metrics in stages.items():
-                print(f"  {name}: {float(metrics.get('execution_time', 0.0)):.2f}s")
+        for w in range(WARMUP_RUNS):
+            t0 = time.perf_counter()
+            print(f"\n[warmup {w + 1}/{WARMUP_RUNS}] (compile + shape guards settle here)…")
+            generator.generate_video(
+                output_path=str(OUTPUT_DIR / f"_warmup_{w + 1}.mp4"),
+                seed=SEED,
+                **common_kwargs,
+            )
+            print(f"[warmup {w + 1}/{WARMUP_RUNS}] wall={time.perf_counter() - t0:.1f}s")
+        for w in range(WARMUP_RUNS):
+            (OUTPUT_DIR / f"_warmup_{w + 1}.mp4").unlink(missing_ok=True)
+
+        measured: list[float] = []
+        stage_times: dict[str, list[float]] = {}
+        stage_order: OrderedDict = OrderedDict()
+        for m in range(MEASURED_RUNS):
+            out_path = OUTPUT_DIR / f"i2v_test_run_{m + 1}.mp4"
+            t0 = time.perf_counter()
+            result = generator.generate_video(
+                output_path=str(out_path),
+                seed=SEED + m,
+                **common_kwargs,
+            )
+            wall = time.perf_counter() - t0
+            e2e = (result.get("e2e_latency") if isinstance(result, dict) else None) or wall
+            measured.append(e2e)
+            _collect_stage_times(result, stage_times, stage_order)
+            print(f"[measured {m + 1}/{MEASURED_RUNS}] e2e={e2e:.2f}s wall={wall:.2f}s -> {out_path}")
+
+        print(f"\n=== summary (compile={COMPILE} quant={QUANT}) ===")
+        if measured:
+            print(f"measured e2e (n={len(measured)}): "
+                  f"{[round(x, 2) for x in measured]} -> avg {sum(measured) / len(measured):.2f}s")
+        if stage_times:
+            total = 0.0
+            for name in stage_order:
+                vals = stage_times.get(name) or []
+                avg = sum(vals) / len(vals)
+                total += avg
+                print(f"  {name}: {avg:.3f}s")
+            print(f"  stage_sum_avg: {total:.3f}s")
     finally:
         generator.shutdown()
 
