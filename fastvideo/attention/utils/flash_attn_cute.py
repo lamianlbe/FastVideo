@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import functools
+import contextlib
 from collections.abc import Callable
 
 import torch
@@ -49,13 +49,29 @@ def _check_dropout(dropout_p: float) -> None:
         raise NotImplementedError(f"flash_attn.cute does not support dropout (got dropout_p={dropout_p})")
 
 
-@functools.cache
-def _sm90_or_newer() -> bool:
-    return current_platform.has_device_capability(90)
+# Resolved eagerly at import (with a lazy fallback for hosts where no CUDA
+# device is visible yet) instead of a functools.cache wrapper: the capability
+# query bottoms out in pynvml/C which dynamo cannot trace, and cache wrappers
+# are opaque to it too. By the time a compiled region traces _use_fa2 this is
+# a plain module-level bool, which dynamo folds into a constant — keeping the
+# FA4 path fullgraph-compatible.
+_SM90_OR_NEWER: bool | None = None
+
+
+def _resolve_sm90_or_newer() -> bool:
+    global _SM90_OR_NEWER
+    if _SM90_OR_NEWER is None:
+        _SM90_OR_NEWER = bool(current_platform.has_device_capability(90))
+    return _SM90_OR_NEWER
+
+
+with contextlib.suppress(Exception):  # pragma: no cover - device-less host
+    _resolve_sm90_or_newer()
 
 
 def _use_fa2(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-    if _sm90_or_newer():
+    sm90 = (_SM90_OR_NEWER if _SM90_OR_NEWER is not None else _resolve_sm90_or_newer())
+    if sm90:
         return False
     # Pre-sm90 FA4 cute limitations, both served by FA2 (deterministic
     # capability gate, not a runtime fallback):
