@@ -339,3 +339,48 @@ def test_reference_prefix_zero_timesteps_changes_output(tiny_ltx2_model):
     inherited = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, ref_zero_timesteps=False)
     zeroed = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, ref_zero_timesteps=True)
     assert not torch.allclose(inherited, zeroed)
+
+
+# --- Refine init stage: scale-aware stage-1 resolution -------------------------
+
+
+def _refine_args(spatial_ratio=32):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        ltx2_refine_enabled=True,
+        pipeline_config=SimpleNamespace(vae_config=SimpleNamespace(arch_config=SimpleNamespace(
+            spatial_compression_ratio=spatial_ratio))),
+    )
+
+
+def _refine_batch(height, width):
+    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+    batch = ForwardBatch(data_type="dummy")
+    batch.height = height
+    batch.width = width
+    return batch
+
+
+@pytest.mark.parametrize("scale,target,expected_stage1", [
+    (2.0, (1344, 1024), (672, 512)),
+    (1.5, (1344, 1056), (896, 704)),
+    (1.5, (1344, 960), (896, 640)),
+])
+def test_refine_init_stage_scales(scale, target, expected_stage1):
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_refine import LTX2RefineInitStage
+    batch = _refine_batch(*target)
+    LTX2RefineInitStage(spatial_scale=scale).forward(batch, _refine_args())
+    assert (batch.height, batch.width) == expected_stage1
+    assert batch.extra["ltx2_refine_target_height"] == target[0]
+    assert batch.extra["ltx2_refine_target_width"] == target[1]
+
+
+@pytest.mark.parametrize("scale,target", [
+    (1.5, (1344, 1024)),   # 1024/1.5 is not an integer
+    (1.5, (1344, 1008)),   # 1008 not divisible by 32
+    (2.0, (1376, 1024)),   # 688 not divisible by 32
+])
+def test_refine_init_stage_rejects_bad_dims(scale, target):
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_refine import LTX2RefineInitStage
+    with pytest.raises(ValueError):
+        LTX2RefineInitStage(spatial_scale=scale).forward(_refine_batch(*target), _refine_args())

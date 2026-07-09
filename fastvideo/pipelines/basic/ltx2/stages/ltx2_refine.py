@@ -57,12 +57,21 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
 class LTX2RefineInitStage(PipelineStage):
-    """Switch the request to half resolution before the stage-1 denoise.
+    """Switch the request to stage-1 resolution before the stage-1 denoise.
 
-    Stashes the original target resolution on ``batch.extra`` so
-    :class:`LTX2UpsampleStage` can recover it after stage 1 runs. When
-    the refine path is disabled the stage is a no-op.
+    Stage-1 runs at ``target / spatial_scale`` where ``spatial_scale`` comes
+    from the loaded latent upsampler (2.0 for the x2 upscaler, 1.5 for the
+    x1.5 rational-resampler upscaler). Stashes the original target
+    resolution on ``batch.extra`` so :class:`LTX2UpsampleStage` can recover
+    it after stage 1 runs. When the refine path is disabled the stage is a
+    no-op.
     """
+
+    def __init__(self, spatial_scale: float = 2.0) -> None:
+        super().__init__()
+        if spatial_scale <= 1.0:
+            raise ValueError(f"LTX-2 refine spatial_scale must be > 1.0, got {spatial_scale}")
+        self.spatial_scale = float(spatial_scale)
 
     def forward(
         self,
@@ -79,16 +88,18 @@ class LTX2RefineInitStage(PipelineStage):
         if isinstance(height, list) or isinstance(width, list):
             raise ValueError("LTX-2 refinement expects scalar height/width.")
 
-        if height % 2 != 0 or width % 2 != 0:
-            raise ValueError("LTX-2 refinement requires even height/width so stage1 can be "
-                             "half resolution.")
-
+        scale = self.spatial_scale
         spatial_ratio = (fastvideo_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio)
-        stage1_height = height // 2
-        stage1_width = width // 2
-        if stage1_height % spatial_ratio != 0 or stage1_width % spatial_ratio != 0:
-            raise ValueError(f"LTX-2 refinement requires height/width divisible by "
-                             f"{2 * spatial_ratio} (got {height}x{width}).")
+        stage1_height_f = height / scale
+        stage1_width_f = width / scale
+        stage1_height = int(round(stage1_height_f))
+        stage1_width = int(round(stage1_width_f))
+        if (stage1_height != stage1_height_f or stage1_width != stage1_width_f or stage1_height % spatial_ratio != 0
+                or stage1_width % spatial_ratio != 0 or height % spatial_ratio != 0 or width % spatial_ratio != 0):
+            raise ValueError(f"LTX-2 refinement at scale {scale}x requires height/width such that "
+                             f"both the target and target/{scale} are integers divisible by "
+                             f"{spatial_ratio} (got {height}x{width} -> stage1 "
+                             f"{stage1_width_f}x{stage1_height_f}).")
 
         batch.extra["ltx2_refine_target_height"] = height
         batch.extra["ltx2_refine_target_width"] = width

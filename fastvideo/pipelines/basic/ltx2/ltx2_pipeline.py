@@ -47,9 +47,16 @@ class LTX2Pipeline(LoRAPipeline):
         )
 
         if refine_enabled:
+            # The stage-1 downscale factor follows the loaded latent
+            # upsampler's spatial_scale (2.0 for the x2 upscaler, 1.5 for
+            # the x1.5 rational-resampler upscaler) so swapping the
+            # upsampler checkpoint switches the whole two-stage geometry.
+            upsampler_module = self.get_module("spatial_upsampler")
+            refine_scale = float(getattr(getattr(upsampler_module, "model", upsampler_module), "spatial_scale", 2.0))
+            logger.info("[LTX2] Refine spatial scale from upsampler config: %sx", refine_scale)
             self.add_stage(
                 stage_name="ltx2_refine_init_stage",
-                stage=LTX2RefineInitStage(),
+                stage=LTX2RefineInitStage(spatial_scale=refine_scale),
             )
 
         self.add_stage(
