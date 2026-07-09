@@ -68,10 +68,8 @@ STAGE1_SIGMAS = [1.000, 0.955, 0.893, 0.812, 0.715, 0.603, 0.482, 0.241, 0.121, 
 STAGE2_SIGMAS = [0.92, 0.725, 0.421875, 0.0]
 IMAGE_CRF = 35.0  # LTXVPreprocess slider (node 915)
 
-# Node 536 preamble + node 537 negative, verbatim.
-PROMPT_PREAMBLE = ("Use the provided start image exactly as the first frame. \n\n"
-                   "Keep the acting natural and cinematic. Small pauses, micro-expressions, "
-                   "realistic movement, subtle environmental details.\n")
+# Node 537 negative prompt, verbatim. The user prompt is passed through
+# as-is (no preamble concatenation).
 NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitles, text, "
                    "watermark, overlay effects, pc game, yelling, console game, video game, "
                    "cartoon, childish, ugly, text, blur, logo, wordmark, static, low quality, "
@@ -147,7 +145,7 @@ def main() -> None:
     try:
         t0 = time.perf_counter()
         result = generator.generate_video(
-            prompt=PROMPT_PREAMBLE + PROMPT_BODY,
+            prompt=PROMPT_BODY,
             negative_prompt=NEGATIVE_PROMPT,             # node 537; feeds cfg_pp's uncond pass
             guidance_scale=1.0,                          # cfg=1 in both SamplerCustom nodes
             height=HEIGHT,
