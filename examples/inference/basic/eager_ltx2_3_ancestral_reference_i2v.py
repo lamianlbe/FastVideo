@@ -47,13 +47,17 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from fastvideo.configs.pipelines.base import PipelineConfig
+from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
 
 # ---------------------------------------------------------------------------
 # Fill these in (env vars override).
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "10Eros-LTX-2.3-Distilled-Diffusers")
-IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/path/to/your/first_frame.png")
-PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT", "REPLACE ME: describe the motion and scene here.")
+MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros-LTX-2.3-Distilled-Diffusers")
+IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/workspace/photo_2026-07-09_16-48-21.jpg")
+PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT",
+                        "情色电影，温暖亲密光影。画面右侧的男生用双手持续揉捏女生的乳房，拇指反复刺激乳头，画面左侧的女生保持柔和微张嘴表情"
+                        "并发出轻微喘息，两人目光锁定，身体轻微摇摆。")
 OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/eager_i2v_test"))
 SEED = int(os.getenv("LTX23_SEED", "635141064074927"))  # workflow node 524
 
@@ -63,9 +67,9 @@ SEED = int(os.getenv("LTX23_SEED", "635141064074927"))  # workflow node 524
 # VAE's /32 rule). NOTE: the ComfyUI sliders say 1024x1376, but node 893
 # (Resize v2, divisible_by=32) silently crops the half-res image 688 -> 672,
 # so the workflow's true output is 1024x1344 — replicated here explicitly.
-WIDTH = 1024
-HEIGHT = 1344
-NUM_FRAMES = int(os.getenv("LTX23_NUM_FRAMES", "361"))  # shrink (e.g. 121) for smoke tests
+WIDTH = 1344
+HEIGHT = 768
+NUM_FRAMES = int(os.getenv("LTX23_NUM_FRAMES", "241"))  # shrink (e.g. 121) for smoke tests
 FPS = 24
 
 # Workflow sampling (nodes 914 / 582 / 910 / 911).
@@ -120,9 +124,13 @@ def main() -> None:
     print(f"image:     {IMAGE_PATH}")
     print(f"frames:    {NUM_FRAMES} @ {FPS} fps, {WIDTH}x{HEIGHT}")
 
+    pipeline_config = PipelineConfig.from_pretrained(model_root)
+    pipeline_config.dit_config.quant_config = NVFP4Config()
+
     generator = VideoGenerator.from_pretrained(
         model_root,
         num_gpus=1,
+        pipeline_config=pipeline_config,
         # --- eager: no compile flags at all ---
         # --- two-stage refine (ComfyUI first pass + upscale pass) ---
         ltx2_refine_enabled=True,
