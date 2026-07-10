@@ -235,6 +235,62 @@ def euler_ancestral_cfg_pp_step(
     return x
 
 
+def parse_block_range(spec: str, num_blocks: int) -> list[int]:
+    """Parse "36-47" / "10,12,14" style block filters (comfy semantics:
+    inclusive ranges, clamped to [0, num_blocks - 1])."""
+    blocks: set[int] = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, _, hi_s = part.partition("-")
+            lo, hi = int(lo_s), int(hi_s)
+        else:
+            lo = hi = int(part)
+        lo = max(0, lo)
+        hi = min(num_blocks - 1, hi)
+        blocks.update(range(lo, hi + 1))
+    if not blocks:
+        raise ValueError(f"Block filter {spec!r} selects no blocks (num_blocks={num_blocks})")
+    return sorted(blocks)
+
+
+def build_text_amp_weight(
+    *,
+    scale: float,
+    spatial_focus: float,
+    frames: int,
+    height_tokens: int,
+    width_tokens: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Per-token amplification weight for the text cross-attention output
+    (port of the ComfyUI LTXTextAttentionAmplifier math).
+
+    Returns ``[1, frames * H * W, 1]``. ``spatial_focus <= 0`` -> uniform
+    ``scale``; otherwise ``1 + (scale - 1) * g`` with ``g`` a min-max
+    normalized center Gaussian over the (H, W) grid (sigma =
+    ``max(0.3, 1 - 0.7 * focus) * min(H, W)``), identical for every frame.
+    """
+    hw = height_tokens * width_tokens
+    if spatial_focus <= 0.0:
+        grid = torch.full((hw, ), float(scale), device=device, dtype=torch.float32)
+    else:
+        sigma_g = max(0.3, 1.0 - 0.7 * float(spatial_focus)) * min(height_tokens, width_tokens)
+        cy = (height_tokens - 1) / 2.0
+        cx = (width_tokens - 1) / 2.0
+        dy = torch.arange(height_tokens, dtype=torch.float32, device=device) - cy
+        dx = torch.arange(width_tokens, dtype=torch.float32, device=device) - cx
+        dist_sq = dy.unsqueeze(1).pow(2) + dx.unsqueeze(0).pow(2)
+        gaussian = torch.exp(-dist_sq / (2.0 * sigma_g * sigma_g))
+        gaussian = (gaussian - gaussian.min()) / (gaussian.max() - gaussian.min() + 1e-6)
+        grid = (1.0 + (float(scale) - 1.0) * gaussian).reshape(hw)
+    weight = grid.repeat(frames).reshape(1, frames * hw, 1)
+    return weight.to(dtype=dtype)
+
+
 class LTX2DenoisingStage(PipelineStage):
     """Run the LTX-2 denoising loop over the sigma schedule."""
 
@@ -307,10 +363,14 @@ class LTX2DenoisingStage(PipelineStage):
         # term, even at guidance_scale=1 (matching ComfyUI's
         # disable_cfg1_optimization behaviour).
         need_uncond = sampler == "euler_ancestral_cfg_pp"
+        # A stage-1 per-step CFG schedule with entries > 1.0 needs negative
+        # embeddings even when the scalar guidance_scale is 1.0.
+        schedule_wants_neg = (self.sigmas_override is None and fastvideo_args.ltx2_stage1_cfg_values is not None
+                              and any(v != 1.0 for v in fastvideo_args.ltx2_stage1_cfg_values))
 
         neg_prompt_embeds = None
         neg_prompt_mask = None
-        if use_cfg or need_uncond:
+        if use_cfg or need_uncond or schedule_wants_neg:
             if batch.negative_prompt_embeds is not None and batch.negative_prompt_embeds:
                 neg_prompt_embeds = batch.negative_prompt_embeds[0]
             elif need_uncond:
@@ -531,15 +591,23 @@ class LTX2DenoisingStage(PipelineStage):
         do_stg_video = not math.isclose(float(stg_scale_video), 0.0)
         do_stg_audio = not math.isclose(float(stg_scale_audio), 0.0)
         do_stg = do_stg_video or do_stg_audio
+        # Per-step CFG schedule (stage 1 only; port of the ComfyUI
+        # STGGuiderAdvanced cfg_values list). Entry i applies at step i,
+        # padded with the last value; overrides both stream CFG scales.
+        stage1_cfg_values = (fastvideo_args.ltx2_stage1_cfg_values if self.sigmas_override is None else None)
+        if stage1_cfg_values is not None:
+            use_cfg = use_cfg or any(v != 1.0 for v in stage1_cfg_values)
+
         do_cfg_text = use_cfg and (cfg_scale_video != 1.0 or cfg_scale_audio != 1.0)
         do_modality_video = not math.isclose(float(modality_scale_video), 1.0)
         do_modality_audio = not math.isclose(float(modality_scale_audio), 1.0)
         do_mod = do_modality_video or do_modality_audio
-        do_guidance = do_cfg_text or do_mod or do_stg
 
-        if do_cfg_text and neg_prompt_embeds is None:
+        needs_neg = do_cfg_text or (stage1_cfg_values is not None and any(v != 1.0 for v in stage1_cfg_values))
+        if needs_neg and neg_prompt_embeds is None:
             raise ValueError("LTX-2 text CFG is enabled "
-                             "(ltx2_cfg_scale_video/audio != 1.0), "
+                             "(ltx2_cfg_scale_video/audio != 1.0 or "
+                             "ltx2_stage1_cfg_values has entries > 1.0), "
                              "but negative prompt embeddings are missing")
 
         logger.info(
@@ -599,6 +667,64 @@ class LTX2DenoisingStage(PipelineStage):
             logger.info("[LTX2] Reference token conditioning active (%s, mode=%s)", ref_key,
                         fastvideo_args.ltx2_reference_position_mode)
 
+        # Text cross-attention amplification (LTXTextAttentionAmplifier port).
+        stage_name = "refine" if self.sigmas_override is not None else "base"
+        num_blocks = int(
+            getattr(self.transformer, "num_layers", None)
+            or len(getattr(getattr(self.transformer, "model", None), "transformer_blocks", [])) or 48)
+        amp_scale = float(fastvideo_args.ltx2_text_amp_scale)
+        if amp_scale != 1.0 and fastvideo_args.ltx2_text_amp_stage in (stage_name, "both"):
+            amp_blocks = parse_block_range(fastvideo_args.ltx2_text_amp_blocks, num_blocks)
+            amp_weight = build_text_amp_weight(
+                scale=amp_scale,
+                spatial_focus=float(fastvideo_args.ltx2_text_amp_spatial_focus),
+                frames=int(latents.shape[2]),
+                height_tokens=int(latents.shape[3]),
+                width_tokens=int(latents.shape[4]),
+                device=latents.device,
+                dtype=target_dtype,
+            )
+            extra_transformer_kwargs["text_amp_weight"] = amp_weight
+            extra_transformer_kwargs["text_amp_blocks"] = amp_blocks
+            logger.info("[LTX2] Text attention amplification x%.2f on blocks %s (%s stage, focus=%.2f)", amp_scale,
+                        amp_blocks, stage_name, fastvideo_args.ltx2_text_amp_spatial_focus)
+
+        # Latent anchor identity stabilizer (LTXLatentAnchorAware port),
+        # stage-1 only, eager-only.
+        anchor_ctx = None
+        if fastvideo_args.ltx2_anchor_strength > 0.0 and self.sigmas_override is None:
+            if getattr(fastvideo_args, "enable_torch_compile", False):
+                raise ValueError("ltx2_anchor_strength > 0 is eager-only: the per-block anchor "
+                                 "snapshot cache is incompatible with torch.compile. Disable "
+                                 "enable_torch_compile or the anchor.")
+            from fastvideo.models.dits.ltx2_anchor import (
+                LatentAnchorContext,
+                resample_energy_map,
+            )
+            energy = batch.extra.get("ltx2_anchor_energy_map")
+            if isinstance(energy, torch.Tensor):
+                energy = resample_energy_map(
+                    energy.to(device=latents.device, dtype=torch.float32),
+                    int(latents.shape[3]),
+                    int(latents.shape[4]),
+                )
+            anchor_ctx = LatentAnchorContext(
+                strength=float(fastvideo_args.ltx2_anchor_strength),
+                blocks=parse_block_range(fastvideo_args.ltx2_anchor_blocks, num_blocks),
+                frames=int(latents.shape[2]),
+                height_tokens=int(latents.shape[3]),
+                width_tokens=int(latents.shape[4]),
+                similarity_threshold=float(fastvideo_args.ltx2_anchor_similarity_threshold),
+                decay_with_distance=float(fastvideo_args.ltx2_anchor_decay_with_distance),
+                energy_threshold=float(fastvideo_args.ltx2_anchor_energy_threshold),
+                anchor_frame=int(fastvideo_args.ltx2_anchor_frame),
+                energy_grid=energy if isinstance(energy, torch.Tensor) else None,
+            )
+            extra_transformer_kwargs["latent_anchor"] = anchor_ctx
+            logger.info("[LTX2] Latent anchor active: strength=%.3f blocks=%s cache_at_step=%d energy=%s",
+                        anchor_ctx.strength, anchor_ctx.blocks, fastvideo_args.ltx2_anchor_cache_at_step,
+                        "on" if anchor_ctx.energy_grid is not None else "off")
+
         # Fresh-noise generator for the ancestral samplers. Seeded with an
         # offset so the ancestral draws don't replay the initial-latent
         # noise stream.
@@ -622,6 +748,20 @@ class LTX2DenoisingStage(PipelineStage):
         for step_index in tqdm(range(len(sigmas) - 1)):
             sigma = sigmas[step_index]
             sigma_next = sigmas[step_index + 1]
+            # Per-step CFG lookup (padded with the last entry, comfy-style).
+            step_cfg_video = cfg_scale_video
+            step_cfg_audio = cfg_scale_audio
+            if stage1_cfg_values is not None:
+                step_cfg = stage1_cfg_values[min(step_index, len(stage1_cfg_values) - 1)]
+                step_cfg_video = step_cfg
+                step_cfg_audio = step_cfg
+            step_do_cfg_text = (neg_prompt_embeds is not None and (step_cfg_video != 1.0 or step_cfg_audio != 1.0)
+                                if stage1_cfg_values is not None else do_cfg_text)
+            step_do_guidance = step_do_cfg_text or do_mod or do_stg
+            if anchor_ctx is not None:
+                # The snapshot is captured on the first pass of the cache
+                # step; later passes/steps hit the populated cache.
+                anchor_ctx.capture = (step_index == int(fastvideo_args.ltx2_anchor_cache_at_step))
             # Per-sample sigma for LTX-2.3 cross-attention AdaLN prompt
             # timestep. Ignored by LTX-2.0 (prompt_adaln is None).
             sigma_batch = sigma.reshape(1).expand(latents.shape[0])
@@ -673,7 +813,7 @@ class LTX2DenoisingStage(PipelineStage):
                 # (which wants the raw unconditional x0 even at cfg=1).
                 uncond_denoised = None
                 uncond_audio = None
-                if (do_guidance and do_cfg_text) or need_uncond:
+                if (step_do_guidance and step_do_cfg_text) or need_uncond:
                     with _nvtx_range("ltx2.denoise.pass.neg"):
                         neg_outputs = self.transformer(
                             hidden_states=latent_model_input,
@@ -694,7 +834,7 @@ class LTX2DenoisingStage(PipelineStage):
                         uncond_denoised = neg_outputs
                         uncond_audio = None
 
-                if do_guidance:
+                if step_do_guidance:
                     # Defaults: (pos - pos) = 0 under each scale.
                     neg_denoised = (uncond_denoised if uncond_denoised is not None else pos_denoised)
                     neg_audio = uncond_audio if uncond_audio is not None else pos_audio
@@ -751,14 +891,13 @@ class LTX2DenoisingStage(PipelineStage):
                             ptb_audio = None
 
                     # Multi-modal guidance formula per stream.
-                    vid = (pos_denoised + (cfg_scale_video - 1) * (pos_denoised - neg_denoised) +
+                    vid = (pos_denoised + (step_cfg_video - 1) * (pos_denoised - neg_denoised) +
                            (modality_scale_video - 1) * (pos_denoised - mod_denoised) + stg_scale_video *
                            (pos_denoised - ptb_denoised))
                     aud = None
                     if pos_audio is not None:
-                        aud = (pos_audio + (cfg_scale_audio - 1) * (pos_audio - neg_audio) +
-                               (modality_scale_audio - 1) * (pos_audio - mod_audio) + stg_scale_audio *
-                               (pos_audio - ptb_audio))
+                        aud = (pos_audio + (step_cfg_audio - 1) * (pos_audio - neg_audio) + (modality_scale_audio - 1) *
+                               (pos_audio - mod_audio) + stg_scale_audio * (pos_audio - ptb_audio))
 
                     # Guidance rescaling (prevents saturation).
                     if rescale_scale > 0:

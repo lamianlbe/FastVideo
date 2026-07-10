@@ -32,6 +32,7 @@ from fastvideo.layers.linear import ReplicatedLinear
 from fastvideo.layers.quantization.base_config import QuantizationConfig
 from fastvideo.logger import init_logger
 from fastvideo.models.dits.base import BaseDiT
+from fastvideo.models.dits.ltx2_anchor import apply_latent_anchor
 from fastvideo.platforms import AttentionBackendEnum
 
 logger = init_logger(__name__)
@@ -2029,6 +2030,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
         skip_cross_modal_attn: bool = False,
         skip_video_self_attn: bool | torch.Tensor = False,
         skip_audio_self_attn: bool | torch.Tensor = False,
+        text_amp: torch.Tensor | None = None,
+        latent_anchor: Any | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward pass for transformer block.
 
@@ -2097,9 +2100,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
             else:
                 vx_attn1_out = self.attn1(norm_vx, pe=video.positional_embeddings)
+            if latent_anchor is not None:
+                # LTXLatentAnchorAware port: pre-gate additive pull toward the
+                # anchor frame's matched tokens (eager-only, see ltx2_anchor).
+                vx_attn1_out = apply_latent_anchor(vx_attn1_out, latent_anchor, self.idx)
             vx = vx + vx_attn1_out * vgate_msa * video_self_attn_mask
             # Text cross-attention: no SP mask needed (text is replicated).
-            vx = vx + self._apply_text_cross_attention(
+            vx_ca_out = self._apply_text_cross_attention(
                 x=vx,
                 context=video.context,
                 attn=self.attn2,
@@ -2110,6 +2117,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 prompt_timestep=video.prompt_timestep,
                 context_mask=video.context_mask,
             )
+            if text_amp is not None:
+                # LTXTextAttentionAmplifier port: per-token scale on the text
+                # cross-attention output (commutes with the AdaLN gate).
+                vx_ca_out = vx_ca_out * text_amp.to(dtype=vx_ca_out.dtype)
+            vx = vx + vx_ca_out
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
@@ -2651,10 +2663,15 @@ class LTXModel(torch.nn.Module):
         skip_cross_modal_attn: bool = False,
         skip_video_self_attn_blocks: list[int] | None = None,
         skip_audio_self_attn_blocks: list[int] | None = None,
+        text_amp_weight: torch.Tensor | None = None,
+        text_amp_blocks: list[int] | None = None,
+        latent_anchor: Any | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         # Convert once so per-block membership checks stay O(1).
         skip_video_self_attn_block_set = set(skip_video_self_attn_blocks or [])
         skip_audio_self_attn_block_set = set(skip_audio_self_attn_blocks or [])
+        text_amp_block_set = set(text_amp_blocks or [])
+        anchor_block_set = set(latent_anchor.blocks) if latent_anchor is not None else set()
 
         for idx, block in enumerate(self.transformer_blocks):
             skip_v_sa = idx in skip_video_self_attn_block_set
@@ -2667,6 +2684,8 @@ class LTXModel(torch.nn.Module):
                 skip_cross_modal_attn=skip_cross_modal_attn,
                 skip_video_self_attn=skip_v_sa,
                 skip_audio_self_attn=skip_a_sa,
+                text_amp=(text_amp_weight if idx in text_amp_block_set else None),
+                latent_anchor=(latent_anchor if idx in anchor_block_set else None),
             )
         return video, audio
 
@@ -2696,6 +2715,9 @@ class LTXModel(torch.nn.Module):
         skip_cross_modal_attn: bool = False,
         skip_video_self_attn_blocks: list[int] | None = None,
         skip_audio_self_attn_blocks: list[int] | None = None,
+        text_amp_weight: torch.Tensor | None = None,
+        text_amp_blocks: list[int] | None = None,
+        latent_anchor: Any | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX model.
 
@@ -2737,6 +2759,9 @@ class LTXModel(torch.nn.Module):
             skip_cross_modal_attn=skip_cross_modal_attn,
             skip_video_self_attn_blocks=skip_video_self_attn_blocks,
             skip_audio_self_attn_blocks=skip_audio_self_attn_blocks,
+            text_amp_weight=text_amp_weight,
+            text_amp_blocks=text_amp_blocks,
+            latent_anchor=latent_anchor,
         )
 
         vx = (
@@ -2921,6 +2946,9 @@ class LTX2Transformer3DModel(BaseDiT):
         ref_latent: torch.Tensor | None = None,
         ref_zero_timesteps: bool = False,
         ref_position_mode: str = "reference",
+        text_amp_weight: torch.Tensor | None = None,
+        text_amp_blocks: list[int] | None = None,
+        latent_anchor: Any | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # Reference token conditioning (attention-level identity reference,
@@ -2990,6 +3018,24 @@ class LTX2Transformer3DModel(BaseDiT):
                 ref_timestep = torch.zeros_like(ref_timestep)
             timestep = torch.cat([ref_timestep, timestep], dim=1)
 
+        if latent_anchor is not None:
+            if sp_world_size > 1:
+                raise ValueError("LTX-2 latent anchor conditioning requires the full token "
+                                 "sequence on one rank; it is not supported with sequence "
+                                 "parallelism yet.")
+            # The anchor grid maps onto the target tokens only; skip any
+            # reference-token prefix.
+            latent_anchor.token_offset = n_ref_tokens
+
+        # Text-amplification weight follows the token sequence exactly:
+        # extend for the reference prefix (per-frame weight pattern is
+        # identical, so reuse the leading rows), then shard with the latents.
+        if text_amp_weight is not None and n_ref_tokens > 0:
+            text_amp_weight = torch.cat(
+                [text_amp_weight[:, :n_ref_tokens], text_amp_weight],
+                dim=1,
+            )
+
         # Shard video latents and timestep across SP ranks
         video_original_seq_len = latents.shape[1]
         video_padded_seq_len = video_original_seq_len
@@ -2998,6 +3044,8 @@ class LTX2Transformer3DModel(BaseDiT):
             latents, video_original_seq_len = sequence_model_parallel_shard(latents, dim=1)
             # Shard timestep along sequence dimension (timestep has shape [batch, seq_len])
             video_timestep, _ = sequence_model_parallel_shard(timestep, dim=1)
+            if text_amp_weight is not None:
+                text_amp_weight, _ = sequence_model_parallel_shard(text_amp_weight, dim=1)
             current_seq_len = latents.shape[1]
             video_padded_seq_len = current_seq_len * sp_world_size
         # Compute RoPE positions for the FULL sequence (before sharding)
@@ -3129,6 +3177,9 @@ class LTX2Transformer3DModel(BaseDiT):
             skip_cross_modal_attn=skip_cross_modal_attn,
             skip_video_self_attn_blocks=skip_video_self_attn_blocks,
             skip_audio_self_attn_blocks=skip_audio_self_attn_blocks,
+            text_amp_weight=text_amp_weight,
+            text_amp_blocks=text_amp_blocks,
+            latent_anchor=latent_anchor,
         )
 
         # Denoised prediction

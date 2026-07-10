@@ -36,9 +36,13 @@ class LTX2TextEncodingStage(TextEncodingStage):
     ) -> ForwardBatch:
         # CFG++ needs the unconditional prediction every step even at
         # guidance_scale=1 (it decouples the step direction from the CFG
-        # result), so negative embeddings must be encoded regardless of the
-        # guidance scale.
-        if (fastvideo_args.ltx2_refine_sampler == "euler_ancestral_cfg_pp" and not batch.do_classifier_free_guidance):
+        # result), and a stage-1 per-step CFG schedule with entries > 1.0
+        # needs negatives too — so force negative encoding regardless of the
+        # scalar guidance scale in both cases.
+        schedule_wants_neg = (fastvideo_args.ltx2_stage1_cfg_values is not None
+                              and any(v != 1.0 for v in fastvideo_args.ltx2_stage1_cfg_values))
+        if ((fastvideo_args.ltx2_refine_sampler == "euler_ancestral_cfg_pp" or schedule_wants_neg)
+                and not batch.do_classifier_free_guidance):
             if batch.negative_prompt is None:
                 batch.negative_prompt = ""
             batch.do_classifier_free_guidance = True
