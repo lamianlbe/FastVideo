@@ -14,6 +14,12 @@ checkpoint_conversion/
 ├── convert_gamecraft_weights.py         # DiT only
 ├── convert_gen3c_to_fastvideo.py
 ├── convert_ltx2_weights.py
+├── convert_ltx2_upsampler.py            # Official single-file latent upsampler → dir
+├── convert_ltx23_weights.py             # One-step LTX-2.3 convert + config patch
+├── patch_ltx23_configs.py               # Re-adds 2.3 arch fields the stock converter drops
+├── merge_ltx2_lora_stack.py             # Offline-merge plain/component-gated LoRA stacks
+├── dequant_gemma_fp8mixed_to_hf.py      # ComfyUI fp8mixed Gemma → HF dir (donor-based)
+├── inspect_safetensors.py               # Header-only structural dump of any safetensors
 ├── convert_turbodiffusion_to_diffusers.py
 ├── convert_turbodiffusion_i2v_to_diffusers.py
 ├── extract_llava_text_encoder.py        # Encoder extraction from a multimodal repo
