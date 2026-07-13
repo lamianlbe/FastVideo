@@ -62,7 +62,14 @@ LAST_LATENT_IDX = (NUM_FRAMES - 1) // 8
 # Validated DMD sampling recipe (same as the main DMD example).
 STAGE1_SIGMAS = [1.000, 0.955, 0.893, 0.812, 0.715, 0.603, 0.482, 0.241, 0.121, 0.0]
 STAGE2_SIGMAS = [0.92, 0.725, 0.421875, 0.0]
-IMAGE_CRF = 35.0
+# LTXVPreprocess port: H.264 CRF re-encode of the conditioning images.
+# Higher = more motion (frames look like video, not stills) but a blurrier
+# anchored first frame. The stage-2 override lets the refine pass re-anchor
+# with a cleaner encode — LTX23_IMAGE_CRF_STAGE2=0 sharpens the final first
+# frame while stage 1 keeps the motion-strength CRF (empty = same as stage 1).
+IMAGE_CRF = float(os.getenv("LTX23_IMAGE_CRF", "35.0"))
+_crf2 = os.getenv("LTX23_IMAGE_CRF_STAGE2", "")
+IMAGE_CRF_STAGE2 = float(_crf2) if _crf2 else None
 
 NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitles, text, "
                    "watermark, overlay effects, pc game, yelling, console game, video game, "
@@ -125,6 +132,7 @@ def main() -> None:
           f"in_upscale={LAST_IN_UPSCALE}")
     print(f"frames:     {NUM_FRAMES} @ {FPS} fps, {WIDTH}x{HEIGHT}")
     print(f"mode:       compile={COMPILE} quant={QUANT}")
+    print(f"image_crf:  stage1={IMAGE_CRF} stage2={IMAGE_CRF_STAGE2 if IMAGE_CRF_STAGE2 is not None else '(same)'}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
     pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
@@ -188,6 +196,7 @@ def main() -> None:
         # unless LTX23_LAST_IN_UPSCALE=1 (None = same list as stage 1).
         ltx2_images_stage2=(None if LAST_IN_UPSCALE else [(IMAGE_PATH, 0, 1.0)]),
         ltx2_image_crf=IMAGE_CRF,
+        ltx2_image_crf_stage2=IMAGE_CRF_STAGE2,
         ltx2_stg_scale_video=0.0,
         ltx2_stg_scale_audio=0.0,
         ltx2_cfg_scale_video=1.0,

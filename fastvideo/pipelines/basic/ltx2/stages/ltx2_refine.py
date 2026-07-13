@@ -219,6 +219,10 @@ class LTX2UpsampleStage(PipelineStage):
             # Per-stage image list: lets callers keep a keyframe (e.g. a
             # last-frame anchor) out of the refine pass.
             images_override=batch.ltx2_images_stage2,
+            # Per-stage CRF: a lower stage-2 value re-anchors with a cleaner
+            # encode (sharper final first frame) while stage 1 keeps the
+            # motion-strength CRF. None falls back to batch.ltx2_image_crf.
+            image_crf=batch.ltx2_image_crf_stage2,
         )
         if image_conditioning is None:
             batch.extra.pop(LTX2_VIDEO_CLEAN_LATENT_KEY, None)

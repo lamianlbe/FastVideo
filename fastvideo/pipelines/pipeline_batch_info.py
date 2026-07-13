@@ -200,6 +200,10 @@ class ForwardBatch:
     # the refine pass; an empty list disables stage-2 image conditioning.
     ltx2_images_stage2: list[tuple[str, int, float]] | None = None
     ltx2_image_crf: float = 33.0
+    # Optional stage-2 (refine) CRF override. None = reuse ltx2_image_crf.
+    # A lower stage-2 CRF re-anchors the first frame with a cleaner encode
+    # (sharper final frame 0) while stage 1 keeps the motion-strength CRF.
+    ltx2_image_crf_stage2: float | None = None
     ltx2_conditioning_latent_stage1: torch.Tensor | None = None
     ltx2_conditioning_latent_stage2: torch.Tensor | None = None
     ltx2_video_conditions: list[tuple[list[str], int, float]] | None = None

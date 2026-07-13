@@ -135,6 +135,8 @@ class SamplingParam:
     # conditioning entirely.
     ltx2_images_stage2: list[tuple[str, int, float]] | None = None
     ltx2_image_crf: float = 33.0
+    # Optional stage-2 (refine) CRF override; None reuses ltx2_image_crf.
+    ltx2_image_crf_stage2: float | None = None
     ltx2_conditioning_latent_stage1: Any | None = None
     ltx2_conditioning_latent_stage2: Any | None = None
     ltx2_video_conditions: list[tuple[list[str], int, float]] | None = None
