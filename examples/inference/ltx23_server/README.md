@@ -16,6 +16,7 @@ the two share compiled graphs, so switching between them never recompiles.
 | `ltx23_engine.py` | Shared engine (recipe, generator construction, mode matching, warmup) |
 | `deploy/install.sh` | One-shot dependency install (kernel, FA4, flashinfer, server extras) |
 | `deploy/Dockerfile` | Fleet image: deps + server baked in, model/cache on a volume |
+| `deploy/run_server.sh` | Bare-metal supervisor: restart-on-crash loop with per-run logs |
 
 ## Installing dependencies
 
@@ -137,3 +138,51 @@ part of the shape**: the audio latent length is derived from the clip
 duration (`num_frames / fps`), so the same frame count at a different
 frame rate is a different DiT sequence length. To add a mode, add it to
 the config, re-run `build_compile_cache.py`, and restart.
+
+## Reliability: auto-restart + request logs
+
+**Request logging** (built in, both environments). Every request gets an
+id, returned as `X-LTX23-Request-Id` on every response including errors,
+and one JSON line in `<log_dir>/requests.jsonl` (rotating, 64 MB × 10)
+recording the client, all parameters, the served mode, seed, latency, and
+on failure the error + traceback. Failed generations additionally keep
+their uploaded images and a `request.json` under
+`<log_dir>/failed/<request_id>/` so any failure can be reproduced offline.
+Point `log_dir` at the network volume; `""` logs to stdout only.
+
+**Crash handling.** Two distinct failure shapes:
+
+- *Process dies* (CUDA abort, OOM kill, segfault) → the supervisor
+  restarts it.
+- *Process alive but GPU wedged* (every generation errors) → no
+  supervisor can see that, so the server converts it into the first
+  shape: after `max_consecutive_failures` (default 3) consecutive
+  generation errors it logs a critical event and exits(1). Successes
+  reset the counter; 4xx validation errors don't count.
+
+**Docker (production):** restart policy + the built-in `HEALTHCHECK`
+(hits `/healthz`; `start-period` must cover startup warmup):
+
+```bash
+docker run -d --name ltx23 --gpus all --restart unless-stopped \
+    -p 8000:8000 -v /workspace:/workspace ltx23-server:<tag>
+docker logs -f ltx23                       # startup + [request] lines
+tail -f /workspace/ltx23/logs/requests.jsonl
+```
+
+Note plain docker only *reports* unhealthy — restarts happen because the
+process exits (crash or self-exit) under `--restart unless-stopped`.
+
+**Bare metal (debugging):** `deploy/run_server.sh` wraps the server in a
+restart loop with backoff, teeing each run to `logs/server-<ts>.log`:
+
+```bash
+cd examples/inference/ltx23_server
+CONFIG=config.yaml bash deploy/run_server.sh
+```
+
+A clean exit (code 0, e.g. Ctrl-C on uvicorn) stops the loop; crashes and
+the self-exit (code 1) restart after `BACKOFF` (default 5 s). On hosts
+with systemd, an equivalent unit is `Restart=on-failure` +
+`ExecStart=... python server.py --config ...` — the self-exit semantics
+are the same.

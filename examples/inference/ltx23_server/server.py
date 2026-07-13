@@ -19,21 +19,35 @@ configured mode are served with the closest-resolution mode; conditioning
 images are cover-fit (aspect-preserving resize + center crop, no
 letterboxing) to the served resolution inside the pipeline. The actually
 served combo is reported in X-LTX23-* response headers.
+
+Reliability: every request gets an id (X-LTX23-Request-Id) and a JSON
+line in <log_dir>/requests.jsonl; failed generations keep their inputs
+under <log_dir>/failed/<id>/ for repro. After max_consecutive_failures
+generation errors the process exits(1) so the supervisor (docker
+--restart / deploy/run_server.sh) replaces a wedged GPU worker.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
+import logging.handlers
+import os
 import random
 import shutil
 import tempfile
 import threading
+import time
+import traceback
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # fastapi doesn't import torch, so these are safe before
 # setup_environment() stages the process env. They must be module-level for
 # FastAPI to resolve the endpoint's postponed annotations.
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -51,6 +65,33 @@ from ltx23_engine import (
 
 _ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
+# Indirection so tests can intercept the supervisor-restart exit.
+_terminate = lambda: os._exit(1)  # noqa: E731
+
+
+def setup_request_logging(cfg: Ltx23ServerConfig) -> logging.Logger:
+    """JSON-lines request log: always mirrored to stdout; also rotated
+    into <log_dir>/requests.jsonl when log_dir is set."""
+    logger = logging.getLogger("ltx23.requests")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()  # idempotent across rebuilds (tests)
+    stream = logging.StreamHandler()
+    stream.setFormatter(logging.Formatter("[request] %(message)s"))
+    logger.addHandler(stream)
+    if cfg.log_dir:
+        log_dir = Path(cfg.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_dir / "requests.jsonl",
+            maxBytes=64 * 2**20,
+            backupCount=10,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(file_handler)
+    return logger
+
 
 def _save_upload(upload, dest_dir: Path, stem: str) -> str:
     suffix = Path(upload.filename or "").suffix.lower()
@@ -66,6 +107,7 @@ def _save_upload(upload, dest_dir: Path, stem: str) -> str:
 
 def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
     app = FastAPI(title="FastVideo LTX-2.3 server", version="1.0")
+    request_logger = setup_request_logging(cfg)
     # One GPU pipeline: requests queue on this lock and run strictly
     # serially (sync endpoints run in Starlette's threadpool).
     gpu_lock = threading.Lock()
@@ -73,9 +115,51 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
     if scratch_root:
         Path(scratch_root).mkdir(parents=True, exist_ok=True)
 
+    fail_lock = threading.Lock()
+    fail_state = {"consecutive": 0}
+
+    def _register_failure() -> int:
+        with fail_lock:
+            fail_state["consecutive"] += 1
+            count = fail_state["consecutive"]
+        if cfg.max_consecutive_failures and count >= cfg.max_consecutive_failures:
+            request_logger.critical(
+                json.dumps({
+                    "event": "too_many_consecutive_failures",
+                    "count": count,
+                    "action": "exiting in 2s so the supervisor restarts the server",
+                }))
+            # Delay so the in-flight 500 response flushes first.
+            threading.Timer(2.0, _terminate).start()
+        return count
+
+    def _register_success() -> None:
+        with fail_lock:
+            fail_state["consecutive"] = 0
+
+    def _preserve_failed_inputs(workdir: Path, record: dict, tb: str) -> str | None:
+        """Keep a failed request's inputs + params for repro (log_dir set)."""
+        if not cfg.log_dir:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+        failed_dir = Path(cfg.log_dir) / "failed" / record["request_id"]
+        try:
+            failed_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(workdir), str(failed_dir))
+            (failed_dir / "request.json").write_text(
+                json.dumps(record, ensure_ascii=False, indent=2) + "\n" + tb)
+            return str(failed_dir)
+        except OSError:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+
     @app.get("/healthz")
     def healthz() -> dict:
-        return {"status": "ok", "busy": gpu_lock.locked()}
+        return {
+            "status": "ok",
+            "busy": gpu_lock.locked(),
+            "consecutive_failures": fail_state["consecutive"],
+        }
 
     @app.get("/v1/modes")
     def modes() -> dict:
@@ -90,6 +174,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
 
     @app.post("/v1/generate")
     def generate(
+        http_request: Request,
         prompt: str = Form(...),
         width: int = Form(...),
         height: int = Form(...),
@@ -106,15 +191,45 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
         image_crf: float = Form(cfg.image_crf),
         image_crf_stage2: float = Form(cfg.image_crf_stage2),
     ):
+        request_id = uuid.uuid4().hex[:12]
+        t0 = time.perf_counter()
+        record: dict = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "request_id": request_id,
+            "client": http_request.client.host if http_request.client else None,
+            "params": {
+                "prompt": prompt,
+                "negative_prompt_set": negative_prompt is not None,
+                "requested": [width, height, num_frames, fps],
+                "has_last_frame": bool(last_frame is not None and last_frame.filename),
+                "last_frame_strength": last_frame_strength,
+                "last_in_upscale": last_in_upscale,
+                "image_crf": image_crf,
+                "image_crf_stage2": image_crf_stage2,
+            },
+        }
+        id_header = {"X-LTX23-Request-Id": request_id}
+
+        def finish(status: int, **extra) -> None:
+            record.update(status=status, wall_seconds=round(time.perf_counter() - t0, 2), **extra)
+            request_logger.info(json.dumps(record, ensure_ascii=False))
+
+        def bail(status: int, detail: str) -> HTTPException:
+            finish(status, error=detail)
+            return HTTPException(status_code=status, detail=detail, headers=id_header)
+
         if not prompt.strip():
-            raise HTTPException(status_code=400, detail="prompt must not be empty")
+            raise bail(400, "prompt must not be empty")
         if width <= 0 or height <= 0 or num_frames <= 0 or fps <= 0:
-            raise HTTPException(status_code=400, detail="width/height/num_frames/fps must be positive")
+            raise bail(400, "width/height/num_frames/fps must be positive")
         if not 0.0 <= last_frame_strength <= 1.0:
-            raise HTTPException(status_code=400, detail="last_frame_strength must be in [0, 1]")
+            raise bail(400, "last_frame_strength must be in [0, 1]")
 
         mode, exact = match_mode(cfg.modes, width, height, num_frames, fps)
         req_seed = seed if seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
+        record["params"]["seed"] = req_seed
+        record["params"]["served"] = [mode.width, mode.height, mode.num_frames, mode.fps]
+        record["params"]["exact_match"] = exact
 
         workdir = Path(tempfile.mkdtemp(prefix="ltx23_req_", dir=scratch_root))
         try:
@@ -123,7 +238,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                          if last_frame is not None and last_frame.filename else None)
         except ValueError as err:
             shutil.rmtree(workdir, ignore_errors=True)
-            raise HTTPException(status_code=400, detail=str(err)) from err
+            raise bail(400, str(err)) from err
 
         request = GenerationRequest(
             prompt=prompt,
@@ -140,15 +255,23 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
         try:
             with gpu_lock:
                 result = generate_for_mode(generator, cfg, mode, request, workdir / "output.mp4")
+            video_path = result["video_path"]
+            if not Path(video_path).is_file():
+                raise RuntimeError("generation produced no video file")
         except Exception as err:  # noqa: BLE001
-            shutil.rmtree(workdir, ignore_errors=True)
-            raise HTTPException(status_code=500, detail=f"generation failed: {err}") from err
+            tb = traceback.format_exc()
+            failed_dir = _preserve_failed_inputs(workdir, record, tb)
+            count = _register_failure()
+            finish(500, error=str(err), traceback=tb, failed_inputs=failed_dir,
+                   consecutive_failures=count)
+            raise HTTPException(
+                status_code=500,
+                detail=f"generation failed: {err} (request_id={request_id})",
+                headers=id_header,
+            ) from err
 
-        video_path = result["video_path"]
-        if not Path(video_path).is_file():
-            shutil.rmtree(workdir, ignore_errors=True)
-            raise HTTPException(status_code=500, detail="generation produced no video file")
-
+        _register_success()
+        finish(200, e2e_seconds=round(result["e2e_latency"], 2))
         return FileResponse(
             video_path,
             media_type="video/mp4",
@@ -161,6 +284,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 "X-LTX23-Exact-Match": "1" if exact else "0",
                 "X-LTX23-Seed": str(req_seed),
                 "X-LTX23-E2E-Seconds": f"{result['e2e_latency']:.2f}",
+                **id_header,
             },
             background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),
         )

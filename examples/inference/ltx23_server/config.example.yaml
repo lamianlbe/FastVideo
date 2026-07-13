@@ -26,6 +26,14 @@ port: 8000
 # "" = system temp. Per-request scratch dirs (uploads + output) live here
 # and are deleted after the response is sent.
 output_dir: ""
+# Request log directory: requests.jsonl (rotating JSON lines, one per
+# request) + failed/<request_id>/ (inputs of failed generations, for
+# repro). "" = stdout only. Point at the network volume in production.
+log_dir: /workspace/ltx23/logs
+# Exit(1) after this many consecutive generation failures so the
+# supervisor (docker --restart / run_server.sh) restarts a wedged GPU
+# worker. 0 disables.
+max_consecutive_failures: 3
 
 # Every supported (width, height, num_frames, fps) combination. Requests
 # that don't exactly match are served with the closest-resolution mode.

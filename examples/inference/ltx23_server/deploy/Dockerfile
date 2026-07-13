@@ -38,5 +38,15 @@ ENV FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN \
 
 WORKDIR /opt/FastVideo/examples/inference/ltx23_server
 EXPOSE 8000
+
+# Liveness probe. start-period must cover startup warmup (one dynamo trace
+# per mode against a warm inductor cache) — size it to your mode count.
+# Note plain docker only REPORTS unhealthy; restarts come from the process
+# exiting (crash, or the server's max_consecutive_failures self-exit)
+# combined with `docker run --restart unless-stopped`. Adjust the port if
+# your config overrides it.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60m --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"
+
 ENTRYPOINT ["python", "server.py"]
 CMD ["--config", "/workspace/ltx23/config.yaml"]

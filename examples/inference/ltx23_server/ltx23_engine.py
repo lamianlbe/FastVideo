@@ -92,6 +92,15 @@ class Ltx23ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     output_dir: str = ""  # "" = system temp; holds per-request scratch dirs
+    # "" = log to stdout only. Otherwise a directory receiving
+    # requests.jsonl (rotating JSON-lines request log) and failed/<id>/
+    # (preserved inputs + params of failed generations, for repro).
+    log_dir: str = ""
+    # Exit the process after this many CONSECUTIVE generation failures so
+    # the supervisor (docker --restart / run_server.sh) replaces a wedged
+    # GPU worker with a fresh process. 0 disables. Validation errors (4xx)
+    # don't count; any success resets the counter.
+    max_consecutive_failures: int = 3
     stage1_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE1_SIGMAS))
     stage2_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE2_SIGMAS))
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
