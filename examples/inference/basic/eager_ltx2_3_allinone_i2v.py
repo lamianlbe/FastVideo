@@ -39,9 +39,11 @@ from collections import OrderedDict
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros-AllInOne-LTX-2.3-Distilled-Diffusers")
-IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/workspace/keyframe.png")
-PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT", "REPLACE ME: describe the motion and scene here.")
+MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros_v1_Diffusers")
+IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/workspace/photo_2026-07-09_16-48-21.jpg")
+PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT",
+                        "情色电影，温暖亲密光影。画面右侧的男生用双手持续揉捏女生的乳房，拇指反复刺激乳头，画面左侧的女生保持柔和微张嘴表情"
+                        "并发出轻微喘息，两人目光锁定，身体轻微摇摆。")
 OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/allinone_i2v_test"))
 SEED = int(os.getenv("LTX23_SEED", "635141064074927"))
 
