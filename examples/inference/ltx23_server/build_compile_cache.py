@@ -3,9 +3,10 @@
 
     env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml
 
-Runs one full generation per distinct compile shape (resolution x
-num_frames; fps-only variants share kernels) so all inductor artifacts land
-in the config's ``inductor_cache_dir``. Ship that directory to every
+Runs one full generation per distinct mode (fps included: the audio latent
+length is derived from num_frames / fps, so each fps is its own compile
+shape) so all inductor artifacts land in the config's
+``inductor_cache_dir``. Ship that directory to every
 identical machine (same GPU model / driver / torch / fastvideo stack) and
 server startup warmup drops from a cold compile (tens of minutes per shape)
 to a dynamo re-trace (about a minute per shape).

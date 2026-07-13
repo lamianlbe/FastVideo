@@ -87,5 +87,8 @@ curl -sS -X POST http://localhost:8000/v1/generate \
 One GPU pipeline; requests are served strictly serially (a queue forms
 under load). Per-request parameters — prompt, images, seed, CRF values,
 `last_in_upscale`, FLF vs i2v — are all value-level and never trigger
-recompilation. Only the mode list defines compiled shapes; to add a mode,
-add it to the config, re-run `build_compile_cache.py`, and restart.
+recompilation. Only the mode list defines compiled shapes, and **fps is
+part of the shape**: the audio latent length is derived from the clip
+duration (`num_frames / fps`), so the same frame count at a different
+frame rate is a different DiT sequence length. To add a mode, add it to
+the config, re-run `build_compile_cache.py`, and restart.

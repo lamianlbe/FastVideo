@@ -66,9 +66,12 @@ class Ltx23Mode:
         if self.fps <= 0:
             raise ValueError(f"mode fps={self.fps}: must be positive")
 
-    def shape_key(self) -> tuple[int, int, int]:
-        """Compile-shape identity: fps is value-level and shares kernels."""
-        return (self.width, self.height, self.num_frames)
+    def shape_key(self) -> tuple[int, int, int, int]:
+        """Compile-shape identity. fps is part of it: the audio latent
+        length is derived from the clip duration (num_frames / fps), so a
+        different fps at the same frame count changes the DiT sequence
+        length and requires its own compiled graph."""
+        return (self.width, self.height, self.num_frames, self.fps)
 
 
 @dataclass
@@ -315,16 +318,15 @@ def run_warmup(
     log=print,
 ) -> None:
     """One generation per distinct compile shape so every dynamo trace /
-    inductor compile happens before real traffic. Modes differing only in
-    fps share compiled kernels (fps is value-level) and are traced once."""
-    seen: set[tuple[int, int, int]] = set()
+    inductor compile happens before real traffic. Duplicate mode entries
+    are traced once."""
+    seen: set[tuple[int, int, int, int]] = set()
     workdir = Path(tempfile.mkdtemp(prefix="ltx23_warmup_"))
     try:
         for mode in cfg.modes:
             key = mode.shape_key()
             if key in seen:
-                log(f"[warmup] {mode} shares a compiled shape with an earlier mode (fps is "
-                    "value-level); skipping duplicate trace")
+                log(f"[warmup] {mode} duplicates an earlier mode; skipping")
                 continue
             seen.add(key)
             first = workdir / f"first_{mode.width}x{mode.height}.png"
