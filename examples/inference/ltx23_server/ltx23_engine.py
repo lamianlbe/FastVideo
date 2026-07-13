@@ -101,6 +101,10 @@ class Ltx23ServerConfig:
     # GPU worker with a fresh process. 0 disables. Validation errors (4xx)
     # don't count; any success resets the counter.
     max_consecutive_failures: int = 3
+    # Allowed API keys. Non-empty: /v1/* requests must present one via
+    # "X-API-Key: <key>" or "Authorization: Bearer <key>" or get 401
+    # (/healthz stays open for the docker HEALTHCHECK). Empty: no auth.
+    api_keys: list[str] = field(default_factory=list)
     stage1_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE1_SIGMAS))
     stage2_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE2_SIGMAS))
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
@@ -144,6 +148,8 @@ def load_config(path: str | Path) -> Ltx23ServerConfig:
         raise ValueError(f"{path}: 'model_path' is required")
     if cfg.quant not in ("nvfp4", "none"):
         raise ValueError(f"{path}: quant must be nvfp4 or none, got {cfg.quant}")
+    if any(not isinstance(k, str) or not k.strip() for k in cfg.api_keys):
+        raise ValueError(f"{path}: api_keys entries must be non-empty strings")
     return cfg
 
 

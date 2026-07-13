@@ -35,6 +35,7 @@ import logging
 import logging.handlers
 import os
 import random
+import secrets
 import shutil
 import tempfile
 import threading
@@ -47,7 +48,7 @@ from pathlib import Path
 # fastapi doesn't import torch, so these are safe before
 # setup_environment() stages the process env. They must be module-level for
 # FastAPI to resolve the endpoint's postponed annotations.
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
@@ -115,6 +116,33 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
     if scratch_root:
         Path(scratch_root).mkdir(parents=True, exist_ok=True)
 
+    allowed_keys = [k.strip() for k in cfg.api_keys if k.strip()]
+
+    def require_api_key(
+        http_request: Request,
+        x_api_key: str | None = Header(None),
+        authorization: str | None = Header(None),
+    ) -> None:
+        """401 unless the request presents a configured key via X-API-Key
+        or Authorization: Bearer. No-op when api_keys is empty. /healthz is
+        deliberately outside this gate (docker HEALTHCHECK)."""
+        if not allowed_keys:
+            return
+        presented = x_api_key
+        if presented is None and authorization and authorization.startswith("Bearer "):
+            presented = authorization[len("Bearer "):].strip()
+        if presented and any(secrets.compare_digest(presented, key) for key in allowed_keys):
+            return
+        request_logger.info(
+            json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "event": "auth_rejected",
+                "client": http_request.client.host if http_request.client else None,
+                "path": http_request.url.path,
+                "key_presented": presented is not None,
+            }))
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+
     fail_lock = threading.Lock()
     fail_state = {"consecutive": 0}
 
@@ -161,7 +189,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
             "consecutive_failures": fail_state["consecutive"],
         }
 
-    @app.get("/v1/modes")
+    @app.get("/v1/modes", dependencies=[Depends(require_api_key)])
     def modes() -> dict:
         return {
             "modes": [{
@@ -172,7 +200,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
             } for m in cfg.modes]
         }
 
-    @app.post("/v1/generate")
+    @app.post("/v1/generate", dependencies=[Depends(require_api_key)])
     def generate(
         http_request: Request,
         prompt: str = Form(...),

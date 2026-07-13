@@ -34,6 +34,12 @@ log_dir: /workspace/ltx23/logs
 # supervisor (docker --restart / run_server.sh) restarts a wedged GPU
 # worker. 0 disables.
 max_consecutive_failures: 3
+# Allowed API keys. Non-empty: every /v1/* request must send one via
+# "X-API-Key: <key>" or "Authorization: Bearer <key>" (else 401);
+# /healthz stays open for the docker HEALTHCHECK. Empty list = no auth.
+api_keys:
+  - CHANGE-ME-master-key
+  # - CHANGE-ME-secondary-key
 
 # Every supported (width, height, num_frames, fps) combination. Requests
 # that don't exactly match are served with the closest-resolution mode.

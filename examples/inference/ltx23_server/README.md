@@ -85,6 +85,12 @@ stack component.
 
 ## API
 
+**Auth**: when the config's `api_keys` list is non-empty, every `/v1/*`
+request must carry a configured key — `X-API-Key: <key>` or
+`Authorization: Bearer <key>` — or it gets a 401 (attempts are logged as
+`auth_rejected` events). `/healthz` stays open so the docker HEALTHCHECK
+works. An empty `api_keys` list disables auth (dev only).
+
 ### `POST /v1/generate` (multipart/form-data)
 
 | Field | Required | Default | Notes |
@@ -109,6 +115,7 @@ mode), `X-LTX23-Seed`, `X-LTX23-E2E-Seconds`.
 
 ```bash
 curl -sS -X POST http://localhost:8000/v1/generate \
+  -H 'X-API-Key: CHANGE-ME-master-key' \
   -F prompt='describe the motion…' \
   -F first_frame=@first.png \
   -F last_frame=@last.png \
