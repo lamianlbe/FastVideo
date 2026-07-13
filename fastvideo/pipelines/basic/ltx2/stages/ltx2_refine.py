@@ -42,6 +42,7 @@ from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
     apply_ltx2_gaussian_noiser,
     build_ltx2_image_conditioning,
     build_ltx2_reference_latent,
+    resolve_ltx2_reference_image_path,
 )
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.base import PipelineStage
@@ -184,12 +185,13 @@ class LTX2UpsampleStage(PipelineStage):
         if video_encoder is None:
             raise ValueError("LTX-2 VAE encoder is required for latent upsampling.")
 
-        if fastvideo_args.ltx2_reference_image_path:
+        reference_image_path = resolve_ltx2_reference_image_path(batch, fastvideo_args)
+        if reference_image_path:
             # Re-encode the reference at the stage-2 resolution so its RoPE
             # grid overlaps the refined target's.
             batch.extra[LTX2_REFERENCE_LATENT_STAGE2_KEY] = build_ltx2_reference_latent(
                 vae=self.vae,
-                image_path=fastvideo_args.ltx2_reference_image_path,
+                image_path=reference_image_path,
                 height=int(target_height),
                 width=int(target_width),
                 strength=fastvideo_args.ltx2_reference_strength,
@@ -199,7 +201,7 @@ class LTX2UpsampleStage(PipelineStage):
             )
             logger.info(
                 "[LTX2] Encoded stage-2 reference latent from %s at %dx%d.",
-                fastvideo_args.ltx2_reference_image_path,
+                reference_image_path,
                 int(target_width),
                 int(target_height),
             )

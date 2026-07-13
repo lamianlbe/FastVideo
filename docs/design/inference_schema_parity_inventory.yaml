@@ -517,6 +517,7 @@ surfaces:
       ltx2_images_stage2: request.extensions.ltx2.images_stage2
       ltx2_image_crf_stage2: request.stage_overrides.refine.image_crf_stage2
       ltx2_image_crf: request.stage_overrides.refine.image_crf
+      ltx2_reference_image_path: request.extensions.ltx2.reference_image_path
       ltx2_conditioning_latent_stage1: request.extensions.ltx2.conditioning_latent_stage1
       ltx2_conditioning_latent_stage2: request.extensions.ltx2.conditioning_latent_stage2
       ltx2_video_conditions: request.extensions.ltx2.video_conditions

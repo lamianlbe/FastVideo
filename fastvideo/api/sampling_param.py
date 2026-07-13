@@ -137,6 +137,13 @@ class SamplingParam:
     ltx2_image_crf: float = 33.0
     # Optional stage-2 (refine) CRF override; None reuses ltx2_image_crf.
     ltx2_image_crf_stage2: float | None = None
+    # Per-request reference-token image override; None falls back to the
+    # engine-level ``fastvideo_args.ltx2_reference_image_path``. Servers use
+    # this to point the identity reference at each request's first frame.
+    # NOTE: toggling the reference on/off changes the DiT sequence length
+    # (a recompile under torch.compile) — keep it consistently set or
+    # consistently empty across requests against a compiled engine.
+    ltx2_reference_image_path: str | None = None
     ltx2_conditioning_latent_stage1: Any | None = None
     ltx2_conditioning_latent_stage2: Any | None = None
     ltx2_video_conditions: list[tuple[list[str], int, float]] | None = None

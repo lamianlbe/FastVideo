@@ -102,6 +102,13 @@ def resolve_ltx2_images(
     return resolved
 
 
+def resolve_ltx2_reference_image_path(batch: ForwardBatch, fastvideo_args) -> str:
+    """Reference-token image source: per-request batch override wins, the
+    engine-level fastvideo_args value is the fallback. Returns "" when
+    neither is set (reference conditioning disabled)."""
+    return batch.ltx2_reference_image_path or fastvideo_args.ltx2_reference_image_path or ""
+
+
 def _resize_and_center_crop(
     tensor: torch.Tensor,
     height: int,

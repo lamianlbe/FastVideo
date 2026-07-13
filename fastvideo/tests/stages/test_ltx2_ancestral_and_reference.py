@@ -602,3 +602,25 @@ def test_ltx2_images_stage2_override_resolution():
     assert resolve_ltx2_images(batch, None) == resolve_ltx2_images(batch)
     # Empty override disables image conditioning for that stage.
     assert resolve_ltx2_images(batch, []) == []
+
+
+def test_ltx2_reference_image_path_batch_override():
+    """Per-request reference image (server use case) beats the engine arg."""
+    from types import SimpleNamespace
+
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+        resolve_ltx2_reference_image_path, )
+    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+
+    args = SimpleNamespace(ltx2_reference_image_path="engine.png")
+    batch = ForwardBatch(data_type="dummy")
+
+    # No batch override: engine-level arg applies.
+    assert resolve_ltx2_reference_image_path(batch, args) == "engine.png"
+    # Per-request override wins.
+    batch.ltx2_reference_image_path = "request.png"
+    assert resolve_ltx2_reference_image_path(batch, args) == "request.png"
+    # Neither set: disabled ("" so truthiness gating works at call sites).
+    batch.ltx2_reference_image_path = None
+    args.ltx2_reference_image_path = ""
+    assert resolve_ltx2_reference_image_path(batch, args) == ""
