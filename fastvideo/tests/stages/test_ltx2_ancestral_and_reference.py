@@ -582,3 +582,23 @@ def test_ancestral_repin_preserves_conditioned_frame():
     final = repin_conditioned_latents(torch.zeros_like(clean), clean_latent=clean, denoise_mask=mask,
                                       cond_noise=cond_noise, sigma_next=0.0)
     torch.testing.assert_close(final[:, :, 0], clean[:, :, 0] * 0.8, rtol=1e-5, atol=1e-5)
+
+
+def test_ltx2_images_stage2_override_resolution():
+    """Stage-2 can run a reduced keyframe list via ltx2_images_stage2."""
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+        resolve_ltx2_images, )
+    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+
+    batch = ForwardBatch(data_type="dummy")
+    batch.ltx2_images = [("first.png", 0, 1.0), ("last.png", 30, 0.8)]
+    batch.ltx2_images_stage2 = [("first.png", 0, 1.0)]
+
+    # Default (stage 1): full list from the batch.
+    assert resolve_ltx2_images(batch) == [("first.png", 0, 1.0), ("last.png", 30, 0.8)]
+    # Stage-2 override: reduced list.
+    assert resolve_ltx2_images(batch, batch.ltx2_images_stage2) == [("first.png", 0, 1.0)]
+    # None override falls back to the batch list (backward compatible).
+    assert resolve_ltx2_images(batch, None) == resolve_ltx2_images(batch)
+    # Empty override disables image conditioning for that stage.
+    assert resolve_ltx2_images(batch, []) == []

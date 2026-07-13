@@ -216,6 +216,9 @@ class LTX2UpsampleStage(PipelineStage):
             height=target_height,
             width=target_width,
             base_clean_latent=latents,
+            # Per-stage image list: lets callers keep a keyframe (e.g. a
+            # last-frame anchor) out of the refine pass.
+            images_override=batch.ltx2_images_stage2,
         )
         if image_conditioning is None:
             batch.extra.pop(LTX2_VIDEO_CLEAN_LATENT_KEY, None)

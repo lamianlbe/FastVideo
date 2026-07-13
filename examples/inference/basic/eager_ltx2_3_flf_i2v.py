@@ -23,7 +23,9 @@ FLF specifics:
   the last image only enters through the latent anchor, so switching between
   i2v and FLF never changes tensor shapes (no recompile under torch.compile).
 
-Toggles: LTX23_COMPILE=1 / LTX23_QUANT=nvfp4|none, same as the DMD example.
+Toggles: LTX23_COMPILE=1 / LTX23_QUANT=nvfp4|none, same as the DMD example,
+plus LTX23_LAST_IN_UPSCALE=1 to also feed the tail anchor into the stage-2
+refine pass (default off — this misbehaved in ComfyUI testing).
 """
 
 from __future__ import annotations
@@ -40,6 +42,12 @@ MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros_v1.4_Stack_Diffuse
 IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/workspace/first_frame.png")
 LAST_IMAGE_PATH = os.getenv("LTX23_I2V_LAST_IMAGE", "/workspace/last_frame.png")
 LAST_STRENGTH = float(os.getenv("LTX23_LAST_STRENGTH", "0.8"))
+# Whether the last-frame anchor also enters the stage-2 refine pass.
+# Default OFF: in ComfyUI testing, feeding the tail keyframe into the
+# upscale pass caused artifacts/errors — stage 2 then re-anchors only the
+# first frame while the last frame's content survives via the upsampled
+# stage-1 latent.
+LAST_IN_UPSCALE = os.getenv("LTX23_LAST_IN_UPSCALE", "0") == "1"
 PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT", "REPLACE ME: describe the motion between the two keyframes.")
 OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/flf_i2v_test"))
 SEED = int(os.getenv("LTX23_SEED", "635141064074927"))
@@ -113,7 +121,8 @@ def main() -> None:
     print(f"model:      {model_root}")
     print(f"upsampler:  {upsampler_path}")
     print(f"first:      {IMAGE_PATH}")
-    print(f"last:       {LAST_IMAGE_PATH} @ latent idx {LAST_LATENT_IDX}, strength {LAST_STRENGTH}")
+    print(f"last:       {LAST_IMAGE_PATH} @ latent idx {LAST_LATENT_IDX}, strength {LAST_STRENGTH}, "
+          f"in_upscale={LAST_IN_UPSCALE}")
     print(f"frames:     {NUM_FRAMES} @ {FPS} fps, {WIDTH}x{HEIGHT}")
     print(f"mode:       compile={COMPILE} quant={QUANT}")
 
@@ -175,6 +184,9 @@ def main() -> None:
             (IMAGE_PATH, 0, 1.0),
             (LAST_IMAGE_PATH, LAST_LATENT_IDX, LAST_STRENGTH),
         ],
+        # Stage-2 override: keep the tail anchor out of the refine pass
+        # unless LTX23_LAST_IN_UPSCALE=1 (None = same list as stage 1).
+        ltx2_images_stage2=(None if LAST_IN_UPSCALE else [(IMAGE_PATH, 0, 1.0)]),
         ltx2_image_crf=IMAGE_CRF,
         ltx2_stg_scale_video=0.0,
         ltx2_stg_scale_audio=0.0,

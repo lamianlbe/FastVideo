@@ -67,15 +67,21 @@ class LTX2ImageConditioningState:
     latent_conditioned: bool = False
 
 
-def resolve_ltx2_images(batch: ForwardBatch) -> list[tuple[str, int, float]]:
+def resolve_ltx2_images(
+    batch: ForwardBatch,
+    images: list[tuple[str, int, float]] | None = None,
+) -> list[tuple[str, int, float]]:
     """Collect any LTX-2 image conditioning inputs from the batch.
 
-    Falls back to ``batch.image_path`` for the simple single-image i2v
-    case (anchors the first latent frame at full strength).
+    ``images`` overrides ``batch.ltx2_images`` when provided (used by the
+    stage-2 refine pass via ``batch.ltx2_images_stage2``). Falls back to
+    ``batch.image_path`` for the simple single-image i2v case (anchors the
+    first latent frame at full strength).
     """
-    images = batch.ltx2_images
-    if images is None and batch.image_path:
-        images = [(batch.image_path, 0, 1.0)]
+    if images is None:
+        images = batch.ltx2_images
+        if images is None and batch.image_path:
+            images = [(batch.image_path, 0, 1.0)]
     if not images:
         return []
 
@@ -349,6 +355,7 @@ def build_ltx2_image_conditioning(
     width: int,
     image_crf: float | None = None,
     base_clean_latent: torch.Tensor | None = None,
+    images_override: list[tuple[str, int, float]] | None = None,
 ) -> LTX2ImageConditioningState | None:
     """Build the (clean_latent, denoise_mask) state for the next segment.
 
@@ -358,8 +365,10 @@ def build_ltx2_image_conditioning(
     exactly. ``base_clean_latent is None`` corresponds to stage 1
     (fresh half-res latent); ``base_clean_latent`` set means stage 2
     (already-upsampled latent from the upsampler stage).
+    ``images_override`` replaces ``batch.ltx2_images`` when given (the
+    stage-2 per-stage image list).
     """
-    images = resolve_ltx2_images(batch)
+    images = resolve_ltx2_images(batch, images_override)
     conditioning_latent_stage1 = getattr(batch, "ltx2_conditioning_latent_stage1", None)
     conditioning_latent_stage2 = getattr(batch, "ltx2_conditioning_latent_stage2", None)
     is_stage1_conditioning = base_clean_latent is None

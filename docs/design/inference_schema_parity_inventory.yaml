@@ -86,6 +86,28 @@ surfaces:
       ltx2_refine_audio_noise_path: "LTX-2 refine audio noise carrier; no typed equivalent yet."
       ltx2_legacy_native_noise_order: "LTX-2 SSIM compatibility knob preserving legacy native latent noise ordering."
       ltx2_use_distilled_sigmas: "LTX-2 compatibility knob gating use of distilled sigma schedule."
+      ltx2_sampler: "LTX-2 ComfyUI workflow-port sampler selector (stage 1); no typed equivalent yet."
+      ltx2_refine_sampler: "LTX-2 ComfyUI workflow-port sampler selector (stage 2); no typed equivalent yet."
+      ltx2_sampler_eta: "LTX-2 ancestral sampler eta; no typed equivalent yet."
+      ltx2_sampler_s_noise: "LTX-2 ancestral sampler s_noise; no typed equivalent yet."
+      ltx2_stage1_sigmas: "LTX-2 stage-1 sigma schedule override; no typed equivalent yet."
+      ltx2_stage2_sigmas: "LTX-2 stage-2 sigma schedule override; no typed equivalent yet."
+      ltx2_stage1_cfg_values: "LTX-2 stage-1 per-step CFG schedule; no typed equivalent yet."
+      ltx2_reference_image_path: "LTX-2 reference-token conditioning image; no typed equivalent yet."
+      ltx2_reference_strength: "LTX-2 reference-token latent strength; no typed equivalent yet."
+      ltx2_reference_position_mode: "LTX-2 reference-token RoPE position mode; no typed equivalent yet."
+      ltx2_reference_zero_timesteps: "LTX-2 reference-token timestep zeroing knob; no typed equivalent yet."
+      ltx2_text_amp_scale: "LTX-2 text attention amplifier scale; no typed equivalent yet."
+      ltx2_text_amp_blocks: "LTX-2 text attention amplifier block filter; no typed equivalent yet."
+      ltx2_text_amp_spatial_focus: "LTX-2 text attention amplifier spatial focus; no typed equivalent yet."
+      ltx2_text_amp_stage: "LTX-2 text attention amplifier stage gate; no typed equivalent yet."
+      ltx2_anchor_strength: "LTX-2 latent anchor pull strength; no typed equivalent yet."
+      ltx2_anchor_blocks: "LTX-2 latent anchor block filter; no typed equivalent yet."
+      ltx2_anchor_cache_at_step: "LTX-2 latent anchor snapshot step; no typed equivalent yet."
+      ltx2_anchor_similarity_threshold: "LTX-2 latent anchor similarity gate; no typed equivalent yet."
+      ltx2_anchor_decay_with_distance: "LTX-2 latent anchor temporal falloff; no typed equivalent yet."
+      ltx2_anchor_energy_threshold: "LTX-2 latent anchor energy gate; no typed equivalent yet."
+      ltx2_anchor_frame: "LTX-2 latent anchor source frame; no typed equivalent yet."
     private_only:
       ray_placement_group: "Ray deployment-only field."
       ray_runtime_env: "Ray deployment-only field."
@@ -492,6 +514,7 @@ surfaces:
       ltx2_stg_blocks_video: request.extensions.ltx2.stg_blocks_video
       ltx2_stg_blocks_audio: request.extensions.ltx2.stg_blocks_audio
       ltx2_images: request.extensions.ltx2.images
+      ltx2_images_stage2: request.extensions.ltx2.images_stage2
       ltx2_image_crf: request.stage_overrides.refine.image_crf
       ltx2_conditioning_latent_stage1: request.extensions.ltx2.conditioning_latent_stage1
       ltx2_conditioning_latent_stage2: request.extensions.ltx2.conditioning_latent_stage2

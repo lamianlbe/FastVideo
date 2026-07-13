@@ -195,6 +195,10 @@ class ForwardBatch:
 
     # LTX-2 image / video / continuation conditioning
     ltx2_images: list[tuple[str, int, float]] | None = None
+    # Optional stage-2 (refine) override for ltx2_images. None = reuse
+    # ltx2_images in both stages. A reduced list keeps a keyframe out of
+    # the refine pass; an empty list disables stage-2 image conditioning.
+    ltx2_images_stage2: list[tuple[str, int, float]] | None = None
     ltx2_image_crf: float = 33.0
     ltx2_conditioning_latent_stage1: torch.Tensor | None = None
     ltx2_conditioning_latent_stage2: torch.Tensor | None = None
