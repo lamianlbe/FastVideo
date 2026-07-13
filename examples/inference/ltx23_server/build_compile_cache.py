@@ -45,7 +45,8 @@ def main() -> None:
     t0 = time.perf_counter()
     generator = create_generator(cfg)
     try:
-        run_warmup(generator, cfg, runs_per_shape=args.runs_per_shape)
+        # encode_check=False: the CPU H.264 encoder has no compile cache.
+        run_warmup(generator, cfg, runs_per_shape=args.runs_per_shape, encode_check=False)
     finally:
         generator.shutdown()
 

@@ -41,6 +41,13 @@ api_keys:
   - CHANGE-ME-master-key
   # - CHANGE-ME-secondary-key
 
+# CPU H.264 encode (B200 has no NVENC): libx264 main profile, VBR.
+# Encoding runs outside the GPU lock, overlapping the next request's
+# generation; the response returns once encoding finishes.
+video_bitrate_kbps: 3000  # average bitrate; per-request override available
+x264_preset: medium
+max_concurrent_encodes: 2 # cap simultaneous CPU encodes
+
 # Every supported (width, height, num_frames, fps) combination. Requests
 # that don't exactly match are served with the closest-resolution mode.
 # Constraints: width/height divisible by 64 (x2 refine; 96 for the x1.5

@@ -57,6 +57,7 @@ from ltx23_engine import (
     GenerationRequest,
     Ltx23ServerConfig,
     create_generator,
+    encode_video_h264,
     generate_for_mode,
     load_config,
     match_mode,
@@ -110,8 +111,12 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
     app = FastAPI(title="FastVideo LTX-2.3 server", version="1.0")
     request_logger = setup_request_logging(cfg)
     # One GPU pipeline: requests queue on this lock and run strictly
-    # serially (sync endpoints run in Starlette's threadpool).
+    # serially (sync endpoints run in Starlette's threadpool). CPU H.264
+    # encoding happens OUTSIDE the lock in the request's own thread, so
+    # request N+1's generation overlaps request N's encode; the semaphore
+    # caps simultaneous encodes.
     gpu_lock = threading.Lock()
+    encode_semaphore = threading.Semaphore(max(1, cfg.max_concurrent_encodes))
     scratch_root = cfg.output_dir or None
     if scratch_root:
         Path(scratch_root).mkdir(parents=True, exist_ok=True)
@@ -218,6 +223,8 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
         last_in_upscale: bool = Form(True),
         image_crf: float = Form(cfg.image_crf),
         image_crf_stage2: float = Form(cfg.image_crf_stage2),
+        # Average bitrate of the CPU H.264 (main profile, VBR) encode.
+        video_bitrate_kbps: int = Form(cfg.video_bitrate_kbps),
     ):
         request_id = uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
@@ -234,6 +241,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 "last_in_upscale": last_in_upscale,
                 "image_crf": image_crf,
                 "image_crf_stage2": image_crf_stage2,
+                "video_bitrate_kbps": video_bitrate_kbps,
             },
         }
         id_header = {"X-LTX23-Request-Id": request_id}
@@ -252,6 +260,8 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
             raise bail(400, "width/height/num_frames/fps must be positive")
         if not 0.0 <= last_frame_strength <= 1.0:
             raise bail(400, "last_frame_strength must be in [0, 1]")
+        if not 100 <= video_bitrate_kbps <= 50000:
+            raise bail(400, "video_bitrate_kbps must be in [100, 50000]")
 
         mode, exact = match_mode(cfg.modes, width, height, num_frames, fps)
         req_seed = seed if seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
@@ -280,12 +290,13 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
             image_crf_stage2=image_crf_stage2,
         )
 
+        # Generation holds the GPU lock; encoding runs after it is released
+        # so the next queued request starts generating while this thread
+        # CPU-encodes. Only GENERATION failures feed the wedged-GPU
+        # self-exit counter — encode failures are host/CPU-side.
         try:
             with gpu_lock:
                 result = generate_for_mode(generator, cfg, mode, request, workdir / "output.mp4")
-            video_path = result["video_path"]
-            if not Path(video_path).is_file():
-                raise RuntimeError("generation produced no video file")
         except Exception as err:  # noqa: BLE001
             tb = traceback.format_exc()
             failed_dir = _preserve_failed_inputs(workdir, record, tb)
@@ -297,9 +308,35 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 detail=f"generation failed: {err} (request_id={request_id})",
                 headers=id_header,
             ) from err
-
         _register_success()
-        finish(200, e2e_seconds=round(result["e2e_latency"], 2))
+
+        video_path = workdir / "output.mp4"
+        try:
+            with encode_semaphore:
+                encode_seconds = encode_video_h264(
+                    result["frames"],
+                    mode.fps,
+                    video_path,
+                    bitrate_kbps=video_bitrate_kbps,
+                    preset=cfg.x264_preset,
+                    audio=result.get("audio"),
+                    audio_sample_rate=result.get("audio_sample_rate"),
+                )
+            if not video_path.is_file():
+                raise RuntimeError("encode produced no video file")
+        except Exception as err:  # noqa: BLE001
+            tb = traceback.format_exc()
+            failed_dir = _preserve_failed_inputs(workdir, record, tb)
+            finish(500, error=f"encode failed: {err}", traceback=tb, failed_inputs=failed_dir,
+                   gen_seconds=round(result["gen_seconds"], 2))
+            raise HTTPException(
+                status_code=500,
+                detail=f"video encoding failed: {err} (request_id={request_id})",
+                headers=id_header,
+            ) from err
+
+        finish(200, gen_seconds=round(result["gen_seconds"], 2),
+               encode_seconds=round(encode_seconds, 2))
         return FileResponse(
             video_path,
             media_type="video/mp4",
@@ -311,7 +348,8 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 "X-LTX23-Fps": str(mode.fps),
                 "X-LTX23-Exact-Match": "1" if exact else "0",
                 "X-LTX23-Seed": str(req_seed),
-                "X-LTX23-E2E-Seconds": f"{result['e2e_latency']:.2f}",
+                "X-LTX23-Generate-Seconds": f"{result['gen_seconds']:.2f}",
+                "X-LTX23-Encode-Seconds": f"{encode_seconds:.2f}",
                 **id_header,
             },
             background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),

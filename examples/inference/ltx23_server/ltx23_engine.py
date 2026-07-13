@@ -105,6 +105,15 @@ class Ltx23ServerConfig:
     # "X-API-Key: <key>" or "Authorization: Bearer <key>" or get 401
     # (/healthz stays open for the docker HEALTHCHECK). Empty: no auth.
     api_keys: list[str] = field(default_factory=list)
+    # CPU H.264 encoding (B200 has no NVENC). Average bitrate for the
+    # libx264 main-profile VBR encode; per-request video_bitrate_kbps
+    # overrides it.
+    video_bitrate_kbps: int = 3000
+    x264_preset: str = "medium"
+    # Encodes run OUTSIDE the GPU lock (generation of the next request
+    # overlaps encoding of the previous). This caps simultaneous CPU
+    # encodes so a burst can't starve the host.
+    max_concurrent_encodes: int = 2
     stage1_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE1_SIGMAS))
     stage2_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE2_SIGMAS))
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
@@ -267,10 +276,15 @@ def generate_for_mode(
     request: GenerationRequest,
     output_path: str | Path,
 ) -> dict[str, Any]:
-    """Run one generation at the given mode's shape. Conditioning images are
-    cover-fit (aspect-preserving resize + center crop, no letterboxing) to
-    the mode resolution inside the pipeline, so callers can pass uploads
-    as-is."""
+    """Run one generation at the given mode's shape and return RAW frames
+    (+ audio) instead of writing an mp4 — encoding happens on the CPU via
+    encode_video_h264, outside the caller's GPU lock, so the next request's
+    generation overlaps the previous request's encode.
+
+    Conditioning images are cover-fit (aspect-preserving resize + center
+    crop, no letterboxing) to the mode resolution inside the pipeline, so
+    callers can pass uploads as-is. ``output_path`` is only pipeline path
+    bookkeeping; nothing is written to it."""
     last_latent_idx = (mode.num_frames - 1) // 8
     images: list[tuple[str, int, float]] = [(request.first_frame_path, 0, 1.0)]
     if request.last_frame_path:
@@ -306,11 +320,109 @@ def generate_for_mode(
         ltx2_cfg_scale_audio=1.0,
         ltx2_modality_scale_video=1.0,
         ltx2_modality_scale_audio=1.0,
-        save_video=True,
+        save_video=False,
+        return_frames=True,
     )
-    video_path = (result.get("video_path") if isinstance(result, dict) else None) or str(output_path)
-    e2e = (result.get("e2e_latency") if isinstance(result, dict) else None) or 0.0
-    return {"video_path": video_path, "e2e_latency": float(e2e)}
+    if not isinstance(result, dict):
+        raise RuntimeError(f"unexpected generate_video result type {type(result)}")
+    frames = result.get("frames")
+    if not frames:
+        raise RuntimeError("generation returned no frames")
+    return {
+        "frames": frames,
+        "audio": result.get("audio"),
+        "audio_sample_rate": result.get("audio_sample_rate"),
+        "gen_seconds": float(result.get("e2e_latency") or 0.0),
+    }
+
+
+def _audio_to_int16(audio: Any) -> tuple[Any, int]:
+    """[samples] / [samples, ch] / [ch, samples] float in ~[-1, 1] ->
+    (int16 [samples, ch], num_channels). Mirrors the normalization the
+    stock save path applies."""
+    import numpy as np
+
+    if hasattr(audio, "detach"):  # torch tensor without importing torch here
+        audio = audio.detach().cpu().float().numpy()
+    audio_np = np.asarray(audio, dtype=np.float32)
+    if audio_np.ndim == 1:
+        audio_np = audio_np[:, None]
+    elif audio_np.ndim == 2:
+        if audio_np.shape[0] <= 8 and audio_np.shape[1] > audio_np.shape[0]:
+            audio_np = audio_np.T
+    else:
+        raise ValueError(f"Unexpected audio shape {audio_np.shape}.")
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+    audio_int16 = (audio_np * 32767.0).astype(np.int16)
+    return audio_int16, audio_int16.shape[1]
+
+
+def encode_video_h264(
+    frames: list[Any],
+    fps: int,
+    output_path: str | Path,
+    *,
+    bitrate_kbps: int = 3000,
+    preset: str = "medium",
+    audio: Any = None,
+    audio_sample_rate: int | None = None,
+) -> float:
+    """CPU-encode RGB frames (+ optional audio) to MP4: libx264 main
+    profile, VBR at the given average bitrate with a 2x/4x VBV envelope,
+    AAC audio. Returns the encode wall time in seconds."""
+    import numpy as np
+
+    import av
+
+    if not frames:
+        raise ValueError("no frames to encode")
+    t0 = time.perf_counter()
+    container = av.open(str(output_path), mode="w")
+    try:
+        video_stream = container.add_stream("libx264", rate=int(fps))
+        video_stream.width = int(frames[0].shape[1])
+        video_stream.height = int(frames[0].shape[0])
+        video_stream.pix_fmt = "yuv420p"
+        video_stream.bit_rate = int(bitrate_kbps) * 1000
+        video_stream.options = {
+            "profile": "main",
+            "preset": preset,
+            "maxrate": f"{int(bitrate_kbps) * 2}k",
+            "bufsize": f"{int(bitrate_kbps) * 4}k",
+        }
+
+        audio_stream = None
+        audio_int16 = None
+        layout = "mono"
+        if audio is not None and audio_sample_rate:
+            audio_int16, num_channels = _audio_to_int16(audio)
+            layout = "stereo" if num_channels == 2 else "mono"
+            audio_stream = container.add_stream("aac", rate=int(audio_sample_rate), layout=layout)
+
+        for frame_np in frames:
+            vframe = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame_np), format="rgb24")
+            for packet in video_stream.encode(vframe):
+                container.mux(packet)
+        for packet in video_stream.encode():
+            container.mux(packet)
+
+        if audio_stream is not None and audio_int16 is not None:
+            # AAC uses 1024-sample frames; pad the tail to avoid shape errors.
+            chunk_size = 1024
+            for start in range(0, audio_int16.shape[0], chunk_size):
+                chunk = audio_int16[start:start + chunk_size]
+                if chunk.shape[0] < chunk_size:
+                    pad = np.zeros((chunk_size - chunk.shape[0], chunk.shape[1]), dtype=chunk.dtype)
+                    chunk = np.concatenate([chunk, pad], axis=0)
+                aframe = av.AudioFrame.from_ndarray(np.ascontiguousarray(chunk.T), format="s16p", layout=layout)
+                aframe.sample_rate = int(audio_sample_rate)
+                for packet in audio_stream.encode(aframe):
+                    container.mux(packet)
+            for packet in audio_stream.encode():
+                container.mux(packet)
+    finally:
+        container.close()
+    return time.perf_counter() - t0
 
 
 def make_warmup_image(path: str | Path, width: int, height: int) -> None:
@@ -336,11 +448,14 @@ def run_warmup(
     cfg: Ltx23ServerConfig,
     runs_per_shape: int = 1,
     log=print,
+    encode_check: bool = True,
 ) -> None:
     """One generation per distinct compile shape so every dynamo trace /
     inductor compile happens before real traffic. Duplicate mode entries
-    are traced once."""
+    are traced once. With encode_check the first generation is also run
+    through the CPU H.264 encoder to validate that path before serving."""
     seen: set[tuple[int, int, int, int]] = set()
+    encode_checked = not encode_check
     workdir = Path(tempfile.mkdtemp(prefix="ltx23_warmup_"))
     try:
         for mode in cfg.modes:
@@ -366,9 +481,21 @@ def run_warmup(
                 t0 = time.perf_counter()
                 log(f"[warmup] {mode.width}x{mode.height} f{mode.num_frames} "
                     f"run {run + 1}/{runs_per_shape}…")
-                generate_for_mode(generator, cfg, mode, request, workdir / "warmup.mp4")
+                result = generate_for_mode(generator, cfg, mode, request, workdir / "warmup.mp4")
                 log(f"[warmup] {mode.width}x{mode.height} f{mode.num_frames} "
                     f"run {run + 1}/{runs_per_shape} wall={time.perf_counter() - t0:.1f}s")
+                if not encode_checked:
+                    encode_checked = True
+                    encode_seconds = encode_video_h264(
+                        result["frames"],
+                        mode.fps,
+                        workdir / "warmup.mp4",
+                        bitrate_kbps=cfg.video_bitrate_kbps,
+                        preset=cfg.x264_preset,
+                        audio=result.get("audio"),
+                        audio_sample_rate=result.get("audio_sample_rate"),
+                    )
+                    log(f"[warmup] CPU H.264 encode check passed ({encode_seconds:.1f}s)")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -107,6 +107,7 @@ works. An empty `api_keys` list disables auth (dev only).
 | `last_in_upscale` | no | **true** | whether the tail anchor also enters the stage-2 refine pass |
 | `image_crf` | no | 35 | stage-1 conditioning CRF ("motion strength") |
 | `image_crf_stage2` | no | **0** | stage-2 re-anchor CRF; 0 keeps the final first frame sharp |
+| `video_bitrate_kbps` | no | 3000 | average bitrate of the H.264 main-profile VBR encode |
 
 Response: the mp4 bytes (`video/mp4`), synchronously. Headers report what
 was actually served: `X-LTX23-Width/Height/Num-Frames/Fps`,
@@ -137,8 +138,16 @@ curl -sS -X POST http://localhost:8000/v1/generate \
 
 ## Concurrency & recompilation
 
-One GPU pipeline; requests are served strictly serially (a queue forms
-under load). Per-request parameters — prompt, images, seed, CRF values,
+One GPU pipeline; **generation** is strictly serial (a queue forms under
+load), but **CPU H.264 encoding runs outside the GPU lock**: as soon as
+request N's frames leave the GPU, request N+1 starts generating while
+request N's thread encodes (libx264 main profile, VBR at
+`video_bitrate_kbps` with a 2x/4x VBV envelope, AAC audio; B200 has no
+NVENC so this hides the CPU-encode latency). Each response returns when
+its encode finishes; `X-LTX23-Generate-Seconds` / `X-LTX23-Encode-Seconds`
+report the split, and `max_concurrent_encodes` caps simultaneous encodes.
+
+Per-request parameters — prompt, images, seed, CRF values, bitrate,
 `last_in_upscale`, FLF vs i2v — are all value-level and never trigger
 recompilation. Only the mode list defines compiled shapes, and **fps is
 part of the shape**: the audio latent length is derived from the clip
