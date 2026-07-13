@@ -13,6 +13,7 @@ upsampler_path: ""
 quant: nvfp4              # nvfp4 | none
 num_gpus: 1
 attention_backend: FLASH_ATTN
+fa4: true                 # FA4 (flash_attn.cute) — needs the pinned install
 
 # Persistent torch.compile artifact cache — REQUIRED for sane startup times.
 # Shareable across machines with an identical GPU/driver/torch/fastvideo stack.

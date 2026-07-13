@@ -14,6 +14,51 @@ the two share compiled graphs, so switching between them never recompiles.
 | `build_compile_cache.py` | Offline: compile every mode into a persistent inductor cache |
 | `server.py` | Online: FastAPI server, warms up all modes at startup, serves mp4 synchronously |
 | `ltx23_engine.py` | Shared engine (recipe, generator construction, mode matching, warmup) |
+| `deploy/install.sh` | One-shot dependency install (kernel, FA4, flashinfer, server extras) |
+| `deploy/Dockerfile` | Fleet image: deps + server baked in, model/cache on a volume |
+
+## Installing dependencies
+
+`deploy/install.sh` is the single source of truth for the dependency chain
+(order matters — the in-tree kernel must land before `pip install .` so pip
+never falls back to the broken PyPI sdist):
+
+1. `git submodule update --init --recursive` — cutlass/tk for the kernel
+2. `pip install -v ./fastvideo-kernel` — in-tree source (or a `WHEELHOUSE` wheel)
+3. `pip install .` — fastvideo itself (pulls flashinfer, fastapi, uvicorn)
+4. FA4 `flash_attn.cute`, pinned to the cutlass-4.5-compatible revision
+   (same pin as `[tool.uv.sources].flash-attn-4` in pyproject.toml)
+5. `python-multipart` + an import self-check
+
+Two ways to consume it:
+
+**Bare machine / RunPod pod** — run it inside the target env:
+
+```bash
+bash examples/inference/ltx23_server/deploy/install.sh
+# fleets: build the slow kernel wheel once, then reuse it everywhere
+pip wheel ./fastvideo-kernel -w /workspace/wheels     # once
+WHEELHOUSE=/workspace/wheels bash .../deploy/install.sh   # every other pod
+```
+
+**Docker image (recommended for fleets)** — bake code + deps into one image;
+model weights, config, and the inductor cache live on the network volume:
+
+```bash
+docker build -f examples/inference/ltx23_server/deploy/Dockerfile \
+    --build-arg BASE_IMAGE=<image of your validated pod> \
+    -t ltx23-server:$(git rev-parse --short HEAD) .
+docker run --gpus all -p 8000:8000 -v /workspace:/workspace \
+    ltx23-server:<tag>    # serves /workspace/ltx23/config.yaml
+```
+
+`BASE_IMAGE` must match the stack the compile cache was built on — the
+cache is keyed on GPU model/driver/torch/CUDA, so a base-image change means
+re-running `build_compile_cache.py`.
+
+`FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN` + `FASTVIDEO_FA4=1` are set by the
+image, and the server also derives them from the config's
+`attention_backend`/`fa4` fields — no manual exports needed either way.
 
 ## Deployment flow
 

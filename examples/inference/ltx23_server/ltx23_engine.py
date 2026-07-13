@@ -82,6 +82,10 @@ class Ltx23ServerConfig:
     quant: str = "nvfp4"  # nvfp4 | none
     num_gpus: int = 1
     attention_backend: str = "FLASH_ATTN"
+    # FA4 (flash_attn.cute) under the FLASH_ATTN backend — the validated
+    # serving stack. Requires the pinned flash-attn cute install (see
+    # deploy/install.sh).
+    fa4: bool = True
     inductor_cache_dir: str = ""  # "" = torch default (NOT persistent)
     compile: bool = True
     warmup_on_start: bool = True
@@ -140,6 +144,7 @@ def setup_environment(cfg: Ltx23ServerConfig) -> None:
     if cfg.inductor_cache_dir:
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cfg.inductor_cache_dir)
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", cfg.attention_backend)
+    os.environ.setdefault("FASTVIDEO_FA4", "1" if cfg.fa4 else "0")
     os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
 
 
