@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Populate the persistent torch.compile cache for every configured mode.
+
+    env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml
+
+Runs one full generation per distinct compile shape (resolution x
+num_frames; fps-only variants share kernels) so all inductor artifacts land
+in the config's ``inductor_cache_dir``. Ship that directory to every
+identical machine (same GPU model / driver / torch / fastvideo stack) and
+server startup warmup drops from a cold compile (tens of minutes per shape)
+to a dynamo re-trace (about a minute per shape).
+
+The cache is keyed on the full stack: rebuild it after changing torch,
+fastvideo, the quantization mode, the attention backend, or the GPU model.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+from ltx23_engine import cache_dir_size, create_generator, load_config, run_warmup, setup_environment
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="Path to the server YAML config")
+    parser.add_argument("--runs-per-shape", type=int, default=1,
+                        help="Generations per compile shape (1 is enough to fill the cache)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    if not cfg.compile:
+        raise SystemExit("config has compile: false — nothing to cache. Enable compile first.")
+    if not cfg.inductor_cache_dir:
+        raise SystemExit("config has no inductor_cache_dir — the compile artifacts would land in "
+                         "a non-persistent default location. Set inductor_cache_dir first.")
+    setup_environment(cfg)
+
+    print(f"[compile-cache] cache dir: {cfg.inductor_cache_dir} "
+          f"(current size: {cache_dir_size(cfg.inductor_cache_dir)})")
+    print(f"[compile-cache] modes: {len(cfg.modes)}, quant={cfg.quant}")
+
+    t0 = time.perf_counter()
+    generator = create_generator(cfg)
+    try:
+        run_warmup(generator, cfg, runs_per_shape=args.runs_per_shape)
+    finally:
+        generator.shutdown()
+
+    print(f"[compile-cache] done in {(time.perf_counter() - t0) / 60:.1f} min; "
+          f"cache size now {cache_dir_size(cfg.inductor_cache_dir)}")
+    print("[compile-cache] sync this directory to identical machines and point their "
+          "TORCHINDUCTOR_CACHE_DIR / config inductor_cache_dir at it.")
+
+
+if __name__ == "__main__":
+    main()

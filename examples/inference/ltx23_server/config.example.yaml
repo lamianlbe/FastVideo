@@ -1,0 +1,45 @@
+# LTX-2.3 server configuration.
+#
+# Copy to config.yaml, adjust paths/modes, then:
+#   1. env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml
+#   2. env -u LD_LIBRARY_PATH python server.py --config config.yaml
+
+# Merged checkpoint in FastVideo/Diffusers layout (10Eros + LoRA stack + DMD,
+# see scripts/checkpoint_conversion/).
+model_path: /workspace/10Eros_v1.4_Stack_Diffusers
+# "" = auto-detect <model_path>/spatial_upscaler or spatial_upsampler.
+upsampler_path: ""
+
+quant: nvfp4              # nvfp4 | none
+num_gpus: 1
+attention_backend: FLASH_ATTN
+
+# Persistent torch.compile artifact cache — REQUIRED for sane startup times.
+# Shareable across machines with an identical GPU/driver/torch/fastvideo stack.
+inductor_cache_dir: /workspace/inductor_cache
+compile: true
+warmup_on_start: true     # trace every mode before binding the port
+
+host: 0.0.0.0
+port: 8000
+# "" = system temp. Per-request scratch dirs (uploads + output) live here
+# and are deleted after the response is sent.
+output_dir: ""
+
+# Every supported (width, height, num_frames, fps) combination. Requests
+# that don't exactly match are served with the closest-resolution mode.
+# Constraints: width/height divisible by 64 (x2 refine; 96 for the x1.5
+# upsampler), num_frames = 8*k + 1.
+modes:
+  - {width: 1344, height: 768, num_frames: 241, fps: 24}
+  - {width: 768, height: 1344, num_frames: 241, fps: 24}
+  # - {width: 1024, height: 1024, num_frames: 241, fps: 24}
+  # - {width: 1344, height: 768, num_frames: 121, fps: 24}
+
+# --- Optional recipe overrides (defaults = validated DMD workflow port) ---
+# stage1_sigmas: [1.000, 0.955, 0.893, 0.812, 0.715, 0.603, 0.482, 0.241, 0.121, 0.0]
+# stage2_sigmas: [0.92, 0.725, 0.421875, 0.0]
+# image_crf: 35.0          # stage-1 conditioning CRF ("motion strength")
+# image_crf_stage2: 0.0    # stage-2 re-anchor CRF (0 = sharp final first frame)
+# last_frame_strength: 0.8
+# negative_prompt: "..."

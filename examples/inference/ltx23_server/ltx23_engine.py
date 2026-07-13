@@ -1,0 +1,362 @@
+"""Shared engine for the LTX-2.3 production HTTP server.
+
+Wraps the validated DMD-stack recipe (the ComfyUI two-pass I2V workflow
+port, see examples/inference/basic/eager_ltx2_3_ancestral_reference_i2v.py
+and .../eager_ltx2_3_flf_i2v.py) behind a config file + a small API used by
+both server.py (online serving) and build_compile_cache.py (offline
+compilation).
+
+Import order matters: call ``setup_environment(cfg)`` BEFORE anything that
+imports torch/fastvideo so TORCHINDUCTOR_CACHE_DIR and the attention
+backend are picked up. All fastvideo/torch imports in this module are
+deliberately function-local.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# ---------------------------------------------------------------------------
+# Validated DMD-stack sampling recipe (ComfyUI workflow port).
+# ---------------------------------------------------------------------------
+DEFAULT_STAGE1_SIGMAS = [1.000, 0.955, 0.893, 0.812, 0.715, 0.603, 0.482, 0.241, 0.121, 0.0]
+DEFAULT_STAGE2_SIGMAS = [0.92, 0.725, 0.421875, 0.0]
+DEFAULT_NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitles, text, "
+                           "watermark, overlay effects, pc game, yelling, console game, video game, "
+                           "cartoon, childish, ugly, text, blur, logo, wordmark, static, low quality, "
+                           "noise, white noise, bleep, censoring, censor, bleeping, beep, beeping, "
+                           "newscast, interview, podcast, non-english, foreign language, russian, "
+                           "chinese, japanese, mutant, horror, 70's, film grain, cinematic, comedy, "
+                           "stand-up ")
+# Stage-1 conditioning CRF = LTXVPreprocess "motion strength".
+DEFAULT_IMAGE_CRF = 35.0
+# Server default: stage 2 re-anchors with a clean (CRF 0) encode so the
+# final first frame stays sharp while stage 1 keeps the motion CRF.
+DEFAULT_IMAGE_CRF_STAGE2 = 0.0
+DEFAULT_LAST_FRAME_STRENGTH = 0.8
+WARMUP_PROMPT = ("A person slowly turns their head toward the camera and smiles, "
+                 "soft warm light, gentle camera drift.")
+
+
+@dataclass(frozen=True)
+class Ltx23Mode:
+    """One supported (resolution, frames, fps) combination."""
+    width: int
+    height: int
+    num_frames: int
+    fps: int
+
+    def validate(self) -> None:
+        if self.width % 64 or self.height % 64:
+            raise ValueError(f"mode {self.width}x{self.height}: both dims must be divisible by 64 "
+                             "(x2 refine; the x1.5 upsampler additionally needs divisibility by 96)")
+        if (self.num_frames - 1) % 8:
+            raise ValueError(f"mode num_frames={self.num_frames}: must be 8*k+1 "
+                             "(temporal VAE compression)")
+        if self.fps <= 0:
+            raise ValueError(f"mode fps={self.fps}: must be positive")
+
+    def shape_key(self) -> tuple[int, int, int]:
+        """Compile-shape identity: fps is value-level and shares kernels."""
+        return (self.width, self.height, self.num_frames)
+
+
+@dataclass
+class Ltx23ServerConfig:
+    model_path: str
+    modes: list[Ltx23Mode]
+    upsampler_path: str = ""  # "" = auto-detect <model>/spatial_upscaler|spatial_upsampler
+    quant: str = "nvfp4"  # nvfp4 | none
+    num_gpus: int = 1
+    attention_backend: str = "FLASH_ATTN"
+    inductor_cache_dir: str = ""  # "" = torch default (NOT persistent)
+    compile: bool = True
+    warmup_on_start: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8000
+    output_dir: str = ""  # "" = system temp; holds per-request scratch dirs
+    stage1_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE1_SIGMAS))
+    stage2_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE2_SIGMAS))
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
+    image_crf: float = DEFAULT_IMAGE_CRF
+    image_crf_stage2: float = DEFAULT_IMAGE_CRF_STAGE2
+    last_frame_strength: float = DEFAULT_LAST_FRAME_STRENGTH
+
+
+@dataclass
+class GenerationRequest:
+    """One resolved generation job (paths point at files on local disk)."""
+    prompt: str
+    first_frame_path: str
+    last_frame_path: str | None = None
+    negative_prompt: str | None = None
+    seed: int = 0
+    last_frame_strength: float = DEFAULT_LAST_FRAME_STRENGTH
+    # Whether the last-frame anchor also enters the stage-2 refine pass.
+    last_in_upscale: bool = True
+    image_crf: float = DEFAULT_IMAGE_CRF
+    image_crf_stage2: float | None = DEFAULT_IMAGE_CRF_STAGE2
+
+
+def load_config(path: str | Path) -> Ltx23ServerConfig:
+    raw = yaml.safe_load(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected a YAML mapping at the top level")
+    modes_raw = raw.pop("modes", None)
+    if not modes_raw:
+        raise ValueError(f"{path}: 'modes' must list at least one "
+                         "{width, height, num_frames, fps} combination")
+    modes = [Ltx23Mode(**m) for m in modes_raw]
+    for mode in modes:
+        mode.validate()
+    known = {f for f in Ltx23ServerConfig.__dataclass_fields__ if f != "modes"}
+    unknown = set(raw) - known
+    if unknown:
+        raise ValueError(f"{path}: unknown config keys {sorted(unknown)}")
+    cfg = Ltx23ServerConfig(modes=modes, **raw)
+    if not cfg.model_path:
+        raise ValueError(f"{path}: 'model_path' is required")
+    if cfg.quant not in ("nvfp4", "none"):
+        raise ValueError(f"{path}: quant must be nvfp4 or none, got {cfg.quant}")
+    return cfg
+
+
+def setup_environment(cfg: Ltx23ServerConfig) -> None:
+    """Set process env consumed by torch/fastvideo. Call before importing
+    either; already-exported env vars win (operator override)."""
+    if cfg.inductor_cache_dir:
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cfg.inductor_cache_dir)
+    os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", cfg.attention_backend)
+    os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
+
+
+def match_mode(
+    modes: list[Ltx23Mode],
+    width: int,
+    height: int,
+    num_frames: int,
+    fps: int,
+) -> tuple[Ltx23Mode, bool]:
+    """Exact (width, height, num_frames, fps) match, else the mode with the
+    closest resolution (aspect-aware log distance); frames/fps only break
+    ties. Returns (mode, exact)."""
+    for mode in modes:
+        if (mode.width, mode.height, mode.num_frames, mode.fps) == (width, height, num_frames, fps):
+            return mode, True
+
+    def distance(mode: Ltx23Mode) -> tuple[float, int, int]:
+        res = (math.log(width / mode.width)**2 + math.log(height / mode.height)**2)
+        return (res, abs(num_frames - mode.num_frames), abs(fps - mode.fps))
+
+    return min(modes, key=distance), False
+
+
+def resolve_upsampler(model_root: str, override: str = "") -> str:
+    candidates = ([override] if override else []) + [
+        str(Path(model_root) / "spatial_upscaler"),
+        str(Path(model_root) / "spatial_upsampler"),
+    ]
+    for cand in candidates:
+        if cand and (Path(cand) / "config.json").is_file():
+            return cand
+    raise FileNotFoundError("No spatial upsampler found; set 'upsampler_path' in the config or add "
+                            "spatial_upscaler/ to the model repo.")
+
+
+def create_generator(cfg: Ltx23ServerConfig) -> Any:
+    """Build the resident VideoGenerator with the validated recipe wired in.
+    The reference-token image is per-request (ltx2_reference_image_path in
+    generation kwargs), everything else is fixed at init."""
+    if cfg.compile:
+        import torch._inductor.config as _inductor
+
+        _inductor.shape_padding = False  # mandatory on Blackwell (pad_mm crash)
+        _inductor.conv_1x1_as_mm = True
+        _inductor.coordinate_descent_tuning = True
+        _inductor.coordinate_descent_check_all_directions = True
+        _inductor.epilogue_fusion = False
+
+    from fastvideo import VideoGenerator
+    from fastvideo.configs.pipelines.base import PipelineConfig
+    from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
+    from fastvideo.utils import maybe_download_model
+
+    model_root = maybe_download_model(cfg.model_path)
+    upsampler_path = resolve_upsampler(model_root, cfg.upsampler_path)
+
+    pipeline_config = PipelineConfig.from_pretrained(model_root)
+    pipeline_config.dit_config.quant_config = (NVFP4Config() if cfg.quant == "nvfp4" else None)
+
+    compile_kwargs: dict[str, Any] = {}
+    if cfg.compile:
+        torch_compile_kwargs = {
+            "backend": "inductor",
+            "fullgraph": True,
+            "mode": "default",
+            "dynamic": False,
+        }
+        compile_kwargs = dict(
+            enable_torch_compile=True,
+            enable_torch_compile_text_encoder=True,
+            enable_torch_compile_vae=True,
+            torch_compile_kwargs=torch_compile_kwargs,
+            torch_compile_kwargs_vae=torch_compile_kwargs,
+        )
+
+    return VideoGenerator.from_pretrained(
+        model_root,
+        num_gpus=cfg.num_gpus,
+        pipeline_config=pipeline_config,
+        **compile_kwargs,
+        ltx2_refine_enabled=True,
+        ltx2_refine_upsampler_path=upsampler_path,
+        ltx2_refine_lora_path="",
+        ltx2_refine_guidance_scale=1.0,
+        ltx2_refine_add_noise=True,
+        ltx2_sampler="euler_ancestral",
+        ltx2_refine_sampler="euler_ancestral_cfg_pp",
+        ltx2_stage1_sigmas=cfg.stage1_sigmas,
+        ltx2_stage2_sigmas=cfg.stage2_sigmas,
+        ltx2_reference_strength=1.0,
+        ltx2_reference_position_mode="reference",
+        ltx2_reference_zero_timesteps=False,
+        dit_cpu_offload=False,
+        text_encoder_cpu_offload=False,
+        vae_cpu_offload=False,
+        ltx2_vae_tiling=False,
+    )
+
+
+def generate_for_mode(
+    generator: Any,
+    cfg: Ltx23ServerConfig,
+    mode: Ltx23Mode,
+    request: GenerationRequest,
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Run one generation at the given mode's shape. Conditioning images are
+    cover-fit (aspect-preserving resize + center crop, no letterboxing) to
+    the mode resolution inside the pipeline, so callers can pass uploads
+    as-is."""
+    last_latent_idx = (mode.num_frames - 1) // 8
+    images: list[tuple[str, int, float]] = [(request.first_frame_path, 0, 1.0)]
+    if request.last_frame_path:
+        images.append((request.last_frame_path, last_latent_idx, request.last_frame_strength))
+    # None = same keyframes in both stages; a reduced list keeps the tail
+    # anchor out of the stage-2 refine pass.
+    images_stage2 = None
+    if request.last_frame_path and not request.last_in_upscale:
+        images_stage2 = [(request.first_frame_path, 0, 1.0)]
+
+    result = generator.generate_video(
+        prompt=request.prompt,
+        negative_prompt=(request.negative_prompt if request.negative_prompt else cfg.negative_prompt),
+        output_path=str(output_path),
+        seed=request.seed,
+        guidance_scale=1.0,
+        height=mode.height,
+        width=mode.width,
+        num_frames=mode.num_frames,
+        fps=mode.fps,
+        num_inference_steps=len(cfg.stage1_sigmas) - 1,
+        ltx2_images=images,
+        ltx2_images_stage2=images_stage2,
+        ltx2_image_crf=request.image_crf,
+        ltx2_image_crf_stage2=request.image_crf_stage2,
+        # Identity reference tokens always come from the first frame — a
+        # constant-on setting so the DiT sequence length (and thus the
+        # compiled graph) never changes between i2v and FLF requests.
+        ltx2_reference_image_path=request.first_frame_path,
+        ltx2_stg_scale_video=0.0,
+        ltx2_stg_scale_audio=0.0,
+        ltx2_cfg_scale_video=1.0,
+        ltx2_cfg_scale_audio=1.0,
+        ltx2_modality_scale_video=1.0,
+        ltx2_modality_scale_audio=1.0,
+        save_video=True,
+    )
+    video_path = (result.get("video_path") if isinstance(result, dict) else None) or str(output_path)
+    e2e = (result.get("e2e_latency") if isinstance(result, dict) else None) or 0.0
+    return {"video_path": video_path, "e2e_latency": float(e2e)}
+
+
+def make_warmup_image(path: str | Path, width: int, height: int) -> None:
+    """Synthetic but structured conditioning image (diagonal gradient)."""
+    import numpy as np
+    from PIL import Image
+
+    x = np.linspace(0.0, 255.0, width, dtype=np.float32)[None, :]
+    y = np.linspace(0.0, 255.0, height, dtype=np.float32)[:, None]
+    arr = np.stack(
+        [
+            np.broadcast_to(x, (height, width)),
+            np.broadcast_to(y, (height, width)),
+            np.broadcast_to((x + y) / 2.0, (height, width)),
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    Image.fromarray(arr).save(path)
+
+
+def run_warmup(
+    generator: Any,
+    cfg: Ltx23ServerConfig,
+    runs_per_shape: int = 1,
+    log=print,
+) -> None:
+    """One generation per distinct compile shape so every dynamo trace /
+    inductor compile happens before real traffic. Modes differing only in
+    fps share compiled kernels (fps is value-level) and are traced once."""
+    seen: set[tuple[int, int, int]] = set()
+    workdir = Path(tempfile.mkdtemp(prefix="ltx23_warmup_"))
+    try:
+        for mode in cfg.modes:
+            key = mode.shape_key()
+            if key in seen:
+                log(f"[warmup] {mode} shares a compiled shape with an earlier mode (fps is "
+                    "value-level); skipping duplicate trace")
+                continue
+            seen.add(key)
+            first = workdir / f"first_{mode.width}x{mode.height}.png"
+            last = workdir / f"last_{mode.width}x{mode.height}.png"
+            make_warmup_image(first, mode.width, mode.height)
+            make_warmup_image(last, mode.width, mode.height)
+            request = GenerationRequest(
+                prompt=WARMUP_PROMPT,
+                first_frame_path=str(first),
+                last_frame_path=str(last),
+                seed=42,
+                image_crf=cfg.image_crf,
+                image_crf_stage2=cfg.image_crf_stage2,
+                last_frame_strength=cfg.last_frame_strength,
+            )
+            for run in range(runs_per_shape):
+                t0 = time.perf_counter()
+                log(f"[warmup] {mode.width}x{mode.height} f{mode.num_frames} "
+                    f"run {run + 1}/{runs_per_shape}…")
+                generate_for_mode(generator, cfg, mode, request, workdir / "warmup.mp4")
+                log(f"[warmup] {mode.width}x{mode.height} f{mode.num_frames} "
+                    f"run {run + 1}/{runs_per_shape} wall={time.perf_counter() - t0:.1f}s")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def cache_dir_size(path: str) -> str:
+    """Human-readable size of the inductor cache dir (best effort)."""
+    if not path or not Path(path).is_dir():
+        return "n/a"
+    try:
+        out = subprocess.run(["du", "-sh", path], capture_output=True, text=True, check=True)
+        return out.stdout.split()[0]
+    except Exception:  # noqa: BLE001
+        return "unknown"
