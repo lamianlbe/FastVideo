@@ -235,6 +235,40 @@ def euler_ancestral_cfg_pp_step(
     return x
 
 
+def repin_conditioned_latents(
+    latents: torch.Tensor,
+    *,
+    clean_latent: torch.Tensor,
+    denoise_mask: torch.Tensor,
+    cond_noise: torch.Tensor,
+    sigma_next: float,
+) -> torch.Tensor:
+    """Re-impose partially-pinned conditioning regions on the running latent.
+
+    The ancestral samplers inject fresh noise into the WHOLE latent every
+    step; near sigma=1 a single step can replace ~90% of the conditioned
+    frame's content, destroying i2v anchoring. ComfyUI avoids this via its
+    KSamplerX0Inpaint wrapper, which re-blends the masked region toward the
+    correctly-noised clean latent on every call — this is the equivalent:
+
+        ideal   = clean * (1 - mask * sigma_next) + cond_noise * mask * sigma_next
+        latents = latents * mask + ideal * (1 - mask)
+
+    ``cond_noise`` must be a FIXED per-run noise tensor (matching ComfyUI,
+    which reuses the sampler's initial noise) so the pinned region stays on
+    one consistent noise trajectory. No-op for mask == 1 regions; the plain
+    Euler sampler does not need this (no fresh-noise injection).
+    """
+    ideal = apply_ltx2_gaussian_noiser(
+        noise=cond_noise,
+        clean_latent=clean_latent,
+        denoise_mask=denoise_mask,
+        noise_scale=float(sigma_next),
+    )
+    mask = denoise_mask.to(latents.dtype)
+    return (latents * mask + ideal.to(latents.dtype) * (1.0 - mask)).to(latents.dtype)
+
+
 def parse_block_range(spec: str, num_blocks: int) -> list[int]:
     """Parse "36-47" / "10,12,14" style block filters (comfy semantics:
     inclusive ranges, clamped to [0, num_blocks - 1])."""
@@ -745,6 +779,33 @@ class LTX2DenoisingStage(PipelineStage):
                 dtype=torch.float32,
             )
 
+        # Fixed per-run conditioning noise for the ancestral repin (see
+        # repin_conditioned_latents). Drawn once so the pinned region follows
+        # a single noise trajectory across steps.
+        cond_noise_video: torch.Tensor | None = None
+        cond_noise_audio: torch.Tensor | None = None
+        if sampler != "euler":
+            if video_clean_latent is not None and video_denoise_mask is not None:
+                repin_generator = None
+                if batch.seed is not None:
+                    repin_generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed) + 2)
+                cond_noise_video = torch.randn(
+                    latents.shape,
+                    generator=repin_generator,
+                    device=latents.device,
+                    dtype=torch.float32,
+                )
+            if (audio_clean_latent is not None and audio_denoise_mask is not None and audio_latents is not None):
+                repin_generator = None
+                if batch.seed is not None:
+                    repin_generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed) + 3)
+                cond_noise_audio = torch.randn(
+                    audio_latents.shape,
+                    generator=repin_generator,
+                    device=latents.device,
+                    dtype=torch.float32,
+                )
+
         for step_index in tqdm(range(len(sigmas) - 1)):
             sigma = sigmas[step_index]
             sigma_next = sigmas[step_index + 1]
@@ -1001,6 +1062,27 @@ class LTX2DenoisingStage(PipelineStage):
                             s_noise=sampler_s_noise,
                             noise=_ancestral_noise(audio_latents) if draw else None,
                         ).to(audio_latents.dtype)
+
+            # Re-impose partially-pinned conditioning after the ancestral
+            # fresh-noise injection (ComfyUI KSamplerX0Inpaint equivalent);
+            # without this the conditioned frame is obliterated within a few
+            # near-sigma-1 steps and i2v anchoring is lost.
+            if cond_noise_video is not None:
+                latents = repin_conditioned_latents(
+                    latents,
+                    clean_latent=video_clean_latent,
+                    denoise_mask=video_denoise_mask,
+                    cond_noise=cond_noise_video,
+                    sigma_next=sigma_next_f,
+                )
+            if cond_noise_audio is not None and audio_latents is not None:
+                audio_latents = repin_conditioned_latents(
+                    audio_latents,
+                    clean_latent=audio_clean_latent,
+                    denoise_mask=audio_denoise_mask,
+                    cond_noise=cond_noise_audio,
+                    sigma_next=sigma_next_f,
+                )
 
         batch.latents = latents
         if (batch.return_continuation_state and self.sigmas_override is not None):

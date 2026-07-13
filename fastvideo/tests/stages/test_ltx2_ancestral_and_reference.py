@@ -535,3 +535,50 @@ def test_stage1_cfg_values_validation():
         _make_args(ltx2_text_amp_stage="stage3")
     with pytest.raises(ValueError):
         _make_args(ltx2_anchor_strength=-0.1)
+
+
+def test_ancestral_repin_preserves_conditioned_frame():
+    """Regression: ancestral fresh-noise injection obliterates a partially
+    pinned conditioning frame within a few near-sigma-1 steps unless the
+    region is re-pinned after every update (ComfyUI KSamplerX0Inpaint
+    semantics)."""
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_denoising import (
+        repin_conditioned_latents, )
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+        apply_ltx2_gaussian_noiser,
+        post_process_ltx2_denoised,
+    )
+
+    torch.manual_seed(SEED + 20)
+    sigmas = [1.0, 0.99987238, 0.99820748, 0.99001548, 0.96332988, 0.89394948, 0.744596, 0.47298248, 0.20186216,
+              0.04708576, 0.0]
+    clean = torch.randn(1, 4, 3, 4, 4)  # [B, C, F, H, W]
+    mask = torch.ones(1, 1, 3, 4, 4)
+    mask[:, :, 0] = 0.2  # frame 0 pinned at strength 0.8
+    cond_noise = torch.randn_like(clean)
+
+    def run(repin: bool) -> torch.Tensor:
+        x = apply_ltx2_gaussian_noiser(noise=torch.randn_like(clean), clean_latent=clean, denoise_mask=mask)
+        for i in range(len(sigmas) - 1):
+            x0 = post_process_ltx2_denoised(denoised=x * 0.9, denoise_mask=mask, clean_latent=clean)
+            x = euler_ancestral_rf_step(x, x0, sigmas[i], sigmas[i + 1], eta=1.0, s_noise=1.0,
+                                        noise=torch.randn_like(x))
+            if repin:
+                x = repin_conditioned_latents(x, clean_latent=clean, denoise_mask=mask, cond_noise=cond_noise,
+                                              sigma_next=sigmas[i + 1])
+        return x
+
+    fixed = run(repin=True)
+    broken = run(repin=False)
+    frame0 = clean[:, :, 0]
+    err_fixed = (fixed[:, :, 0] - frame0).norm() / frame0.norm()
+    err_broken = (broken[:, :, 0] - frame0).norm() / frame0.norm()
+    # With the repin the pinned frame ends close to clean; without it the
+    # ancestral noise dominates.
+    assert err_fixed < 0.35, f"repin failed to preserve the conditioned frame (err={err_fixed:.3f})"
+    assert err_broken > 2 * err_fixed, (f"expected collapse without repin (fixed={err_fixed:.3f}, "
+                                        f"broken={err_broken:.3f})")
+    # sigma_next=0 pins exactly (up to the 0.2 free component of the mask).
+    final = repin_conditioned_latents(torch.zeros_like(clean), clean_latent=clean, denoise_mask=mask,
+                                      cond_noise=cond_noise, sigma_next=0.0)
+    torch.testing.assert_close(final[:, :, 0], clean[:, :, 0] * 0.8, rtol=1e-5, atol=1e-5)
