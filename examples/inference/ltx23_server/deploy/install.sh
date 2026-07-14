@@ -14,6 +14,9 @@
 #                           skips the slow in-tree kernel source build.
 #                           Populate once per stack with:
 #                             pip wheel ./fastvideo-kernel -w $WHEELHOUSE
+#   TORCH_CUDA_ARCH_LIST    REQUIRED on GPU-less hosts (docker build): GPU
+#                           archs for the kernel build, e.g. "10.0" for
+#                           B200/GB200. With a visible GPU it is probed.
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
@@ -73,6 +76,10 @@ echo "== [5/5] verify imports =="
 import importlib
 
 import torch
+
+# A CPU-only torch here means pip replaced the base image's CUDA build
+# during `pip install .` — the pyproject pin must match the image's torch.
+assert torch.version.cuda, "torch lost its CUDA build during install!"
 
 for mod in ("fastvideo", "flashinfer", "fastapi", "yaml", "uvicorn"):
     importlib.import_module(mod)

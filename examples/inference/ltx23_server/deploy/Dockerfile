@@ -1,4 +1,8 @@
-# LTX-2.3 server image for fleet deployment.
+# LTX-2.3 server image for fleet deployment — SELF-CONTAINED: torch, the
+# full CUDA toolchain, and every python dep are baked in, so the image runs
+# on any provider's GPU hosts. The only host requirements are an NVIDIA
+# driver new enough for CUDA 13 and nvidia-container-toolkit (the driver
+# always comes from the host; it cannot be baked into an image).
 #
 # Build from the repo root of a FRESH clone with submodules initialized
 # (the context is COPY'd wholesale — a dev checkout drags outputs/models in):
@@ -7,26 +11,37 @@
 #   git checkout ltx23-ancestral-reference
 #   git submodule update --init --recursive
 #   docker build -f examples/inference/ltx23_server/deploy/Dockerfile \
-#       --build-arg BASE_IMAGE=<image of your validated pod> \
 #       -t ltx23-server:$(git rev-parse --short HEAD) .
 #
-# BASE_IMAGE is deliberately required: the torch.compile cache is keyed on
-# the exact GPU/driver/torch/CUDA stack, so the image MUST be built on the
-# same base your compile cache was produced with (e.g. the RunPod torch
-# image your B200 pods run).
-#
-# Big mutable state stays on the network volume, not in the image:
-#   /workspace/ltx23/config.yaml     server config (modes, paths)
-#   /workspace/<model dirs>          merged checkpoints
-#   /workspace/inductor_cache        compile cache from build_compile_cache.py
+# The default base is the public pytorch devel image matching the validated
+# stack (torch 2.12.0 + cu130, amd64). "devel" (nvcc present) is REQUIRED
+# even at runtime: flashinfer JIT-compiles NVFP4 kernels and torch.compile
+# needs a host toolchain. The compile cache is keyed on this stack — after
+# changing BASE_IMAGE (or the GPU model), re-run build_compile_cache.py.
+ARG BASE_IMAGE=pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel
+# GPU archs to compile fastvideo-kernel for (no GPU is visible during
+# docker build, so this cannot be probed): 10.0 = B200/GB200 (sm100).
+# Add e.g. "10.0;12.0" to also cover sm120 consumer Blackwell.
+ARG TORCH_CUDA_ARCH_LIST=10.0
 
-ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+ARG TORCH_CUDA_ARCH_LIST
+
+# git: pip installs FA4 from a pinned git revision.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/FastVideo
 COPY . .
 
-RUN bash examples/inference/ltx23_server/deploy/install.sh
+RUN TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    bash examples/inference/ltx23_server/deploy/install.sh
+
+# Big mutable state stays on the volume, not in the image:
+#   /workspace/ltx23/config.yaml     server config (modes, paths, api keys)
+#   /workspace/<model dirs>          merged checkpoints
+#   /workspace/inductor_cache        compile cache from build_compile_cache.py
+#   /workspace/ltx23/logs            request logs + failed-request inputs
 
 # FA4 under the FLASH_ATTN backend + NVFP4 (flashinfer) is the validated
 # serving stack. LD_LIBRARY_PATH is cleared to keep pip-installed CUDA libs

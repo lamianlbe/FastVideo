@@ -42,20 +42,37 @@ pip wheel ./fastvideo-kernel -w /workspace/wheels     # once
 WHEELHOUSE=/workspace/wheels bash .../deploy/install.sh   # every other pod
 ```
 
-**Docker image (recommended for fleets)** — bake code + deps into one image;
-model weights, config, and the inductor cache live on the network volume:
+**Docker image (recommended for fleets)** — SELF-CONTAINED: torch, the
+CUDA toolchain, and all python deps are baked in, so the image runs on any
+provider. The host only needs an NVIDIA driver (new enough for CUDA 13)
+and nvidia-container-toolkit — the driver always comes from the host and
+can never be baked into an image. Model weights, config, and the inductor
+cache live on the volume:
 
 ```bash
+# from a fresh clone with submodules initialized
 docker build -f examples/inference/ltx23_server/deploy/Dockerfile \
-    --build-arg BASE_IMAGE=<image of your validated pod> \
     -t ltx23-server:$(git rev-parse --short HEAD) .
 docker run --gpus all -p 8000:8000 -v /workspace:/workspace \
     ltx23-server:<tag>    # serves /workspace/ltx23/config.yaml
 ```
 
-`BASE_IMAGE` must match the stack the compile cache was built on — the
-cache is keyed on GPU model/driver/torch/CUDA, so a base-image change means
-re-running `build_compile_cache.py`.
+Defaults you may need to override with `--build-arg`:
+
+- `BASE_IMAGE=pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel` — the public
+  devel image matching the validated stack (torch 2.12.0 + cu130, amd64).
+  *devel* (nvcc) is required even at runtime: flashinfer JIT-compiles the
+  NVFP4 kernels and torch.compile needs a host toolchain. The pyproject
+  pins `torch==2.12.0`, which the image already satisfies, so
+  `pip install .` leaves the CUDA torch untouched (the install self-check
+  fails loudly if that ever regresses).
+- `TORCH_CUDA_ARCH_LIST=10.0` — GPU archs for the kernel build (no GPU is
+  visible during `docker build`): `10.0` = B200/GB200 (sm100).
+
+The inductor compile cache is keyed on the GPU model + torch/CUDA stack:
+switching providers with the same GPU + this same image keeps the cache
+valid; changing BASE_IMAGE or the GPU means re-running
+`build_compile_cache.py` once on the new fleet.
 
 `FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN` + `FASTVIDEO_FA4=1` are set by the
 image, and the server also derives them from the config's
