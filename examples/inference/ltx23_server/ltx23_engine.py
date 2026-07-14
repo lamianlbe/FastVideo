@@ -136,6 +136,11 @@ class Ltx23ServerConfig:
     # overrides it.
     video_bitrate_kbps: int = 3000
     x264_preset: str = "medium"
+    # x264 encoder threads (0 = auto ~1.5x logical cores). If encoding is
+    # slow, check the container's ACTUAL cpu allocation first (nproc) and
+    # consider x264_preset: faster / veryfast — at a fixed VBR bitrate the
+    # preset mostly trades quality-per-bit, not target quality.
+    encode_threads: int = 0
     # Encodes run OUTSIDE the GPU lock (generation of the next request
     # overlaps encoding of the previous). This caps simultaneous CPU
     # encodes so a burst can't starve the host. /v1/generate_s3's HQ+LQ
@@ -413,6 +418,7 @@ def encode_video_h264(
     audio_sample_rate: int | None = None,
     audio_bitrate_kbps: int | None = None,
     audio_mono: bool = False,
+    threads: int = 0,
 ) -> float:
     """CPU-encode RGB frames (+ optional audio) to MP4: libx264 at the
     given profile/preset, VBR at the average bitrate with a 2x/4x VBV
@@ -432,6 +438,10 @@ def encode_video_h264(
         video_stream.height = int(frames[0].shape[0])
         video_stream.pix_fmt = "yuv420p"
         video_stream.bit_rate = int(bitrate_kbps) * 1000
+        # Explicit x264 threading (0 = auto, ~1.5x logical cores). Set it
+        # rather than trusting the libavcodec default — via the library API
+        # (unlike the ffmpeg CLI) some builds default to a single thread.
+        video_stream.codec_context.thread_count = max(0, int(threads))
         video_stream.options = {
             # x264's "baseline" is constrained baseline (sets the CBP flag,
             # disables B-frames/CABAC).
@@ -630,6 +640,7 @@ def run_warmup(
                         preset=cfg.x264_preset,
                         audio=result.get("audio"),
                         audio_sample_rate=result.get("audio_sample_rate"),
+                        threads=cfg.encode_threads,
                     )
                     log(f"[warmup] CPU H.264 encode check passed ({encode_seconds:.1f}s)")
         size_after = cache_dir_size(effective_cache)

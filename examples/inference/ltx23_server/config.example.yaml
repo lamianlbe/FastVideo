@@ -50,7 +50,8 @@ api_keys:
 # Encoding runs outside the GPU lock, overlapping the next request's
 # generation; the response returns once encoding finishes.
 video_bitrate_kbps: 3000  # average bitrate; per-request override available
-x264_preset: medium
+x264_preset: medium       # try faster/veryfast if encode latency matters
+encode_threads: 0         # x264 threads; 0 = auto (~1.5x logical cores)
 max_concurrent_encodes: 2 # cap simultaneous CPU encodes
 
 # /v1/generate_s3 low-quality variant: half width/height + GPU gaussian

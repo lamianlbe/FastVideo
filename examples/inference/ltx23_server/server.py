@@ -385,6 +385,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                     preset=cfg.x264_preset,
                     audio=result.get("audio"),
                     audio_sample_rate=result.get("audio_sample_rate"),
+                    threads=cfg.encode_threads,
                 )
             if not video_path.is_file():
                 raise RuntimeError("encode produced no video file")
@@ -482,6 +483,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 preset=cfg.x264_preset,
                 audio=audio,
                 audio_sample_rate=audio_sr,
+                threads=cfg.encode_threads,
             )
             key = f"{key_base}/hq.mp4"
             t_up = time.perf_counter()
@@ -509,6 +511,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 audio_sample_rate=audio_sr,
                 audio_bitrate_kbps=64,
                 audio_mono=True,
+                threads=cfg.encode_threads,
             )
             key = f"{key_base}/lq.mp4"
             t_up = time.perf_counter()
