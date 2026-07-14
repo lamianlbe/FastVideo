@@ -14,6 +14,11 @@ quant: nvfp4              # nvfp4 | none
 num_gpus: 1
 attention_backend: FLASH_ATTN
 fa4: true                 # FA4 (flash_attn.cute) — needs the pinned install
+# FP8 (e4m3) attention per stage: ~2x tensor-core rate on both attention
+# GEMMs vs bf16, per-head descale. false = current bf16 path. Changing
+# these changes the compiled graph -> re-run build_compile_cache.py.
+fa4_fp8_stage1: false
+fa4_fp8_stage2: false
 
 # Persistent torch.compile artifact cache — REQUIRED for sane startup times.
 # Shareable across machines with an identical GPU/driver/torch/fastvideo stack.

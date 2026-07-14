@@ -388,6 +388,82 @@ def flash_attn_fp4_func(
     return torch.ops.fastvideo._flash_attn_cute_fp4_forward(q, k, v, sfq, sfk, softmax_scale, causal)
 
 
+# ---------------------------------------------------------------------------
+# FP8 (e4m3, per-head descale) variant
+# ---------------------------------------------------------------------------
+# Upstream FA4 CuTe runs q/k/v all in fp8 on sm100 (forward-only) with
+# float32 (batch, nheads) q/k/v_descale tensors and always produces a BF16
+# output (interface.py: out_torch_dtype = bfloat16 if is_fp8). Registered as
+# a custom op for the same reason as the FP4 variant: the CuTeDSL kernel
+# uses cuda.CUstream which dynamo cannot trace.
+
+
+@torch.library.custom_op(
+    "fastvideo::_flash_attn_cute_fp8_forward",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _flash_attn_cute_fp8_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None,
+    causal: bool,
+) -> torch.Tensor:
+    out = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=None,
+        window_size_right=None,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )[0]
+    return out
+
+
+@torch.library.register_fake("fastvideo::_flash_attn_cute_fp8_forward")
+def _flash_attn_cute_fp8_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None,
+    causal: bool,
+) -> torch.Tensor:
+    del k, q_descale, k_descale, v_descale, softmax_scale, causal
+    batch, seqlen_q, nheads = q.shape[:3]
+    # fp8 inputs always produce a bf16 output upstream.
+    return v.new_empty((batch, seqlen_q, nheads, v.shape[-1]), dtype=torch.bfloat16)
+
+
+def flash_attn_fp8_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """FP8 (e4m3) flash attention: q/k/v fp8 with per-(batch, head) float32
+    descales; output BF16. Forward-only, sm100."""
+    return torch.ops.fastvideo._flash_attn_cute_fp8_forward(q, k, v, q_descale, k_descale, v_descale, softmax_scale,
+                                                            causal)
+
+
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,

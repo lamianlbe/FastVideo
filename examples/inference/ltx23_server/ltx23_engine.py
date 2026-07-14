@@ -86,6 +86,12 @@ class Ltx23ServerConfig:
     # serving stack. Requires the pinned flash-attn cute install (see
     # deploy/install.sh).
     fa4: bool = True
+    # FP8 (e4m3) attention per LTX-2 stage: q/k/v quantized with per-head
+    # descales, both attention GEMMs at the fp8 tensor-core rate. OFF = the
+    # current bf16 FA4 path. Toggling changes the compiled graph — re-run
+    # build_compile_cache.py after changing these.
+    fa4_fp8_stage1: bool = False
+    fa4_fp8_stage2: bool = False
     inductor_cache_dir: str = ""  # "" = torch default (NOT persistent)
     compile: bool = True
     warmup_on_start: bool = True
@@ -169,6 +175,8 @@ def setup_environment(cfg: Ltx23ServerConfig) -> None:
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cfg.inductor_cache_dir)
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", cfg.attention_backend)
     os.environ.setdefault("FASTVIDEO_FA4", "1" if cfg.fa4 else "0")
+    os.environ.setdefault("FASTVIDEO_FA4_FP8_STAGE1", "1" if cfg.fa4_fp8_stage1 else "0")
+    os.environ.setdefault("FASTVIDEO_FA4_FP8_STAGE2", "1" if cfg.fa4_fp8_stage2 else "0")
     os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
 
 

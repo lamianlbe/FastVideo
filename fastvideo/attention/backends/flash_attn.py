@@ -137,11 +137,22 @@ logger.info("Using FlashAttention-%s backend", fa_version)
 # The FP4 path uses a dedicated custom_op wrapper (flash_attn_fp4_func) so that
 # torch.compile treats the CuTeDSL kernel as an opaque boundary.
 try:
-    from fastvideo.attention.utils.flash_attn_cute import flash_attn_fp4_func
+    from fastvideo.attention.utils.flash_attn_cute import flash_attn_fp4_func, flash_attn_fp8_func
     _FA4_FP4_AVAILABLE = True
+    _FA4_FP8_AVAILABLE = True
 except ImportError:
     flash_attn_fp4_func = None
+    flash_attn_fp8_func = None
     _FA4_FP4_AVAILABLE = False
+    _FA4_FP8_AVAILABLE = False
+
+# FP8 FA4 support: e4m3 q/k/v with per-(batch, head) descales, bf16 output.
+# Covers BOTH attention GEMMs (QK^T and P·V) at the fp8 tensor-core rate,
+# unlike the FP4 path which quantizes Q/K only. Enable per LTX-2 stage via
+# fa4_fp8_stage1/fa4_fp8_stage2 kwargs or FASTVIDEO_FA4_FP8_STAGE1/2=1; the
+# active stage is read from the forward context at runtime (both stages
+# share one transformer instance).
+from fastvideo.attention.utils.fp8_utils import fa4_fp8_stage_active, fp8_quantize_for_fa4
 
 
 def _nvfp4_quantize_for_fa4(tensor_4d: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -278,6 +289,18 @@ class FlashAttentionImpl(AttentionImpl):
             assert _FA4_FP4_AVAILABLE, ("NVFP4 FA4 requires flash-attention-fp4 (flash_attn.cute). "
                                         "Install via instructions in docs/inference/optimizations.md")
             logger.info("NVFP4 FA4 enabled for FlashAttentionImpl (quant_qk only)")
+        self.fa4_fp8_stage1 = (extra_impl_args.get("fa4_fp8_stage1", False)
+                               or os.environ.get("FASTVIDEO_FA4_FP8_STAGE1", "0") == "1")
+        self.fa4_fp8_stage2 = (extra_impl_args.get("fa4_fp8_stage2", False)
+                               or os.environ.get("FASTVIDEO_FA4_FP8_STAGE2", "0") == "1")
+        if self.fa4_fp8_stage1 or self.fa4_fp8_stage2:
+            assert _FA4_FP8_AVAILABLE, ("FP8 FA4 requires flash_attn.cute (the pinned FA4 install); "
+                                        "see examples/inference/ltx23_server/deploy/install.sh")
+            if torch.cuda.is_available():
+                cap = torch.cuda.get_device_capability()
+                assert cap in [(10, 0), (10, 3)], (f"FP8 FA4 is sm100-only upstream, got sm{cap[0]}{cap[1]}")
+            logger.info("FP8 FA4 enabled (stage1=%s, stage2=%s; e4m3 q/k/v, per-head descale)", self.fa4_fp8_stage1,
+                        self.fa4_fp8_stage2)
 
     def forward(
         self,
@@ -344,6 +367,11 @@ class FlashAttentionImpl(AttentionImpl):
                                  f"expected at most {qkv.shape[1]}, got {key_padding_mask.shape[-1]}")
             attn_mask_padded = F.pad(key_padding_mask, (qkv.shape[1] - key_padding_mask.shape[-1], 0), value=True)
             output = flash_attn_no_pad(qkv, attn_mask_padded, causal=False, dropout_p=0, softmax_scale=None)
+        elif self._fa4_fp8_active():
+            # FP8 wins over the FP4 path when both are enabled for a stage:
+            # it quantizes both attention GEMMs (vs QK^T only) at lower
+            # quantization noise (e4m3 vs e2m1).
+            output = self._forward_fp8(query, key, value)
         elif self.nvfp4_fa4:
             output = self._forward_nvfp4(query, key, value)
 
@@ -358,6 +386,39 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
             )
+        return output
+
+    def _fa4_fp8_active(self) -> bool:
+        """Whether the current forward should run FP8 attention. Reads the
+        LTX-2 stage profile from the forward context (base = stage 1,
+        refine = stage 2); dynamo folds this into a per-stage guard, same
+        pattern as the NVFP4 linear layer set and StageAwareRMSNorm."""
+        if not (self.fa4_fp8_stage1 or self.fa4_fp8_stage2):
+            return False
+        if self.fa4_fp8_stage1 and self.fa4_fp8_stage2:
+            return True
+        from fastvideo.layers.quantization.nvfp4_config import _get_ltx2_fp4_stage_profile
+        return fa4_fp8_stage_active(self.fa4_fp8_stage1, self.fa4_fp8_stage2,
+                                    _get_ltx2_fp4_stage_profile(default="refine"))
+
+    def _forward_fp8(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        """FP8 e4m3 flash attention: q/k/v quantized with per-(batch, head)
+        descales; both GEMMs run at the fp8 tensor-core rate; bf16 out."""
+        q_fp8, q_descale = fp8_quantize_for_fa4(query)
+        k_fp8, k_descale = fp8_quantize_for_fa4(key)
+        v_fp8, v_descale = fp8_quantize_for_fa4(value)
+        output = flash_attn_fp8_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
         return output
 
     def _forward_nvfp4(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
