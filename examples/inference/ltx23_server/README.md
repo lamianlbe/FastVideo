@@ -74,6 +74,36 @@ switching providers with the same GPU + this same image keeps the cache
 valid; changing BASE_IMAGE or the GPU means re-running
 `build_compile_cache.py` once on the new fleet.
 
+### Config and cache are volume-side, not image-side
+
+The image never contains a config: the container reads
+`/workspace/ltx23/config.yaml` from the volume at startup, so the config
+is written/edited AFTER the image is built and applied by restarting the
+container — no rebuild. A different path can be passed per container
+(`docker run … ltx23-server:<tag> --config /workspace/other.yaml`
+replaces the default CMD args).
+
+The image also contains the full source tree, so the compile cache is
+built by the image itself — this is the preferred way, since the cache is
+keyed on the exact runtime stack and the image IS that stack:
+
+```bash
+docker run --gpus all -v /workspace:/workspace --entrypoint python \
+    ltx23-server:<tag> build_compile_cache.py --config /workspace/ltx23/config.yaml
+```
+
+The cache lands in the config's `inductor_cache_dir` on the volume and is
+picked up by every subsequent server container. Full first-deploy
+sequence on a new fleet:
+
+1. `docker build …` (no config involved)
+2. put `config.yaml` + model weights on the volume
+3. run the cache-build container above once, on one machine
+4. start server containers everywhere (same image, same volume contents)
+
+Later config edits: change the file on the volume, restart the container.
+Only additions to `modes` need step 3 again first.
+
 `FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN` + `FASTVIDEO_FA4=1` are set by the
 image, and the server also derives them from the config's
 `attention_backend`/`fa4` fields — no manual exports needed either way.
