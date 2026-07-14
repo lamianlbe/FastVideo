@@ -509,7 +509,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 mode.fps,
                 path,
                 bitrate_kbps=cfg.lq_bitrate_kbps,
-                preset="fast",
+                preset=cfg.lq_x264_preset,
                 profile="baseline",  # x264 baseline == constrained baseline
                 audio=audio,
                 audio_sample_rate=audio_sr,

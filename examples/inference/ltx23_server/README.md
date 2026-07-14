@@ -221,13 +221,17 @@ them itself.
 ## Concurrency & recompilation
 
 One GPU pipeline; **generation** is strictly serial (a queue forms under
-load), but **CPU H.264 encoding runs outside the GPU lock**: as soon as
+load), but **H.264 encoding runs outside the GPU lock**: as soon as
 request N's frames leave the GPU, request N+1 starts generating while
-request N's thread encodes (libx264 main profile, VBR at
-`video_bitrate_kbps` with a 2x/4x VBV envelope, AAC audio; B200 has no
-NVENC so this hides the CPU-encode latency). Each response returns when
-its encode finishes; `X-LTX23-Generate-Seconds` / `X-LTX23-Encode-Seconds`
+request N's thread encodes. B200 has no NVENC, so encoding is libx264 on
+the CPU — but the RGB→YUV420 color conversion (libav's single-threaded
+swscale, the real bottleneck) is done on the GPU and yuv420p is piped
+straight to one ffmpeg subprocess (main profile, VBR at
+`video_bitrate_kbps`, `+faststart`). Each response returns when its
+encode finishes; `X-LTX23-Generate-Seconds` / `X-LTX23-Encode-Seconds`
 report the split, and `max_concurrent_encodes` caps simultaneous encodes.
+Needs an `ffmpeg` binary (system, or the `imageio-ffmpeg` pip bundle that
+`deploy/install.sh` installs).
 
 Per-request parameters — prompt, images, seed, CRF values, bitrate,
 `last_in_upscale`, FLF vs i2v — are all value-level and never trigger

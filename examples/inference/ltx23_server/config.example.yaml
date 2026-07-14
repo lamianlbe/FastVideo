@@ -46,19 +46,22 @@ api_keys:
   - CHANGE-ME-master-key
   # - CHANGE-ME-secondary-key
 
-# CPU H.264 encode (B200 has no NVENC): libx264 main profile, VBR.
+# H.264 encode (B200 has no NVENC): RGB->YUV420 on the GPU, then piped to
+# an ffmpeg/libx264 subprocess (main profile, VBR). GPU color conversion
+# bypasses libav's single-threaded swscale (the serial bottleneck).
 # Encoding runs outside the GPU lock, overlapping the next request's
 # generation; the response returns once encoding finishes.
 video_bitrate_kbps: 3000  # average bitrate; per-request override available
-x264_preset: medium       # try faster/veryfast if encode latency matters
-encode_threads: 0         # x264 threads; 0 = auto (~1.5x logical cores)
-max_concurrent_encodes: 2 # cap simultaneous CPU encodes
+x264_preset: veryfast     # HQ preset; ultrafast ~2x faster at same bitrate
+encode_threads: 0         # x264 -threads; 0 = auto
+max_concurrent_encodes: 2 # cap simultaneous encodes (HQ+LQ pair = 1 unit)
 
 # /v1/generate_s3 low-quality variant: half width/height + GPU gaussian
 # blur, constrained baseline @ lq_bitrate_kbps (preset fast), AAC-LC mono
 # 64 kbps. blur radius = gaussian sigma in pixels at the LQ resolution.
 lq_blur_radius: 2.0
 lq_bitrate_kbps: 1000
+lq_x264_preset: ultrafast  # LQ is a throwaway proxy — fastest preset
 
 # S3 destination — required only for /v1/generate_s3 (uploads hq.mp4 +
 # lq.mp4, returns their s3://bucket/key URIs as JSON; downstream signs).
