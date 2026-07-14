@@ -17,6 +17,12 @@
 #   TORCH_CUDA_ARCH_LIST    REQUIRED on GPU-less hosts (docker build): GPU
 #                           archs for the kernel build, e.g. "10.0" for
 #                           B200/GB200. With a visible GPU it is probed.
+#   DEB_PIP_CONFLICTS       deb python packages to purge before pip installs
+#                           (default "python3-blinker"). Ubuntu ships these
+#                           as distutils installs that pip cannot uninstall
+#                           ("Cannot uninstall blinker"). Purged via apt
+#                           when possible, else shadowed with a scoped
+#                           pip --ignore-installed.
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
@@ -34,14 +40,14 @@ pip_install() {
     "$PYTHON" -m pip install $PIP_EXTRA_ARGS "$@"
 }
 
-echo "== [0/5] sanity: torch =="
+echo "== [0/6] sanity: torch =="
 "$PYTHON" - <<'EOF'
 import torch
 print(f"torch {torch.__version__}, cuda {torch.version.cuda}, "
       f"cuda_available={torch.cuda.is_available()}")
 EOF
 
-echo "== [1/5] git submodules (cutlass/tk for the kernel source build) =="
+echo "== [1/6] git submodules (cutlass/tk for the kernel source build) =="
 if [ -d .git ]; then
     git submodule update --init --recursive fastvideo-kernel
 fi
@@ -52,7 +58,7 @@ if [ ! -e fastvideo-kernel/include/cutlass/include ]; then
     exit 1
 fi
 
-echo "== [2/5] fastvideo-kernel =="
+echo "== [2/6] fastvideo-kernel =="
 # Install BEFORE fastvideo: the in-tree version satisfies pyproject's
 # fastvideo-kernel==0.3.2 pin, so pip won't fall back to the PyPI sdist
 # (which ships without the cutlass submodule and fails to build).
@@ -64,14 +70,34 @@ else
     pip_install -v ./fastvideo-kernel
 fi
 
-echo "== [3/5] fastvideo (pulls flashinfer-python, fastapi, uvicorn, ...) =="
+echo "== [3/6] purge deb python packages pip cannot upgrade =="
+DEB_PIP_CONFLICTS="${DEB_PIP_CONFLICTS:-python3-blinker}"
+for deb_pkg in $DEB_PIP_CONFLICTS; do
+    if command -v dpkg >/dev/null 2>&1 && dpkg -s "$deb_pkg" >/dev/null 2>&1; then
+        echo "   purging $deb_pkg (deb distutils install conflicts with pip)"
+        if [ "$(id -u)" -eq 0 ]; then
+            apt-get purge -y "$deb_pkg" || true
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get purge -y "$deb_pkg" || true
+        fi
+        if dpkg -s "$deb_pkg" >/dev/null 2>&1; then
+            # No root: shadow the deb files instead (pip installs land
+            # earlier on sys.path than /usr/lib/python3/dist-packages).
+            pip_name="${deb_pkg#python3-}"
+            echo "   purge unavailable; shadowing via pip --ignore-installed $pip_name"
+            pip_install --ignore-installed "$pip_name"
+        fi
+    fi
+done
+
+echo "== [4/6] fastvideo (pulls flashinfer-python, fastapi, uvicorn, ...) =="
 pip_install .
 
-echo "== [4/5] FA4 (flash_attn.cute) pinned + server extras =="
+echo "== [5/6] FA4 (flash_attn.cute) pinned + server extras =="
 pip_install "git+https://github.com/Dao-AILab/flash-attention.git@${FA4_REV}#subdirectory=flash_attn/cute"
 pip_install python-multipart  # FastAPI multipart Form/File parsing
 
-echo "== [5/5] verify imports =="
+echo "== [6/6] verify imports =="
 "$PYTHON" - <<'EOF'
 import importlib
 
