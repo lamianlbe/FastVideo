@@ -175,7 +175,9 @@ curl -sS -X POST http://localhost:8000/v1/generate \
 
 Same fields and generation as `/v1/generate`, but produces **two variants**
 and uploads both to S3 (requires the config's `s3` section), returning
-JSON instead of the mp4:
+JSON instead of the mp4. Extra field: `generate_lq` (default **true**) —
+`false` skips the LQ variant entirely and the response JSON then has no
+`lq` field.
 
 - **hq**: the same H.264 main-profile mp4 `/v1/generate` returns.
 - **lq**: half width/height, GPU gaussian blur (`lq_blur_radius` = sigma

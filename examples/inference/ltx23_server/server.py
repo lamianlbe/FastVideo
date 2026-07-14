@@ -437,12 +437,15 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
         image_crf: float = Form(cfg.image_crf),
         image_crf_stage2: float = Form(cfg.image_crf_stage2),
         video_bitrate_kbps: int = Form(cfg.video_bitrate_kbps),
+        # false = HQ only: no LQ encode/upload, and no "lq" field in the
+        # response JSON.
+        generate_lq: bool = Form(True),
     ):
-        """Same generation as /v1/generate, but produces TWO variants —
-        the HQ mp4 plus a half-resolution gaussian-blurred LQ mp4
-        (constrained baseline @ lq_bitrate_kbps, preset fast, AAC-LC mono
-        64 kbps) — encoded in parallel, uploaded to S3, and returned as a
-        JSON with both URLs."""
+        """Same generation as /v1/generate, but uploads to S3 and returns
+        JSON. By default produces TWO variants — the HQ mp4 plus a
+        half-resolution gaussian-blurred LQ mp4 (constrained baseline @
+        lq_bitrate_kbps, preset fast, AAC-LC mono 64 kbps) — encoded in
+        parallel; generate_lq=false skips the LQ variant."""
         if s3_client is None or cfg.s3 is None:
             raise HTTPException(status_code=503,
                                 detail="S3 is not configured — set the 's3' section in the server config")
@@ -467,6 +470,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
         mode, exact, workdir, result = ctx["mode"], ctx["exact"], ctx["workdir"], ctx["result"]
         record, finish, id_header = ctx["record"], ctx["finish"], ctx["id_header"]
         request_id, req_seed = ctx["request_id"], ctx["req_seed"]
+        record["params"]["generate_lq"] = generate_lq
 
         audio = result.get("audio")
         audio_sr = result.get("audio_sample_rate")
@@ -528,15 +532,21 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
             }
 
         try:
-            # GPU half-res + gaussian blur (outside the GPU lock — trivial
-            # next to a DiT step), then both encodes + uploads in parallel.
-            lq_frames = make_lq_frames(result["frames"], cfg.lq_blur_radius)
-            with encode_semaphore:
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    hq_future = pool.submit(_encode_upload_hq)
-                    lq_future = pool.submit(_encode_upload_lq, lq_frames)
-                    hq_info = hq_future.result()
-                    lq_info = lq_future.result()
+            lq_info = None
+            if generate_lq:
+                # GPU half-res + gaussian blur (outside the GPU lock —
+                # trivial next to a DiT step), then both encodes + uploads
+                # in parallel.
+                lq_frames = make_lq_frames(result["frames"], cfg.lq_blur_radius)
+                with encode_semaphore:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        hq_future = pool.submit(_encode_upload_hq)
+                        lq_future = pool.submit(_encode_upload_lq, lq_frames)
+                        hq_info = hq_future.result()
+                        lq_info = lq_future.result()
+            else:
+                with encode_semaphore:
+                    hq_info = _encode_upload_hq()
         except Exception as err:  # noqa: BLE001
             tb = traceback.format_exc()
             failed_dir = _preserve_failed_inputs(workdir, record, tb)
@@ -549,24 +559,24 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
             ) from err
 
         shutil.rmtree(workdir, ignore_errors=True)
-        finish(200, gen_seconds=round(result["gen_seconds"], 2), hq=hq_info, lq=lq_info)
-        return JSONResponse(
-            {
-                "request_id": request_id,
-                "seed": req_seed,
-                "mode": {
-                    "width": mode.width,
-                    "height": mode.height,
-                    "num_frames": mode.num_frames,
-                    "fps": mode.fps,
-                },
-                "exact_match": exact,
-                "gen_seconds": round(result["gen_seconds"], 2),
-                "hq": hq_info,
-                "lq": lq_info,
+        finish(200, gen_seconds=round(result["gen_seconds"], 2), hq=hq_info,
+               **({"lq": lq_info} if lq_info is not None else {}))
+        payload = {
+            "request_id": request_id,
+            "seed": req_seed,
+            "mode": {
+                "width": mode.width,
+                "height": mode.height,
+                "num_frames": mode.num_frames,
+                "fps": mode.fps,
             },
-            headers=id_header,
-        )
+            "exact_match": exact,
+            "gen_seconds": round(result["gen_seconds"], 2),
+            "hq": hq_info,
+        }
+        if lq_info is not None:
+            payload["lq"] = lq_info
+        return JSONResponse(payload, headers=id_header)
 
     return app
 
