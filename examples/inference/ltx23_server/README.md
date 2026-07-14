@@ -171,6 +171,37 @@ curl -sS -X POST http://localhost:8000/v1/generate \
   -o out.mp4 -D headers.txt
 ```
 
+### `POST /v1/generate_s3` (multipart/form-data)
+
+Same fields and generation as `/v1/generate`, but produces **two variants**
+and uploads both to S3 (requires the config's `s3` section), returning
+JSON instead of the mp4:
+
+- **hq**: the same H.264 main-profile mp4 `/v1/generate` returns.
+- **lq**: half width/height, GPU gaussian blur (`lq_blur_radius` = sigma
+  in pixels at the LQ resolution), H.264 **constrained baseline** at
+  `lq_bitrate_kbps` (default 1000) preset *fast*, AAC-LC **mono 64 kbps**.
+
+The two encodes + uploads run in parallel (the pair counts as one
+`max_concurrent_encodes` unit), overlapping the next request's generation.
+
+```json
+{
+  "request_id": "…", "seed": 123,
+  "mode": {"width": 1344, "height": 768, "num_frames": 241, "fps": 24},
+  "exact_match": true, "gen_seconds": 31.2,
+  "hq": {"url": "…", "s3_key": "ltx23/20260714/<id>/hq.mp4",
+         "width": 1344, "height": 768, "video_bitrate_kbps": 3000,
+         "encode_seconds": 18.4, "upload_seconds": 2.1},
+  "lq": {"url": "…", "s3_key": "ltx23/20260714/<id>/lq.mp4",
+         "width": 672, "height": 384, "video_bitrate_kbps": 1000,
+         "blur_radius": 2.0, "encode_seconds": 4.9, "upload_seconds": 0.6}
+}
+```
+
+URLs are presigned GETs (`presign_expiry_seconds`) unless
+`public_base_url` is configured.
+
 ### `GET /v1/modes` — the configured combos. `GET /healthz` — liveness.
 
 ## Mode matching & image fitting

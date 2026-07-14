@@ -127,7 +127,7 @@ pip_install .
 
 echo "== [5/6] FA4 (flash_attn.cute) pinned + server extras =="
 pip_install "git+https://github.com/Dao-AILab/flash-attention.git@${FA4_REV}#subdirectory=flash_attn/cute"
-pip_install python-multipart  # FastAPI multipart Form/File parsing
+pip_install python-multipart boto3  # multipart Form/File parsing + S3 uploads
 
 echo "== [6/6] verify imports =="
 EXPECTED_CUDA="$EXPECTED_CUDA" "$PYTHON" - <<'EOF'

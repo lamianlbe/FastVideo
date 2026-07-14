@@ -42,6 +42,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,7 +50,7 @@ from pathlib import Path
 # setup_environment() stages the process env. They must be module-level for
 # FastAPI to resolve the endpoint's postponed annotations.
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 # ltx23_engine keeps all torch/fastvideo imports function-local.
@@ -57,12 +58,15 @@ from ltx23_engine import (
     GenerationRequest,
     Ltx23ServerConfig,
     create_generator,
+    create_s3_client,
     encode_video_h264,
     generate_for_mode,
     load_config,
+    make_lq_frames,
     match_mode,
     run_warmup,
     setup_environment,
+    upload_file_to_s3,
 )
 
 _ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -107,9 +111,11 @@ def _save_upload(upload, dest_dir: Path, stem: str) -> str:
     return str(dest)
 
 
-def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
+def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
     app = FastAPI(title="FastVideo LTX-2.3 server", version="1.0")
     request_logger = setup_request_logging(cfg)
+    if s3_client is None and cfg.s3 is not None:
+        s3_client = create_s3_client(cfg.s3)
     # One GPU pipeline: requests queue on this lock and run strictly
     # serially (sync endpoints run in Starlette's threadpool). CPU H.264
     # encoding happens OUTSIDE the lock in the request's own thread, so
@@ -205,32 +211,34 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
             } for m in cfg.modes]
         }
 
-    @app.post("/v1/generate", dependencies=[Depends(require_api_key)])
-    def generate(
+    def _run_generation(
         http_request: Request,
-        prompt: str = Form(...),
-        width: int = Form(...),
-        height: int = Form(...),
-        num_frames: int = Form(...),
-        fps: int = Form(...),
-        first_frame: UploadFile = File(...),
-        last_frame: UploadFile | None = File(None),
-        negative_prompt: str | None = Form(None),
-        seed: int | None = Form(None),
-        last_frame_strength: float = Form(cfg.last_frame_strength),
-        # Product defaults: tail anchor DOES enter the stage-2 refine pass,
-        # and stage 2 re-anchors with a clean CRF-0 encode.
-        last_in_upscale: bool = Form(True),
-        image_crf: float = Form(cfg.image_crf),
-        image_crf_stage2: float = Form(cfg.image_crf_stage2),
-        # Average bitrate of the CPU H.264 (main profile, VBR) encode.
-        video_bitrate_kbps: int = Form(cfg.video_bitrate_kbps),
-    ):
+        *,
+        endpoint: str,
+        prompt: str,
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: int,
+        first_frame: UploadFile,
+        last_frame: UploadFile | None,
+        negative_prompt: str | None,
+        seed: int | None,
+        last_frame_strength: float,
+        last_in_upscale: bool,
+        image_crf: float,
+        image_crf_stage2: float,
+        video_bitrate_kbps: int,
+    ) -> dict:
+        """Shared validate -> mode-match -> save-uploads -> GENERATE (GPU
+        lock) flow for both endpoints. Returns a context dict; raises an
+        already-logged HTTPException on any failure."""
         request_id = uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
         record: dict = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "request_id": request_id,
+            "endpoint": endpoint,
             "client": http_request.client.host if http_request.client else None,
             "params": {
                 "prompt": prompt,
@@ -293,7 +301,7 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
         # Generation holds the GPU lock; encoding runs after it is released
         # so the next queued request starts generating while this thread
         # CPU-encodes. Only GENERATION failures feed the wedged-GPU
-        # self-exit counter — encode failures are host/CPU-side.
+        # self-exit counter — encode/upload failures are host-side.
         try:
             with gpu_lock:
                 result = generate_for_mode(generator, cfg, mode, request, workdir / "output.mp4")
@@ -309,6 +317,62 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 headers=id_header,
             ) from err
         _register_success()
+
+        return {
+            "request_id": request_id,
+            "record": record,
+            "finish": finish,
+            "id_header": id_header,
+            "mode": mode,
+            "exact": exact,
+            "workdir": workdir,
+            "result": result,
+            "req_seed": req_seed,
+            "video_bitrate_kbps": video_bitrate_kbps,
+        }
+
+    @app.post("/v1/generate", dependencies=[Depends(require_api_key)])
+    def generate(
+        http_request: Request,
+        prompt: str = Form(...),
+        width: int = Form(...),
+        height: int = Form(...),
+        num_frames: int = Form(...),
+        fps: int = Form(...),
+        first_frame: UploadFile = File(...),
+        last_frame: UploadFile | None = File(None),
+        negative_prompt: str | None = Form(None),
+        seed: int | None = Form(None),
+        last_frame_strength: float = Form(cfg.last_frame_strength),
+        # Product defaults: tail anchor DOES enter the stage-2 refine pass,
+        # and stage 2 re-anchors with a clean CRF-0 encode.
+        last_in_upscale: bool = Form(True),
+        image_crf: float = Form(cfg.image_crf),
+        image_crf_stage2: float = Form(cfg.image_crf_stage2),
+        # Average bitrate of the CPU H.264 (main profile, VBR) encode.
+        video_bitrate_kbps: int = Form(cfg.video_bitrate_kbps),
+    ):
+        ctx = _run_generation(
+            http_request,
+            endpoint="generate",
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            last_frame_strength=last_frame_strength,
+            last_in_upscale=last_in_upscale,
+            image_crf=image_crf,
+            image_crf_stage2=image_crf_stage2,
+            video_bitrate_kbps=video_bitrate_kbps,
+        )
+        mode, exact, workdir, result = ctx["mode"], ctx["exact"], ctx["workdir"], ctx["result"]
+        record, finish, id_header = ctx["record"], ctx["finish"], ctx["id_header"]
+        request_id, req_seed = ctx["request_id"], ctx["req_seed"]
 
         video_path = workdir / "output.mp4"
         try:
@@ -353,6 +417,152 @@ def build_app(generator, cfg: Ltx23ServerConfig) -> FastAPI:
                 **id_header,
             },
             background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),
+        )
+
+    @app.post("/v1/generate_s3", dependencies=[Depends(require_api_key)])
+    def generate_s3(
+        http_request: Request,
+        prompt: str = Form(...),
+        width: int = Form(...),
+        height: int = Form(...),
+        num_frames: int = Form(...),
+        fps: int = Form(...),
+        first_frame: UploadFile = File(...),
+        last_frame: UploadFile | None = File(None),
+        negative_prompt: str | None = Form(None),
+        seed: int | None = Form(None),
+        last_frame_strength: float = Form(cfg.last_frame_strength),
+        last_in_upscale: bool = Form(True),
+        image_crf: float = Form(cfg.image_crf),
+        image_crf_stage2: float = Form(cfg.image_crf_stage2),
+        video_bitrate_kbps: int = Form(cfg.video_bitrate_kbps),
+    ):
+        """Same generation as /v1/generate, but produces TWO variants —
+        the HQ mp4 plus a half-resolution gaussian-blurred LQ mp4
+        (constrained baseline @ lq_bitrate_kbps, preset fast, AAC-LC mono
+        64 kbps) — encoded in parallel, uploaded to S3, and returned as a
+        JSON with both URLs."""
+        if s3_client is None or cfg.s3 is None:
+            raise HTTPException(status_code=503,
+                                detail="S3 is not configured — set the 's3' section in the server config")
+        ctx = _run_generation(
+            http_request,
+            endpoint="generate_s3",
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            fps=fps,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            last_frame_strength=last_frame_strength,
+            last_in_upscale=last_in_upscale,
+            image_crf=image_crf,
+            image_crf_stage2=image_crf_stage2,
+            video_bitrate_kbps=video_bitrate_kbps,
+        )
+        mode, exact, workdir, result = ctx["mode"], ctx["exact"], ctx["workdir"], ctx["result"]
+        record, finish, id_header = ctx["record"], ctx["finish"], ctx["id_header"]
+        request_id, req_seed = ctx["request_id"], ctx["req_seed"]
+
+        audio = result.get("audio")
+        audio_sr = result.get("audio_sample_rate")
+        key_base = "/".join(
+            part for part in (cfg.s3.prefix, datetime.now(timezone.utc).strftime("%Y%m%d"), request_id) if part)
+
+        def _encode_upload_hq() -> dict:
+            path = workdir / "hq.mp4"
+            enc = encode_video_h264(
+                result["frames"],
+                mode.fps,
+                path,
+                bitrate_kbps=ctx["video_bitrate_kbps"],
+                preset=cfg.x264_preset,
+                audio=audio,
+                audio_sample_rate=audio_sr,
+            )
+            key = f"{key_base}/hq.mp4"
+            t_up = time.perf_counter()
+            url = upload_file_to_s3(s3_client, cfg.s3, path, key)
+            return {
+                "url": url,
+                "s3_key": key,
+                "width": mode.width,
+                "height": mode.height,
+                "video_bitrate_kbps": ctx["video_bitrate_kbps"],
+                "encode_seconds": round(enc, 2),
+                "upload_seconds": round(time.perf_counter() - t_up, 2),
+            }
+
+        def _encode_upload_lq(lq_frames: list) -> dict:
+            path = workdir / "lq.mp4"
+            enc = encode_video_h264(
+                lq_frames,
+                mode.fps,
+                path,
+                bitrate_kbps=cfg.lq_bitrate_kbps,
+                preset="fast",
+                profile="baseline",  # x264 baseline == constrained baseline
+                audio=audio,
+                audio_sample_rate=audio_sr,
+                audio_bitrate_kbps=64,
+                audio_mono=True,
+            )
+            key = f"{key_base}/lq.mp4"
+            t_up = time.perf_counter()
+            url = upload_file_to_s3(s3_client, cfg.s3, path, key)
+            return {
+                "url": url,
+                "s3_key": key,
+                "width": mode.width // 2,
+                "height": mode.height // 2,
+                "video_bitrate_kbps": cfg.lq_bitrate_kbps,
+                "blur_radius": cfg.lq_blur_radius,
+                "encode_seconds": round(enc, 2),
+                "upload_seconds": round(time.perf_counter() - t_up, 2),
+            }
+
+        try:
+            # GPU half-res + gaussian blur (outside the GPU lock — trivial
+            # next to a DiT step), then both encodes + uploads in parallel.
+            lq_frames = make_lq_frames(result["frames"], cfg.lq_blur_radius)
+            with encode_semaphore:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    hq_future = pool.submit(_encode_upload_hq)
+                    lq_future = pool.submit(_encode_upload_lq, lq_frames)
+                    hq_info = hq_future.result()
+                    lq_info = lq_future.result()
+        except Exception as err:  # noqa: BLE001
+            tb = traceback.format_exc()
+            failed_dir = _preserve_failed_inputs(workdir, record, tb)
+            finish(500, error=f"encode/upload failed: {err}", traceback=tb, failed_inputs=failed_dir,
+                   gen_seconds=round(result["gen_seconds"], 2))
+            raise HTTPException(
+                status_code=500,
+                detail=f"encode/upload failed: {err} (request_id={request_id})",
+                headers=id_header,
+            ) from err
+
+        shutil.rmtree(workdir, ignore_errors=True)
+        finish(200, gen_seconds=round(result["gen_seconds"], 2), hq=hq_info, lq=lq_info)
+        return JSONResponse(
+            {
+                "request_id": request_id,
+                "seed": req_seed,
+                "mode": {
+                    "width": mode.width,
+                    "height": mode.height,
+                    "num_frames": mode.num_frames,
+                    "fps": mode.fps,
+                },
+                "exact_match": exact,
+                "gen_seconds": round(result["gen_seconds"], 2),
+                "hq": hq_info,
+                "lq": lq_info,
+            },
+            headers=id_header,
         )
 
     return app

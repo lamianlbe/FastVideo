@@ -75,6 +75,26 @@ class Ltx23Mode:
 
 
 @dataclass
+class Ltx23S3Config:
+    """S3 destination for the /v1/generate_s3 endpoint."""
+    region: str
+    bucket: str
+    access_key: str
+    secret_key: str
+    endpoint_url: str = ""  # "" = AWS; set for R2/MinIO-compatible stores
+    prefix: str = "ltx23"  # key prefix: <prefix>/<yyyymmdd>/<request_id>/{hq,lq}.mp4
+    # Returned URLs: presigned GET by default; set public_base_url to
+    # return "<public_base_url>/<key>" instead (public bucket / CDN).
+    presign_expiry_seconds: int = 86400
+    public_base_url: str = ""
+
+    def validate(self) -> None:
+        for field_name in ("region", "bucket", "access_key", "secret_key"):
+            if not getattr(self, field_name):
+                raise ValueError(f"s3.{field_name} is required")
+
+
+@dataclass
 class Ltx23ServerConfig:
     model_path: str
     modes: list[Ltx23Mode]
@@ -118,8 +138,17 @@ class Ltx23ServerConfig:
     x264_preset: str = "medium"
     # Encodes run OUTSIDE the GPU lock (generation of the next request
     # overlaps encoding of the previous). This caps simultaneous CPU
-    # encodes so a burst can't starve the host.
+    # encodes so a burst can't starve the host. /v1/generate_s3's HQ+LQ
+    # pair counts as ONE unit (they run in parallel inside it).
     max_concurrent_encodes: int = 2
+    # /v1/generate_s3 low-quality variant: half width/height, GPU gaussian
+    # blur (sigma in pixels at the LQ resolution; 0 disables), H.264
+    # constrained baseline @ lq_bitrate_kbps with preset fast, AAC-LC
+    # mono 64 kbps.
+    lq_blur_radius: float = 2.0
+    lq_bitrate_kbps: int = 1000
+    # S3 destination (required only for /v1/generate_s3).
+    s3: Ltx23S3Config | None = None
     stage1_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE1_SIGMAS))
     stage2_sigmas: list[float] = field(default_factory=lambda: list(DEFAULT_STAGE2_SIGMAS))
     negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
@@ -154,11 +183,18 @@ def load_config(path: str | Path) -> Ltx23ServerConfig:
     modes = [Ltx23Mode(**m) for m in modes_raw]
     for mode in modes:
         mode.validate()
-    known = {f for f in Ltx23ServerConfig.__dataclass_fields__ if f != "modes"}
+    s3_raw = raw.pop("s3", None)
+    s3_cfg = None
+    if s3_raw is not None:
+        if not isinstance(s3_raw, dict):
+            raise ValueError(f"{path}: 's3' must be a mapping")
+        s3_cfg = Ltx23S3Config(**s3_raw)
+        s3_cfg.validate()
+    known = {f for f in Ltx23ServerConfig.__dataclass_fields__ if f not in ("modes", "s3")}
     unknown = set(raw) - known
     if unknown:
         raise ValueError(f"{path}: unknown config keys {sorted(unknown)}")
-    cfg = Ltx23ServerConfig(modes=modes, **raw)
+    cfg = Ltx23ServerConfig(modes=modes, s3=s3_cfg, **raw)
     if not cfg.model_path:
         raise ValueError(f"{path}: 'model_path' is required")
     if cfg.quant not in ("nvfp4", "none"):
@@ -372,12 +408,16 @@ def encode_video_h264(
     *,
     bitrate_kbps: int = 3000,
     preset: str = "medium",
+    profile: str = "main",
     audio: Any = None,
     audio_sample_rate: int | None = None,
+    audio_bitrate_kbps: int | None = None,
+    audio_mono: bool = False,
 ) -> float:
-    """CPU-encode RGB frames (+ optional audio) to MP4: libx264 main
-    profile, VBR at the given average bitrate with a 2x/4x VBV envelope,
-    AAC audio. Returns the encode wall time in seconds."""
+    """CPU-encode RGB frames (+ optional audio) to MP4: libx264 at the
+    given profile/preset, VBR at the average bitrate with a 2x/4x VBV
+    envelope, AAC audio (optionally downmixed to mono at a fixed
+    bitrate). Returns the encode wall time in seconds."""
     import numpy as np
 
     import av
@@ -393,7 +433,9 @@ def encode_video_h264(
         video_stream.pix_fmt = "yuv420p"
         video_stream.bit_rate = int(bitrate_kbps) * 1000
         video_stream.options = {
-            "profile": "main",
+            # x264's "baseline" is constrained baseline (sets the CBP flag,
+            # disables B-frames/CABAC).
+            "profile": profile,
             "preset": preset,
             "maxrate": f"{int(bitrate_kbps) * 2}k",
             "bufsize": f"{int(bitrate_kbps) * 4}k",
@@ -404,8 +446,13 @@ def encode_video_h264(
         layout = "mono"
         if audio is not None and audio_sample_rate:
             audio_int16, num_channels = _audio_to_int16(audio)
+            if audio_mono and num_channels > 1:
+                audio_int16 = (audio_int16.astype(np.float32).mean(axis=1, keepdims=True).astype(np.int16))
+                num_channels = 1
             layout = "stereo" if num_channels == 2 else "mono"
             audio_stream = container.add_stream("aac", rate=int(audio_sample_rate), layout=layout)
+            if audio_bitrate_kbps:
+                audio_stream.bit_rate = int(audio_bitrate_kbps) * 1000
 
         for frame_np in frames:
             vframe = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame_np), format="rgb24")
@@ -431,6 +478,76 @@ def encode_video_h264(
     finally:
         container.close()
     return time.perf_counter() - t0
+
+
+def make_lq_frames(
+    frames: list[Any],
+    blur_radius: float,
+    device: str | None = None,
+    chunk_size: int = 16,
+) -> list[Any]:
+    """Low-quality variant of RGB uint8 frames: half width/height (area
+    downscale) + separable gaussian blur, computed on the GPU in chunks.
+    ``blur_radius`` is the gaussian sigma in pixels AT THE LQ RESOLUTION
+    (0 disables the blur). Runs outside the GPU lock — the tensor work is
+    tiny next to a DiT step, so contention with the next request's
+    generation is negligible."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    if not frames:
+        raise ValueError("no frames")
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    sigma = float(blur_radius)
+    kernel_x = kernel_y = None
+    pad = 0
+    if sigma > 0:
+        ksize = 2 * int(math.ceil(3.0 * sigma)) + 1
+        pad = ksize // 2
+        coords = torch.arange(ksize, dtype=torch.float32, device=dev) - pad
+        gauss = torch.exp(-(coords**2) / (2.0 * sigma * sigma))
+        gauss = gauss / gauss.sum()
+        kernel_x = gauss.view(1, 1, 1, ksize).repeat(3, 1, 1, 1)
+        kernel_y = gauss.view(1, 1, ksize, 1).repeat(3, 1, 1, 1)
+
+    out: list[Any] = []
+    for start in range(0, len(frames), chunk_size):
+        batch = torch.from_numpy(np.stack(frames[start:start + chunk_size])).to(dev)
+        batch = batch.permute(0, 3, 1, 2).float().div_(255.0)  # N,C,H,W
+        batch = F.interpolate(batch, scale_factor=0.5, mode="area")
+        if kernel_x is not None:
+            batch = F.conv2d(F.pad(batch, (pad, pad, 0, 0), mode="reflect"), kernel_x, groups=3)
+            batch = F.conv2d(F.pad(batch, (0, 0, pad, pad), mode="reflect"), kernel_y, groups=3)
+        batch = batch.clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
+        batch = batch.permute(0, 2, 3, 1).cpu().numpy()
+        out.extend(list(batch))
+    return out
+
+
+def create_s3_client(s3_cfg: Ltx23S3Config) -> Any:
+    import boto3
+
+    return boto3.client(
+        "s3",
+        region_name=s3_cfg.region,
+        aws_access_key_id=s3_cfg.access_key,
+        aws_secret_access_key=s3_cfg.secret_key,
+        **({"endpoint_url": s3_cfg.endpoint_url} if s3_cfg.endpoint_url else {}),
+    )
+
+
+def upload_file_to_s3(client: Any, s3_cfg: Ltx23S3Config, local_path: str | Path, key: str) -> str:
+    """Upload an mp4 and return its URL (public base if configured, else a
+    presigned GET)."""
+    client.upload_file(str(local_path), s3_cfg.bucket, key, ExtraArgs={"ContentType": "video/mp4"})
+    if s3_cfg.public_base_url:
+        return f"{s3_cfg.public_base_url.rstrip('/')}/{key}"
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": s3_cfg.bucket, "Key": key},
+        ExpiresIn=s3_cfg.presign_expiry_seconds,
+    )
 
 
 def make_warmup_image(path: str | Path, width: int, height: int) -> None:

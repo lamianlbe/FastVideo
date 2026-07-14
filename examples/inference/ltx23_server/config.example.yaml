@@ -53,6 +53,25 @@ video_bitrate_kbps: 3000  # average bitrate; per-request override available
 x264_preset: medium
 max_concurrent_encodes: 2 # cap simultaneous CPU encodes
 
+# /v1/generate_s3 low-quality variant: half width/height + GPU gaussian
+# blur, constrained baseline @ lq_bitrate_kbps (preset fast), AAC-LC mono
+# 64 kbps. blur radius = gaussian sigma in pixels at the LQ resolution.
+lq_blur_radius: 2.0
+lq_bitrate_kbps: 1000
+
+# S3 destination — required only for /v1/generate_s3 (uploads hq.mp4 +
+# lq.mp4, returns their URLs as JSON). URLs are presigned GETs unless
+# public_base_url is set.
+# s3:
+#   region: us-east-1
+#   bucket: CHANGE-ME
+#   access_key: CHANGE-ME
+#   secret_key: CHANGE-ME
+#   endpoint_url: ""            # set for R2/MinIO-compatible stores
+#   prefix: ltx23               # keys: <prefix>/<yyyymmdd>/<request_id>/{hq,lq}.mp4
+#   presign_expiry_seconds: 86400
+#   public_base_url: ""         # e.g. https://cdn.example.com
+
 # Every supported (width, height, num_frames, fps) combination. Requests
 # that don't exactly match are served with the closest-resolution mode.
 # Constraints: width/height divisible by 64 (x2 refine; 96 for the x1.5
