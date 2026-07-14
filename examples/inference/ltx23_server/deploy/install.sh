@@ -23,11 +23,21 @@
 #                           ("Cannot uninstall blinker"). Purged via apt
 #                           when possible, else shadowed with a scoped
 #                           pip --ignore-installed.
+#   TORCH_BACKEND=cu130     PyTorch wheel variant (download.pytorch.org index).
+#                           cu130 is the validated B200 stack; PyPI's default
+#                           torch wheel is cu126, which skews against a
+#                           CUDA-13 system toolchain (FA4 / flashinfer JIT).
+#   TORCH_VERSION=2.12.0    must match pyproject's torch pin.
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
 PIP_EXTRA_ARGS="${PIP_EXTRA_ARGS:-}"
 WHEELHOUSE="${WHEELHOUSE:-}"
+TORCH_BACKEND="${TORCH_BACKEND:-cu130}"
+TORCH_VERSION="${TORCH_VERSION:-2.12.0}"
+# cu130 -> "13.0", cu126 -> "12.6"
+_cuda_digits="${TORCH_BACKEND#cu}"
+EXPECTED_CUDA="${_cuda_digits%?}.${_cuda_digits: -1}"
 # FA4 revision must stay in sync with [tool.uv.sources].flash-attn-4 in
 # pyproject.toml (cutlass-4.5-compatible pin).
 FA4_REV="82d6441eec5d4dfec120153db2c0145ae855a083"
@@ -40,7 +50,29 @@ pip_install() {
     "$PYTHON" -m pip install $PIP_EXTRA_ARGS "$@"
 }
 
-echo "== [0/6] sanity: torch =="
+echo "== [0/6] torch ${TORCH_VERSION} (${TORCH_BACKEND}) =="
+# Install torch from the matching CUDA index BEFORE anything compiles
+# against it (the kernel build links against the installed torch). Skips
+# when the right build is already present (e.g. the docker base image).
+if EXPECTED_CUDA="$EXPECTED_CUDA" TORCH_VERSION="$TORCH_VERSION" "$PYTHON" - <<'EOF'
+import os
+import sys
+
+try:
+    import torch
+except Exception:
+    sys.exit(1)
+version_ok = torch.__version__.split("+")[0] == os.environ["TORCH_VERSION"]
+cuda_ok = (torch.version.cuda or "") == os.environ["EXPECTED_CUDA"]
+sys.exit(0 if (version_ok and cuda_ok) else 1)
+EOF
+then
+    echo "   torch ${TORCH_VERSION}+${TORCH_BACKEND} already installed; keeping it"
+else
+    echo "   installing torch ${TORCH_VERSION} (${TORCH_BACKEND}) + torchvision/torchaudio"
+    pip_install "torch==${TORCH_VERSION}" torchvision torchaudio \
+        --index-url "https://download.pytorch.org/whl/${TORCH_BACKEND}"
+fi
 "$PYTHON" - <<'EOF'
 import torch
 print(f"torch {torch.__version__}, cuda {torch.version.cuda}, "
@@ -98,14 +130,17 @@ pip_install "git+https://github.com/Dao-AILab/flash-attention.git@${FA4_REV}#sub
 pip_install python-multipart  # FastAPI multipart Form/File parsing
 
 echo "== [6/6] verify imports =="
-"$PYTHON" - <<'EOF'
+EXPECTED_CUDA="$EXPECTED_CUDA" "$PYTHON" - <<'EOF'
 import importlib
+import os
 
 import torch
 
-# A CPU-only torch here means pip replaced the base image's CUDA build
-# during `pip install .` — the pyproject pin must match the image's torch.
-assert torch.version.cuda, "torch lost its CUDA build during install!"
+# A different CUDA flavor here means a later pip step replaced the torch
+# installed in step 0 (e.g. a PyPI cu126 wheel sneaking back in).
+expected = os.environ["EXPECTED_CUDA"]
+assert torch.version.cuda == expected, \
+    f"torch CUDA {torch.version.cuda!r} != expected {expected!r} — replaced during install!"
 
 for mod in ("fastvideo", "flashinfer", "fastapi", "yaml", "uvicorn"):
     importlib.import_module(mod)
