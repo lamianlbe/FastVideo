@@ -83,10 +83,6 @@ class Ltx23S3Config:
     secret_key: str
     endpoint_url: str = ""  # "" = AWS; set for R2/MinIO-compatible stores
     prefix: str = "ltx23"  # key prefix: <prefix>/<yyyymmdd>/<request_id>/{hq,lq}.mp4
-    # Returned URLs: presigned GET by default; set public_base_url to
-    # return "<public_base_url>/<key>" instead (public bucket / CDN).
-    presign_expiry_seconds: int = 86400
-    public_base_url: str = ""
 
     def validate(self) -> None:
         for field_name in ("region", "bucket", "access_key", "secret_key"):
@@ -548,16 +544,10 @@ def create_s3_client(s3_cfg: Ltx23S3Config) -> Any:
 
 
 def upload_file_to_s3(client: Any, s3_cfg: Ltx23S3Config, local_path: str | Path, key: str) -> str:
-    """Upload an mp4 and return its URL (public base if configured, else a
-    presigned GET)."""
+    """Upload an mp4 and return its s3://bucket/key URI (the caller's
+    downstream signs/serves it)."""
     client.upload_file(str(local_path), s3_cfg.bucket, key, ExtraArgs={"ContentType": "video/mp4"})
-    if s3_cfg.public_base_url:
-        return f"{s3_cfg.public_base_url.rstrip('/')}/{key}"
-    return client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": s3_cfg.bucket, "Key": key},
-        ExpiresIn=s3_cfg.presign_expiry_seconds,
-    )
+    return f"s3://{s3_cfg.bucket}/{key}"
 
 
 def make_warmup_image(path: str | Path, width: int, height: int) -> None:
