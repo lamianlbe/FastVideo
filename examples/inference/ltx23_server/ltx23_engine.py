@@ -464,6 +464,17 @@ def run_warmup(
     through the CPU H.264 encoder to validate that path before serving."""
     seen: set[tuple[int, int, int, int]] = set()
     encode_checked = not encode_check
+    # Compile-cache hit diagnostics: dynamo re-traces every shape in every
+    # process (expected, minutes per mode), but the inductor cache should
+    # serve all kernel compilation from disk. If the cache DIR GROWS during
+    # warmup, the cache is missing — check that TORCHINDUCTOR_CACHE_DIR
+    # matches the build_compile_cache.py run (an exported shell var
+    # overrides the config's inductor_cache_dir) and that config/torch/
+    # fastvideo didn't change since.
+    effective_cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
+    size_before = cache_dir_size(effective_cache)
+    log(f"[warmup] inductor cache: {effective_cache or '(default, not persistent!)'} "
+        f"(size before: {size_before})")
     workdir = Path(tempfile.mkdtemp(prefix="ltx23_warmup_"))
     try:
         for mode in cfg.modes:
@@ -504,6 +515,15 @@ def run_warmup(
                         audio_sample_rate=result.get("audio_sample_rate"),
                     )
                     log(f"[warmup] CPU H.264 encode check passed ({encode_seconds:.1f}s)")
+        size_after = cache_dir_size(effective_cache)
+        if size_after != size_before:
+            log(f"[warmup] WARNING: inductor cache grew {size_before} -> {size_after} — "
+                "kernels were (re)compiled, i.e. the prebuilt cache did not fully hit. "
+                "Verify TORCHINDUCTOR_CACHE_DIR matches the build_compile_cache.py run "
+                "and that config/torch/fastvideo are unchanged since.")
+        else:
+            log(f"[warmup] inductor cache clean hit (size unchanged: {size_after}) — "
+                "warmup time was dynamo tracing + the generations themselves.")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
