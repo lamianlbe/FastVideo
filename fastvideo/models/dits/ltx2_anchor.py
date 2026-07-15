@@ -9,9 +9,13 @@ a per-frame temporal-distance falloff. At a chosen sampling step the anchor
 frame's token matrix is snapshotted per block and reused as a frozen pull
 target for the remaining steps.
 
-Eager-only: the per-block snapshot cache mutates a Python dict inside the
-block forward, which is incompatible with torch.compile(fullgraph=True).
-The denoising stage rejects the combination.
+torch.compile-compatible: the per-block snapshot cache is a preallocated
+tensor buffer (indexed by a compile-time-constant block slot) with 0-d
+bool tensor ``capture`` / ``use_cache`` flags, so freeze-at-step-N is
+expressed with ``torch.where`` and functionalized in-place buffer writes —
+no Python dict mutation or data-dependent Python branch inside the block
+forward. With ``anchor_buf`` left None it degrades to "match the current
+anchor frame every step" (used by the shape/math unit tests).
 """
 
 from __future__ import annotations
@@ -31,10 +35,15 @@ _ENERGY_SHARPNESS = 16.0
 class LatentAnchorContext:
     """Carried through the transformer forward for the selected blocks.
 
-    ``cache`` maps block idx -> (anchor_flat [1,K,D], anchor_mean [1,1,D]);
-    populated when ``capture`` is True, used whenever an entry exists.
-    ``token_offset`` skips a reference-token prefix so the anchor grid maps
-    exactly onto the target's (F, H, W) token grid.
+    Compile-safe snapshot cache: ``anchor_buf`` [num_slots, K, D] and
+    ``anchor_mean_buf`` [num_slots, 1, D] are preallocated tensors indexed
+    by ``slot_of[block_idx]`` (a compile-time-constant lookup). ``capture``
+    and ``use_cache`` are 0-d bool tensors set per step by the stage:
+    ``use_cache`` selects the frozen buffer over the current anchor,
+    ``capture`` writes the current anchor into the buffer (both via
+    ``torch.where``). Leaving ``anchor_buf`` None disables caching (match
+    the current anchor frame every step). ``token_offset`` skips a
+    reference-token prefix so the anchor grid maps onto the (F, H, W) grid.
     """
     strength: float
     blocks: list[int]
@@ -47,8 +56,11 @@ class LatentAnchorContext:
     anchor_frame: int = 0
     energy_grid: torch.Tensor | None = None  # [H_tok, W_tok] in [0, 1]
     token_offset: int = 0
-    capture: bool = False
-    cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    slot_of: dict[int, int] = field(default_factory=dict)
+    anchor_buf: torch.Tensor | None = None
+    anchor_mean_buf: torch.Tensor | None = None
+    capture: torch.Tensor | None = None      # 0-d bool
+    use_cache: torch.Tensor | None = None     # 0-d bool
 
 
 def extract_energy_map(ref_latent: torch.Tensor, anchor_frame: int = 0) -> torch.Tensor:
@@ -101,18 +113,25 @@ def apply_latent_anchor(
     compute_dtype = torch.float32
     grid_f = grid.to(compute_dtype)
 
-    cached = ctx.cache.get(block_idx)
-    if cached is not None:
-        anchor_flat = cached[0].to(device=x.device, dtype=compute_dtype).expand(bsz, -1, -1)
-        anchor_mean = cached[1].to(device=x.device, dtype=compute_dtype).expand(bsz, -1, -1)
+    # Current anchor-frame token matrix (this step's activations).
+    current_anchor = grid_f[:, anchor_idx].reshape(bsz, hdim * wdim, dim)
+    current_mean = current_anchor.mean(dim=1, keepdim=True)
+
+    if ctx.anchor_buf is not None and block_idx in ctx.slot_of:
+        # Snapshot cache via tensor buffer + torch.where (compile-safe):
+        # use_cache selects the frozen buffer, capture freezes the current
+        # anchor into it. Both flags are 0-d bool tensors set per step.
+        slot = ctx.slot_of[block_idx]
+        buf_a = ctx.anchor_buf[slot].to(device=x.device, dtype=compute_dtype).unsqueeze(0)
+        buf_m = ctx.anchor_mean_buf[slot].to(device=x.device, dtype=compute_dtype).unsqueeze(0)
+        anchor_flat = torch.where(ctx.use_cache, buf_a, current_anchor)
+        anchor_mean = torch.where(ctx.use_cache, buf_m, current_mean)
+        # Functionalized in-place write; a no-op value when capture is False.
+        ctx.anchor_buf[slot] = torch.where(ctx.capture, current_anchor[0].detach(), ctx.anchor_buf[slot])
+        ctx.anchor_mean_buf[slot] = torch.where(ctx.capture, current_mean[0].detach(), ctx.anchor_mean_buf[slot])
     else:
-        anchor_flat = grid_f[:, anchor_idx].reshape(bsz, hdim * wdim, dim)
-        anchor_mean = anchor_flat.mean(dim=1, keepdim=True)
-        if ctx.capture:
-            ctx.cache[block_idx] = (
-                anchor_flat[:1].detach().clone(),
-                anchor_mean[:1].detach().clone(),
-            )
+        anchor_flat = current_anchor
+        anchor_mean = current_mean
 
     # Centered cosine matching of every token against the anchor frame.
     all_flat = grid_f.reshape(bsz, n_target, dim)

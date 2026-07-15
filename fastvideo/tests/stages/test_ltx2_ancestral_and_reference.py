@@ -473,23 +473,30 @@ def test_latent_anchor_snapshot_cache():
     from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext, apply_latent_anchor
     torch.manual_seed(SEED + 11)
     f, h, w, d = 3, 2, 2, 4
+    k = h * w
+    # Compile-safe cache: preallocated buffers + 0-d bool tensor flags.
     ctx = LatentAnchorContext(strength=0.2, blocks=[5], frames=f, height_tokens=h, width_tokens=w,
-                              energy_threshold=0.0)
-    x1 = torch.randn(1, f * h * w, d)
-    ctx.capture = True
+                              energy_threshold=0.0, slot_of={5: 0},
+                              anchor_buf=torch.zeros(1, k, d), anchor_mean_buf=torch.zeros(1, 1, d))
+    # Capture step (use_cache False, capture True): freeze x1's anchor frame.
+    x1 = torch.randn(1, f * k, d)
+    ctx.capture = torch.tensor(True)
+    ctx.use_cache = torch.tensor(False)
     apply_latent_anchor(x1, ctx, block_idx=5)
-    assert 5 in ctx.cache
-    snap = ctx.cache[5][0].clone()
-    # A later call with different activations must pull toward the SNAPSHOT.
-    x2 = torch.randn(1, f * h * w, d)
-    ctx.capture = False
+    snap = x1.reshape(1, f, h, w, d)[:, 0].reshape(1, k, d)
+    torch.testing.assert_close(ctx.anchor_buf[0], snap[0])  # buffer holds x1's anchor tokens
+    # Later step (use_cache True, capture False): pull toward the SNAPSHOT,
+    # not x2's own anchor frame.
+    x2 = torch.randn(1, f * k, d)
+    ctx.capture = torch.tensor(False)
+    ctx.use_cache = torch.tensor(True)
     out2 = apply_latent_anchor(x2, ctx, block_idx=5)
     grid2 = x2.reshape(1, f, h, w, d)
-    expected = _ref_anchor_pull(grid2, snap, ctx.cache[5][1], strength=0.2, sim_thr=0.5, decay=0.15,
-                                anchor_idx=0).reshape(1, -1, d)
+    expected = _ref_anchor_pull(grid2, snap, snap.mean(dim=1, keepdim=True), strength=0.2, sim_thr=0.5,
+                                decay=0.15, anchor_idx=0).reshape(1, -1, d)
     torch.testing.assert_close(out2, expected, rtol=1e-5, atol=1e-6)
-    # Cache is untouched by the second call.
-    torch.testing.assert_close(ctx.cache[5][0], snap)
+    # Buffer untouched by the use-step (capture False).
+    torch.testing.assert_close(ctx.anchor_buf[0], snap[0])
 
 
 def test_latent_anchor_prefix_and_mismatch():

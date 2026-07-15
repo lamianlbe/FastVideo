@@ -3023,9 +3023,13 @@ class LTX2Transformer3DModel(BaseDiT):
                 raise ValueError("LTX-2 latent anchor conditioning requires the full token "
                                  "sequence on one rank; it is not supported with sequence "
                                  "parallelism yet.")
-            # The anchor grid maps onto the target tokens only; skip any
-            # reference-token prefix.
-            latent_anchor.token_offset = n_ref_tokens
+            # Anchor and the reference-token prefix are distinct identity
+            # mechanisms; no shipped workflow combines them. token_offset is
+            # a construction-time constant (0), so we validate rather than
+            # mutate a Python object inside the (compilable) forward.
+            if n_ref_tokens != latent_anchor.token_offset:
+                raise ValueError("LTX-2 latent anchor is not supported together with reference "
+                                 "tokens; use one identity mechanism at a time.")
 
         # Text-amplification weight follows the token sequence exactly:
         # extend for the reference prefix (per-frame weight pattern is

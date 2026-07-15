@@ -724,13 +724,10 @@ class LTX2DenoisingStage(PipelineStage):
                         amp_blocks, stage_name, fastvideo_args.ltx2_text_amp_spatial_focus)
 
         # Latent anchor identity stabilizer (LTXLatentAnchorAware port),
-        # stage-1 only, eager-only.
+        # stage-1 only. Compile-safe: the snapshot cache is a preallocated
+        # tensor buffer with torch.where capture/use flags (see ltx2_anchor).
         anchor_ctx = None
         if fastvideo_args.ltx2_anchor_strength > 0.0 and self.sigmas_override is None:
-            if getattr(fastvideo_args, "enable_torch_compile", False):
-                raise ValueError("ltx2_anchor_strength > 0 is eager-only: the per-block anchor "
-                                 "snapshot cache is incompatible with torch.compile. Disable "
-                                 "enable_torch_compile or the anchor.")
             from fastvideo.models.dits.ltx2_anchor import (
                 LatentAnchorContext,
                 resample_energy_map,
@@ -742,9 +739,10 @@ class LTX2DenoisingStage(PipelineStage):
                     int(latents.shape[3]),
                     int(latents.shape[4]),
                 )
+            anchor_blocks = parse_block_range(fastvideo_args.ltx2_anchor_blocks, num_blocks)
             anchor_ctx = LatentAnchorContext(
                 strength=float(fastvideo_args.ltx2_anchor_strength),
-                blocks=parse_block_range(fastvideo_args.ltx2_anchor_blocks, num_blocks),
+                blocks=anchor_blocks,
                 frames=int(latents.shape[2]),
                 height_tokens=int(latents.shape[3]),
                 width_tokens=int(latents.shape[4]),
@@ -754,6 +752,23 @@ class LTX2DenoisingStage(PipelineStage):
                 anchor_frame=int(fastvideo_args.ltx2_anchor_frame),
                 energy_grid=energy if isinstance(energy, torch.Tensor) else None,
             )
+            # Preallocate the snapshot buffers here (outside the compiled
+            # forward) so per-step captures are functionalized in-place
+            # writes rather than a Python-dict mutation.
+            dit_cfg = fastvideo_args.pipeline_config.dit_config
+            anchor_dim = int(dit_cfg.num_attention_heads) * int(dit_cfg.attention_head_dim)
+            anchor_k = int(latents.shape[3]) * int(latents.shape[4])
+            anchor_ctx.slot_of = {b: i for i, b in enumerate(anchor_blocks)}
+            anchor_ctx.anchor_buf = torch.zeros(len(anchor_blocks),
+                                                anchor_k,
+                                                anchor_dim,
+                                                dtype=torch.float32,
+                                                device=latents.device)
+            anchor_ctx.anchor_mean_buf = torch.zeros(len(anchor_blocks),
+                                                     1,
+                                                     anchor_dim,
+                                                     dtype=torch.float32,
+                                                     device=latents.device)
             extra_transformer_kwargs["latent_anchor"] = anchor_ctx
             logger.info("[LTX2] Latent anchor active: strength=%.3f blocks=%s cache_at_step=%d energy=%s",
                         anchor_ctx.strength, anchor_ctx.blocks, fastvideo_args.ltx2_anchor_cache_at_step,
@@ -820,9 +835,12 @@ class LTX2DenoisingStage(PipelineStage):
                                 if stage1_cfg_values is not None else do_cfg_text)
             step_do_guidance = step_do_cfg_text or do_mod or do_stg
             if anchor_ctx is not None:
-                # The snapshot is captured on the first pass of the cache
-                # step; later passes/steps hit the populated cache.
-                anchor_ctx.capture = (step_index == int(fastvideo_args.ltx2_anchor_cache_at_step))
+                # Capture the anchor snapshot at the cache step; use the
+                # frozen buffer on later steps. 0-d bool tensors so the
+                # block forward selects with torch.where (compile-safe).
+                cache_step = int(fastvideo_args.ltx2_anchor_cache_at_step)
+                anchor_ctx.capture = torch.tensor(step_index == cache_step, dtype=torch.bool, device=latents.device)
+                anchor_ctx.use_cache = torch.tensor(step_index > cache_step, dtype=torch.bool, device=latents.device)
             # Per-sample sigma for LTX-2.3 cross-attention AdaLN prompt
             # timestep. Ignored by LTX-2.0 (prompt_adaln is None).
             sigma_batch = sigma.reshape(1).expand(latents.shape[0])
