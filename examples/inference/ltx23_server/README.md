@@ -135,9 +135,12 @@ after warm-up, so both instances **share** them — build the cache once.
 Two ways: two config files, or one config + CLI overrides:
 
 ```bash
-# shared: build the compile cache once (on either GPU)
-CUDA_VISIBLE_DEVICES=0 env -u LD_LIBRARY_PATH \
-    python build_compile_cache.py --config config.yaml
+# shared cache, built in parallel across both GPUs (each does half the
+# modes; the cache is keyed on GPU *model*, so both instances then reuse
+# every entry). Serial single-GPU build also works — just drop --gpu/--shard.
+env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml --gpu 0 --shard 0/2 &
+env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml --gpu 1 --shard 1/2 &
+wait
 
 # instance A -> GPU 0, port 8080, its own logs
 env -u LD_LIBRARY_PATH python server.py --config config.yaml \
