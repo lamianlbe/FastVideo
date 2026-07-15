@@ -76,7 +76,8 @@ lq_x264_preset: ultrafast  # LQ is a throwaway proxy — fastest preset
 #   access_key: CHANGE-ME
 #   secret_key: CHANGE-ME
 #   endpoint_url: ""            # set for R2/MinIO-compatible stores
-#   prefix: ltx23               # keys: <prefix>/<yyyymmdd>/<request_id>/{hq,lq}.mp4
+#   prefix: ""                  # directory; "" = bucket root. Each output is
+#                               # <prefix>/<uuid4>.mp4, e.g. sg/xxxx-...-xxxx.mp4
 
 # Every supported (width, height, num_frames, fps) combination. Requests
 # that don't exactly match are served with the closest-resolution mode.

@@ -82,7 +82,10 @@ class Ltx23S3Config:
     access_key: str
     secret_key: str
     endpoint_url: str = ""  # "" = AWS; set for R2/MinIO-compatible stores
-    prefix: str = "ltx23"  # key prefix: <prefix>/<yyyymmdd>/<request_id>/{hq,lq}.mp4
+    # Directory (key prefix) for uploaded files. "" = bucket root. Each
+    # output is <prefix>/<uuid4>.mp4 — e.g. prefix "sg" ->
+    # s3://<bucket>/sg/xxxxxxxx-xxxx-...-xxxx.mp4.
+    prefix: str = ""
 
     def validate(self) -> None:
         for field_name in ("region", "bucket", "access_key", "secret_key"):
@@ -592,6 +595,13 @@ def make_lq_frames(
         batch = batch.permute(0, 2, 3, 1).cpu().numpy()
         out.extend(list(batch))
     return out
+
+
+def build_s3_key(s3_cfg: Ltx23S3Config, filename: str) -> str:
+    """<prefix>/<filename>, or just <filename> when prefix is empty (root).
+    Leading/trailing slashes on the prefix are ignored."""
+    prefix = s3_cfg.prefix.strip("/")
+    return f"{prefix}/{filename}" if prefix else filename
 
 
 def create_s3_client(s3_cfg: Ltx23S3Config) -> Any:

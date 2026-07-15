@@ -57,6 +57,7 @@ from starlette.background import BackgroundTask
 from ltx23_engine import (
     GenerationRequest,
     Ltx23ServerConfig,
+    build_s3_key,
     create_generator,
     create_s3_client,
     encode_video_h264,
@@ -474,10 +475,12 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
 
         audio = result.get("audio")
         audio_sr = result.get("audio_sample_rate")
-        key_base = "/".join(
-            part for part in (cfg.s3.prefix, datetime.now(timezone.utc).strftime("%Y%m%d"), request_id) if part)
+        # Each output is <prefix>/<uuid4>.mp4 (flat; prefix "" = bucket root).
+        # HQ and LQ get independent GUIDs; the response JSON ties them together.
+        hq_key = build_s3_key(cfg.s3, f"{uuid.uuid4()}.mp4")
+        lq_key = build_s3_key(cfg.s3, f"{uuid.uuid4()}.mp4")
 
-        def _encode_upload_hq() -> dict:
+        def _encode_upload_hq(key: str) -> dict:
             path = workdir / "hq.mp4"
             enc = encode_video_h264(
                 result["frames"],
@@ -489,7 +492,6 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 audio_sample_rate=audio_sr,
                 threads=cfg.encode_threads,
             )
-            key = f"{key_base}/hq.mp4"
             t_up = time.perf_counter()
             url = upload_file_to_s3(s3_client, cfg.s3, path, key)
             return {
@@ -502,7 +504,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 "upload_seconds": round(time.perf_counter() - t_up, 2),
             }
 
-        def _encode_upload_lq(lq_frames: list) -> dict:
+        def _encode_upload_lq(lq_frames: list, key: str) -> dict:
             path = workdir / "lq.mp4"
             enc = encode_video_h264(
                 lq_frames,
@@ -517,7 +519,6 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 audio_mono=True,
                 threads=cfg.encode_threads,
             )
-            key = f"{key_base}/lq.mp4"
             t_up = time.perf_counter()
             url = upload_file_to_s3(s3_client, cfg.s3, path, key)
             return {
@@ -540,13 +541,13 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 lq_frames = make_lq_frames(result["frames"], cfg.lq_blur_radius)
                 with encode_semaphore:
                     with ThreadPoolExecutor(max_workers=2) as pool:
-                        hq_future = pool.submit(_encode_upload_hq)
-                        lq_future = pool.submit(_encode_upload_lq, lq_frames)
+                        hq_future = pool.submit(_encode_upload_hq, hq_key)
+                        lq_future = pool.submit(_encode_upload_lq, lq_frames, lq_key)
                         hq_info = hq_future.result()
                         lq_info = lq_future.result()
             else:
                 with encode_semaphore:
-                    hq_info = _encode_upload_hq()
+                    hq_info = _encode_upload_hq(hq_key)
         except Exception as err:  # noqa: BLE001
             tb = traceback.format_exc()
             failed_dir = _preserve_failed_inputs(workdir, record, tb)

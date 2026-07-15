@@ -225,19 +225,21 @@ The two encodes + uploads run in parallel (the pair counts as one
   "request_id": "…", "seed": 123,
   "mode": {"width": 1344, "height": 768, "num_frames": 241, "fps": 24},
   "exact_match": true, "gen_seconds": 31.2,
-  "hq": {"url": "s3://bucket/ltx23/20260714/<id>/hq.mp4",
-         "s3_key": "ltx23/20260714/<id>/hq.mp4",
+  "hq": {"url": "s3://bucket/sg/9f2c…-hq-guid.mp4",
+         "s3_key": "sg/9f2c…-hq-guid.mp4",
          "width": 1344, "height": 768, "video_bitrate_kbps": 3000,
          "encode_seconds": 18.4, "upload_seconds": 2.1},
-  "lq": {"url": "s3://bucket/ltx23/20260714/<id>/lq.mp4",
-         "s3_key": "ltx23/20260714/<id>/lq.mp4",
+  "lq": {"url": "s3://bucket/sg/3a71…-lq-guid.mp4",
+         "s3_key": "sg/3a71…-lq-guid.mp4",
          "width": 672, "height": 384, "video_bitrate_kbps": 1000,
          "blur_radius": 2.0, "encode_seconds": 4.9, "upload_seconds": 0.6}
 }
 ```
 
-URLs are `s3://bucket/key` URIs — downstream is expected to sign/serve
-them itself.
+Each output is keyed `<s3.prefix>/<uuid4>.mp4` (prefix `""` = bucket root;
+prefix `"sg"` → `sg/<uuid4>.mp4`). HQ and LQ get independent GUIDs — the
+response ties them together. URLs are `s3://bucket/key` URIs; downstream
+signs/serves them.
 
 ### `GET /v1/modes` — the configured combos. `GET /healthz` — liveness.
 
