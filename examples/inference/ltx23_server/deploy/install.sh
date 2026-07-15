@@ -106,6 +106,17 @@ if [ -n "$WHEELHOUSE" ] && compgen -G "$WHEELHOUSE/fastvideo_kernel-*.whl" > /de
     pip_install "$WHEELHOUSE"/fastvideo_kernel-*.whl
 else
     echo "   building from in-tree source (slow; consider WHEELHOUSE for fleets)"
+    # Preflight: the kernel is a C++/CUDA extension and needs Python dev
+    # headers (Python.h). A uv/venv built on a bare system Python without
+    # python3-dev has none, and CMake fails cryptically with
+    # "missing: Development.Module". Fail fast with the actual fix instead.
+    if ! "$PYTHON" -c 'import sysconfig, os, sys; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path("include"), "Python.h")) else 1)'; then
+        _inc="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
+        echo "ERROR: Python headers (Python.h) not found under ${_inc}." >&2
+        echo "  Debian/Ubuntu system-Python venv:  apt-get install -y python3-dev" >&2
+        echo "  or recreate the venv from a uv-managed Python (headers bundled)." >&2
+        exit 1
+    fi
     # Build deps into THIS env + --no-build-isolation, mirroring the kernel's
     # own build.sh. With pip's default build isolation, scikit-build-core's
     # CMake find_package(Python COMPONENTS Development.Module) fails against
