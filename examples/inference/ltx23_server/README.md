@@ -16,7 +16,8 @@ the two share compiled graphs, so switching between them never recompiles.
 | `ltx23_engine.py` | Shared engine (recipe, generator construction, mode matching, warmup) |
 | `deploy/install.sh` | One-shot dependency install (kernel, FA4, flashinfer, server extras) |
 | `deploy/Dockerfile` | Fleet image: deps + server baked in, model/cache on a volume |
-| `deploy/run_server.sh` | Bare-metal supervisor: restart-on-crash loop with per-run logs |
+| `deploy/ltx23@.service` + `ltx23.env.example` | systemd template unit — one service per GPU (VMs) |
+| `deploy/run_server.sh` | Fallback supervisor for hosts without systemd (containers): restart loop |
 
 ## Installing dependencies
 
@@ -307,16 +308,27 @@ tail -f /workspace/ltx23/logs/requests.jsonl
 Note plain docker only *reports* unhealthy — restarts happen because the
 process exits (crash or self-exit) under `--restart unless-stopped`.
 
-**Bare metal (debugging):** `deploy/run_server.sh` wraps the server in a
-restart loop with backoff, teeing each run to `logs/server-<ts>.log`:
+**VM / bare metal (recommended): systemd.** `deploy/ltx23@.service` is a
+template unit — one instance per GPU, the instance name being the GPU id.
+`Restart=on-failure` picks up both crashes and the server's own exit(1) on
+a wedged GPU; `StartLimitBurst` stops an unrecoverable loop.
 
 ```bash
-cd examples/inference/ltx23_server
-CONFIG=config.yaml bash deploy/run_server.sh
+cd examples/inference/ltx23_server/deploy
+# edit the venv/repo/config paths in ltx23@.service, then:
+sudo cp ltx23@.service /etc/systemd/system/
+sudo mkdir -p /etc/ltx23
+sudo cp ltx23.env.example /etc/ltx23/0.env   # PORT=8080, LOG_DIR=.../gpu0
+sudo cp ltx23.env.example /etc/ltx23/1.env   # edit: PORT=8081, LOG_DIR=.../gpu1
+sudo systemctl daemon-reload
+sudo systemctl enable --now ltx23@0 ltx23@1  # start both, and on boot
 ```
 
-A clean exit (code 0, e.g. Ctrl-C on uvicorn) stops the loop; crashes and
-the self-exit (code 1) restart after `BACKOFF` (default 5 s). On hosts
-with systemd, an equivalent unit is `Restart=on-failure` +
-`ExecStart=... python server.py --config ...` — the self-exit semantics
-are the same.
+Manage: `systemctl status ltx23@0`, `journalctl -u ltx23@0 -f` (warmup +
+`[request]` lines), `systemctl restart ltx23@1`. The JSON request log
+still lands in each instance's `LOG_DIR/requests.jsonl`.
+
+**Containers without systemd:** `deploy/run_server.sh` wraps the server in
+a restart loop with backoff, teeing each run to `logs/server-<ts>.log`
+(`CONFIG=config.yaml bash deploy/run_server.sh`). Use this only where
+systemd isn't available; on a VM prefer the unit above.
