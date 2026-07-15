@@ -124,6 +124,35 @@ env -u LD_LIBRARY_PATH python server.py --config config.yaml
 
 `env -u LD_LIBRARY_PATH` avoids the system-cuBLAS mismatch on RunPod images.
 
+### Multi-GPU: one instance per GPU
+
+Each server drives a single GPU pipeline, so a 2-GPU box runs two
+independent instances. Pin each to a GPU and give it its own port and
+`log_dir` (the request log's `RotatingFileHandler` is not multi-process
+safe). The model weights and the inductor compile cache are read-only
+after warm-up, so both instances **share** them — build the cache once.
+
+Two ways: two config files, or one config + CLI overrides:
+
+```bash
+# shared: build the compile cache once (on either GPU)
+CUDA_VISIBLE_DEVICES=0 env -u LD_LIBRARY_PATH \
+    python build_compile_cache.py --config config.yaml
+
+# instance A -> GPU 0, port 8080, its own logs
+env -u LD_LIBRARY_PATH python server.py --config config.yaml \
+    --gpu 0 --port 8080 --log-dir /workspace/ltx23/logs/gpu0 &
+# instance B -> GPU 1, port 8081, its own logs
+env -u LD_LIBRARY_PATH python server.py --config config.yaml \
+    --gpu 1 --port 8081 --log-dir /workspace/ltx23/logs/gpu1 &
+```
+
+Put a load balancer (nginx/HAProxy) in front to spread requests across
+8080/8081. `--gpu`/`--log-dir`/`--port` override the config's
+`cuda_visible_devices`/`log_dir`/`port`; or bake those into two separate
+config files. Keep `num_gpus: 1` — this is data-parallel across GPUs, not
+one model split over both.
+
 The inductor cache is shareable across machines with an **identical** stack
 (GPU model, driver, torch, fastvideo, quant mode, attention backend). Sync
 `inductor_cache_dir` to each machine; only the per-process dynamo trace

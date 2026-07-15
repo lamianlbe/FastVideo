@@ -97,6 +97,12 @@ class Ltx23ServerConfig:
     upsampler_path: str = ""  # "" = auto-detect <model>/spatial_upscaler|spatial_upsampler
     quant: str = "nvfp4"  # nvfp4 | none
     num_gpus: int = 1
+    # Which physical GPU(s) this instance runs on, e.g. "1" or "0,1".
+    # "" = inherit the shell / all visible. On a multi-GPU box, run one
+    # server per GPU (num_gpus=1, distinct cuda_visible_devices + port +
+    # log_dir). Set BEFORE torch initializes, so it actually pins the
+    # process. The count should match num_gpus.
+    cuda_visible_devices: str = ""
     attention_backend: str = "FLASH_ATTN"
     # FA4 (flash_attn.cute) under the FLASH_ATTN backend — the validated
     # serving stack. Requires the pinned flash-attn cute install (see
@@ -203,12 +209,20 @@ def load_config(path: str | Path) -> Ltx23ServerConfig:
         raise ValueError(f"{path}: quant must be nvfp4 or none, got {cfg.quant}")
     if any(not isinstance(k, str) or not k.strip() for k in cfg.api_keys):
         raise ValueError(f"{path}: api_keys entries must be non-empty strings")
+    cvd = cfg.cuda_visible_devices
+    if cvd and not all(p.strip().isdigit() for p in cvd.split(",")):
+        raise ValueError(f"{path}: cuda_visible_devices must be comma-separated GPU indices, got {cvd!r}")
     return cfg
 
 
 def setup_environment(cfg: Ltx23ServerConfig) -> None:
     """Set process env consumed by torch/fastvideo. Call before importing
     either; already-exported env vars win (operator override)."""
+    # GPU pinning is authoritative when set in config/CLI (unlike the other
+    # knobs below): a specific GPU is an explicit deployment choice, so it
+    # overrides any inherited CUDA_VISIBLE_DEVICES rather than deferring.
+    if cfg.cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cfg.cuda_visible_devices
     if cfg.inductor_cache_dir:
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cfg.inductor_cache_dir)
     os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", cfg.attention_backend)

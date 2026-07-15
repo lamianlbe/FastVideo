@@ -12,6 +12,11 @@ upsampler_path: ""
 
 quant: nvfp4              # nvfp4 | none
 num_gpus: 1
+# Which physical GPU this instance uses. "" = all visible / shell default.
+# On a multi-GPU box, run ONE server per GPU: give each its own
+# cuda_visible_devices + port + log_dir (see README). Overridable per
+# launch with --gpu. The count must match num_gpus.
+cuda_visible_devices: ""  # e.g. "0" on instance A, "1" on instance B
 attention_backend: FLASH_ATTN
 fa4: true                 # FA4 (flash_attn.cute) — needs the pinned install
 # FP8 (e4m3) attention per stage: ~2x tensor-core rate on both attention

@@ -588,10 +588,22 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=None, help="Override config port")
     parser.add_argument("--skip-warmup", action="store_true",
                         help="Skip startup warmup (first requests then pay the dynamo trace)")
+    parser.add_argument("--gpu", default=None,
+                        help="CUDA_VISIBLE_DEVICES for this instance, e.g. '1' (overrides config); "
+                        "run one instance per GPU on a multi-GPU box")
+    parser.add_argument("--log-dir", default=None,
+                        help="Override config log_dir (give each per-GPU instance its own)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    # CLI overrides let one config file drive several per-GPU instances.
+    if args.gpu is not None:
+        cfg.cuda_visible_devices = args.gpu
+    if args.log_dir is not None:
+        cfg.log_dir = args.log_dir
     setup_environment(cfg)  # before create_generator imports torch/fastvideo
+    if cfg.cuda_visible_devices:
+        print(f"[server] CUDA_VISIBLE_DEVICES={cfg.cuda_visible_devices}")
 
     print(f"[server] building generator (compile={cfg.compile}, quant={cfg.quant})…")
     generator = create_generator(cfg)
