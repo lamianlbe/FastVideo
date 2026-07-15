@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """FastVideo port of the ComfyUI "all-in-one v2" LTX-2.3 I2V workflow.
 
-    env -u LD_LIBRARY_PATH python eager_ltx2_3_allinone_i2v.py
+    env -u LD_LIBRARY_PATH python eager_ltx2_3_allinone_i2v.py \
+        --first-frame first.png [--last-frame last.png] --prompt "..." \
+        --width 1344 --height 768 --fps 24 --num-frames 241 \
+        --output out.mp4 --image-crf 0 --image-crf-stage2 0
+
+Per-run params are CLI flags (same surface as the DMD example; see --help).
+Passing --last-frame switches i2v -> first+last-frame. This workflow's
+frame-0 guide anchor stays at strength 0.8 and defaults to CRF 0 (AddGuide
+does no preprocessing); identity comes from LatentAnchorAware, not
+reference tokens.
 
 Differences from the DMD example (eager_ltx2_3_ancestral_reference_i2v.py):
 this workflow uses a 10-step eased sigma schedule with a per-step CFG head
@@ -33,26 +42,21 @@ Known approximations vs the ComfyUI graph (accepted by design):
 
 from __future__ import annotations
 
+import argparse
 import os
 import time
 from collections import OrderedDict
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros_v1_Diffusers")
-IMAGE_PATH = os.getenv("LTX23_I2V_IMAGE", "/workspace/photo_2026-07-09_16-48-21.jpg")
-PROMPT_BODY = os.getenv("LTX23_I2V_PROMPT",
-                        "情色电影，温暖亲密光影。画面右侧的男生用双手持续揉捏女生的乳房，拇指反复刺激乳头，画面左侧的女生保持柔和微张嘴表情"
-                        "并发出轻微喘息，两人目光锁定，身体轻微摇摆。")
-OUTPUT_DIR = Path(os.getenv("LTX23_OUTPUT_DIR", "outputs_video/allinone_i2v_test"))
-SEED = int(os.getenv("LTX23_SEED", "635141064074927"))
-
-# Final output dims. x1.5 refine requires both divisible by 96
-# (stage 1 = target / 1.5 must hit even /32 latent dims): 1344x768 -> 896x512.
-WIDTH = 1344
-HEIGHT = 768
-NUM_FRAMES = int(os.getenv("LTX23_NUM_FRAMES", "241"))
-FPS = 24
+# Defaults for the CLI args (env still seeds them for backward compat).
+# x1.5 refine requires both output dims divisible by 96 (stage 1 =
+# target / 1.5 must hit even /32 latent dims): 1344x768 -> 896x512.
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_PATH = os.getenv("LTX23_MODEL_PATH", "/workspace/10Eros_v1_Diffusers")
+DEFAULT_PROMPT = os.getenv("LTX23_I2V_PROMPT",
+                           "情色电影，温暖亲密光影。画面右侧的男生用双手持续揉捏女生的乳房，拇指反复刺激乳头，画面左侧的女生保持柔和微张嘴表情"
+                           "并发出轻微喘息，两人目光锁定，身体轻微摇摆。")
 
 # Stage-1 schedule: the workflow's 14-value ManualSigmas after the
 # RES4LYF Sigmas Easing transform (cubic in-out, strength 0.7), with the
@@ -66,7 +70,9 @@ STAGE1_SIGMAS = [
 # via out-of-range layer indices; only the CFG schedule remains).
 STAGE1_CFG_VALUES = [2.0, 1.5]  # padded with 1.0 for the remaining steps
 STAGE2_SIGMAS = [0.85, 0.725, 0.4219, 0.0]
-IMAGE_STRENGTH = 0.8  # LTXPlusBatchAddGuide strength (frame-0 anchor)
+# LTXPlusBatchAddGuide frame-0 anchor strength (guide-token approximation);
+# a workflow constant, not a CLI arg (mirrors the DMD example's fixed 1.0).
+IMAGE_STRENGTH = 0.8
 
 NEGATIVE_PROMPT = ("still image, bad quality, subtitles, text, watermark, overlay effects, pc game, "
                    "yelling, console game, video game, cartoon, childish, ugly, text, blur, logo, "
@@ -100,20 +106,80 @@ def resolve_upsampler(model_root: str) -> str:
                      "commands, or set LTX23_UPSAMPLER_PATH.")
 
 
-def main() -> None:
-    if not Path(IMAGE_PATH).is_file():
-        raise SystemExit(f"IMAGE_PATH not found: {IMAGE_PATH} (set LTX23_I2V_IMAGE)")
-    if "REPLACE ME" in PROMPT_BODY:
-        raise SystemExit("Set PROMPT_BODY or the LTX23_I2V_PROMPT env var.")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="LTX-2.3 all-in-one v2 i2v / first+last-frame "
+                                "generation (ComfyUI workflow port; eager-only).")
+    p.add_argument("--first-frame", default=os.getenv("LTX23_I2V_IMAGE", ""),
+                   help="First-frame image: frame-0 guide anchor + LatentAnchorAware source. Required.")
+    p.add_argument("--last-frame", default=None,
+                   help="Optional last-frame image; passing it switches i2v -> FLF.")
+    p.add_argument("--prompt", default=DEFAULT_PROMPT, help="Positive prompt (passed verbatim).")
+    p.add_argument("--negative-prompt", default=NEGATIVE_PROMPT,
+                   help="Negative prompt; feeds the CFG head + cfg_pp uncond.")
+    p.add_argument("--width", type=int, default=1344,
+                   help="Output width; divisible by 96 for the x1.5 upscaler.")
+    p.add_argument("--height", type=int, default=768, help="Output height; same divisibility as --width.")
+    p.add_argument("--fps", type=int, default=24)
+    p.add_argument("--num-frames", type=int, default=int(os.getenv("LTX23_NUM_FRAMES", "241")),
+                   help="Frame count (8*k+1).")
+    p.add_argument("--output", default=os.getenv("LTX23_OUTPUT", "outputs_video/allinone_i2v.mp4"),
+                   help="Output mp4 path (or a directory).")
+    p.add_argument("--image-crf", type=float, default=0.0,
+                   help="Stage-1 conditioning CRF; this workflow's AddGuide path defaults to 0.")
+    p.add_argument("--image-crf-stage2", type=float, default=None,
+                   help="Stage-2 (refine) CRF; default = same as --image-crf.")
+    p.add_argument("--last-strength", type=float, default=0.8,
+                   help="FLF tail-anchor strength in [0, 1] (only with --last-frame).")
+    p.add_argument("--last-in-upscale", action=argparse.BooleanOptionalAction, default=True,
+                   help="Whether the tail anchor also enters the stage-2 refine pass (FLF only).")
+    p.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Model repo (Diffusers layout).")
+    p.add_argument("--seed", type=int, default=int(os.getenv("LTX23_SEED", "635141064074927")))
+    return p.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    model_root = maybe_download_model(MODEL_PATH)
+
+def main() -> None:
+    args = parse_args()
+    if not args.first_frame or not Path(args.first_frame).is_file():
+        raise SystemExit(f"--first-frame not found: {args.first_frame!r}")
+    if args.last_frame and not Path(args.last_frame).is_file():
+        raise SystemExit(f"--last-frame not found: {args.last_frame}")
+    if QUANT not in ("nvfp4", "none"):
+        raise SystemExit(f"LTX23_QUANT must be nvfp4 or none, got {QUANT}")
+    if not 0.0 <= args.last_strength <= 1.0:
+        raise SystemExit(f"--last-strength must be in [0, 1], got {args.last_strength}")
+
+    output = Path(args.output)
+    if output.suffix:
+        out_dir, out_file = output.parent, output
+    else:
+        out_dir, out_file = output, output / "allinone_i2v.mp4"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model_root = maybe_download_model(args.model)
     upsampler_path = resolve_upsampler(model_root)
-    print(f"model:     {model_root}")
-    print(f"upsampler: {upsampler_path} (x1.5 expected)")
-    print(f"image:     {IMAGE_PATH}")
-    print(f"frames:    {NUM_FRAMES} @ {FPS} fps, {WIDTH}x{HEIGHT} (stage1 {WIDTH * 2 // 3}x{HEIGHT * 2 // 3})")
-    print(f"quant:     {QUANT}")
+
+    # frame-0 guide anchor at IMAGE_STRENGTH; last frame (FLF) at --last-strength.
+    # LATENT frame indices (8x temporal compression).
+    images = [(args.first_frame, 0, IMAGE_STRENGTH)]
+    images_stage2 = None
+    if args.last_frame:
+        last_latent_idx = (args.num_frames - 1) // 8
+        images.append((args.last_frame, last_latent_idx, args.last_strength))
+        if not args.last_in_upscale:
+            images_stage2 = [(args.first_frame, 0, IMAGE_STRENGTH)]
+
+    print(f"model:      {model_root}")
+    print(f"upsampler:  {upsampler_path} (x1.5 expected)")
+    print(f"first:      {args.first_frame} @ strength {IMAGE_STRENGTH}")
+    if args.last_frame:
+        print(f"last:       {args.last_frame} @ latent idx {(args.num_frames - 1) // 8}, "
+              f"strength {args.last_strength}, in_upscale={args.last_in_upscale}")
+    print(f"frames:     {args.num_frames} @ {args.fps} fps, {args.width}x{args.height} "
+          f"(stage1 {args.width * 2 // 3}x{args.height * 2 // 3})")
+    print(f"image_crf:  stage1={args.image_crf} "
+          f"stage2={args.image_crf_stage2 if args.image_crf_stage2 is not None else '(same)'}")
+    print(f"output:     {out_file}")
+    print(f"quant:      {QUANT}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
     pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
@@ -156,19 +222,21 @@ def main() -> None:
     )
 
     common_kwargs = dict(
-        prompt=PROMPT_BODY,
-        negative_prompt=NEGATIVE_PROMPT,  # feeds the CFG head + cfg_pp uncond
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,  # feeds the CFG head + cfg_pp uncond
         guidance_scale=1.0,
         ltx2_rescale_scale=1.0,           # STGGuiderAdvanced std-rescale on CFG steps
-        height=HEIGHT,
-        width=WIDTH,
-        num_frames=NUM_FRAMES,
-        fps=FPS,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        fps=args.fps,
         num_inference_steps=len(STAGE1_SIGMAS) - 1,
-        # Keyframe anchor at frame 0, strength 0.8 (guide-token approximation;
-        # the workflow's AddGuide path applies no CRF preprocessing).
-        ltx2_images=[(IMAGE_PATH, 0, IMAGE_STRENGTH)],
-        ltx2_image_crf=0.0,
+        # frame-0 guide anchor (+ last frame for FLF); AddGuide path defaults
+        # to CRF 0 but --image-crf / --image-crf-stage2 override per stage.
+        ltx2_images=images,
+        ltx2_images_stage2=images_stage2,
+        ltx2_image_crf=args.image_crf,
+        ltx2_image_crf_stage2=args.image_crf_stage2,
         ltx2_stg_scale_video=0.0,
         ltx2_stg_scale_audio=0.0,
         ltx2_cfg_scale_video=1.0,
@@ -183,11 +251,13 @@ def main() -> None:
         stage_times: dict[str, list[float]] = {}
         stage_order: OrderedDict = OrderedDict()
         for m in range(MEASURED_RUNS):
-            out_path = OUTPUT_DIR / f"allinone_run_{m + 1}.mp4"
+            # Single run -> exactly --output; multiple runs -> _runN siblings.
+            out_path = (out_file if MEASURED_RUNS == 1 else out_file.with_name(
+                f"{out_file.stem}_run{m + 1}{out_file.suffix or '.mp4'}"))
             t0 = time.perf_counter()
             result = generator.generate_video(
                 output_path=str(out_path),
-                seed=SEED + m,
+                seed=args.seed + m,
                 **common_kwargs,
             )
             wall = time.perf_counter() - t0
