@@ -114,6 +114,13 @@ else
     # Without isolation, CMake targets this venv's Python (headers present)
     # and the torch installed in step 0.
     pip_install scikit-build-core cmake ninja setuptools wheel
+    # Point CMake's FindPython straight at this interpreter. uv-managed
+    # standalone Pythons otherwise trip "Could NOT find Python (missing:
+    # Development.Module)" even with --no-build-isolation. Harmless when
+    # scikit-build-core already resolves it. If it STILL fails, the venv's
+    # Python has no headers (see the header notes at the top of this file).
+    _py_exec="$("$PYTHON" -c 'import sys; print(sys.executable)')"
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DPython_EXECUTABLE=${_py_exec}"
     pip_install -v --no-build-isolation ./fastvideo-kernel
 fi
 
