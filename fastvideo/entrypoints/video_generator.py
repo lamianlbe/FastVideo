@@ -1144,6 +1144,19 @@ class VideoGenerator:
                 else:
                     cmd += ["-preset", os.getenv("FASTVIDEO_X264_PRESET", "ultrafast")]
 
+                # Arbitrary extra video-encoder args (applied only on this
+                # ffmpeg-pipe path). Lets callers set bitrate / CRF / codec
+                # tuning without code edits, e.g.
+                #   FASTVIDEO_FFMPEG_EXTRA_VIDEO_ARGS="-x265-params asm=avx512 -crf 28 -tag:v hvc1"
+                #   FASTVIDEO_FFMPEG_EXTRA_VIDEO_ARGS="-b:v 2500k -maxrate 5000k -bufsize 10000k"
+                # NOTE: the PyAV fallback (used only if this path fails) is
+                # hardcoded libx264 and ignores these — check `ffmpeg
+                # -encoders` supports your codec so the pipe succeeds.
+                extra_video_args = os.getenv("FASTVIDEO_FFMPEG_EXTRA_VIDEO_ARGS", "").strip()
+                if extra_video_args:
+                    import shlex
+                    cmd += shlex.split(extra_video_args)
+
                 cmd += [
                     "-c:a",
                     "aac",
