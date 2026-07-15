@@ -241,7 +241,20 @@ prefix `"sg"` → `sg/<uuid4>.mp4`). HQ and LQ get independent GUIDs — the
 response ties them together. URLs are `s3://bucket/key` URIs; downstream
 signs/serves them.
 
-### `GET /v1/modes` — the configured combos. `GET /healthz` — liveness.
+### `GET /v1/modes` — the configured combos.
+
+### `GET /healthz` / `GET /readyz`
+
+The port binds immediately, but warmup (per-shape dynamo trace/compile)
+runs in the background. During it, `/v1/generate*` return **503** with
+`Retry-After`, so a load balancer sees a live endpoint rather than
+connection-refused.
+
+- `GET /healthz` — liveness; 200 even while warming, with a `ready` flag.
+- `GET /readyz` — readiness; 200 once warm, 503 while warming. Point the
+  load balancer and the docker HEALTHCHECK here so traffic only routes
+  when the server can actually serve. A warmup failure exits the process
+  (supervisor restarts) rather than lingering at 503.
 
 ## Mode matching & image fitting
 

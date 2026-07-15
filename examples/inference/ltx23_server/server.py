@@ -3,16 +3,19 @@
 
     env -u LD_LIBRARY_PATH python server.py --config config.yaml
 
-Startup: loads the config, builds the compiled generator, then runs one
-warmup generation per distinct compile shape (dynamo trace + inductor cache
-hit) before binding the port. Point TORCHINDUCTOR_CACHE_DIR / the config's
+Startup: loads the config, builds the compiled generator, binds the port,
+and warms up (one generation per distinct compile shape — dynamo trace +
+inductor cache hit) in the BACKGROUND. Until warmup finishes, /v1/* returns
+503 and /readyz stays 503, so a load balancer sees a live endpoint instead
+of connection-refused. Point TORCHINDUCTOR_CACHE_DIR / the config's
 ``inductor_cache_dir`` at the cache produced by build_compile_cache.py so
 warmup is a re-trace (minutes), not a cold compile (tens of minutes).
 
 Endpoints:
     POST /v1/generate   multipart form; returns the mp4 synchronously
     GET  /v1/modes      supported {width, height, num_frames, fps} combos
-    GET  /healthz       liveness + warmup state
+    GET  /healthz       liveness (200 even while warming; has a `ready` flag)
+    GET  /readyz        readiness (200 once warm, 503 while warming) — for LBs
 
 Requests whose (width, height, num_frames, fps) don't exactly match a
 configured mode are served with the closest-resolution mode; conditioning
@@ -155,6 +158,18 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
             }))
         raise HTTPException(status_code=401, detail="invalid or missing API key")
 
+    # Readiness gate: the port binds immediately but warmup runs in the
+    # background (main), so generation requests are refused with a clean 503
+    # + Retry-After until the first-per-shape dynamo traces / compiles are
+    # done. main() flips this via app.state.ready.
+    ready = threading.Event()
+    app.state.ready = ready
+
+    def require_ready() -> None:
+        if not ready.is_set():
+            raise HTTPException(status_code=503, detail="server is warming up; retry shortly",
+                                headers={"Retry-After": "30"})
+
     fail_lock = threading.Lock()
     fail_state = {"consecutive": 0}
 
@@ -195,11 +210,22 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
 
     @app.get("/healthz")
     def healthz() -> dict:
+        # Liveness: the process is up (200 even while warming). Orchestrators
+        # route traffic on /readyz, not this.
         return {
             "status": "ok",
+            "ready": ready.is_set(),
             "busy": gpu_lock.locked(),
             "consecutive_failures": fail_state["consecutive"],
         }
+
+    @app.get("/readyz")
+    def readyz():
+        # Readiness: 200 only once warmup is done; 503 while warming. Point
+        # the load balancer / docker HEALTHCHECK here.
+        if ready.is_set():
+            return {"status": "ready"}
+        return JSONResponse({"status": "warming"}, status_code=503, headers={"Retry-After": "30"})
 
     @app.get("/v1/modes", dependencies=[Depends(require_api_key)])
     def modes() -> dict:
@@ -332,7 +358,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
             "video_bitrate_kbps": video_bitrate_kbps,
         }
 
-    @app.post("/v1/generate", dependencies=[Depends(require_api_key)])
+    @app.post("/v1/generate", dependencies=[Depends(require_ready), Depends(require_api_key)])
     def generate(
         http_request: Request,
         prompt: str = Form(...),
@@ -423,7 +449,7 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
             background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),
         )
 
-    @app.post("/v1/generate_s3", dependencies=[Depends(require_api_key)])
+    @app.post("/v1/generate_s3", dependencies=[Depends(require_ready), Depends(require_api_key)])
     def generate_s3(
         http_request: Request,
         prompt: str = Form(...),
@@ -615,14 +641,31 @@ def main() -> None:
     print(f"[server] building generator (compile={cfg.compile}, quant={cfg.quant})…")
     generator = create_generator(cfg)
 
-    if cfg.warmup_on_start and not args.skip_warmup:
-        print(f"[server] warming up {len(cfg.modes)} mode(s)…")
-        run_warmup(generator, cfg)
-        print("[server] warmup complete")
-    else:
-        print("[server] warmup skipped — first request per shape pays the dynamo trace")
-
     app = build_app(generator, cfg)
+
+    # Bind the port immediately and warm up in the background: /v1/* returns
+    # 503 (and /readyz stays 503) until warmup finishes, so load balancers
+    # see a live endpoint instead of connection-refused during the
+    # minutes-long trace. A warmup failure exit(1)s so the supervisor
+    # restarts (a half-warmed worker must not linger returning 503 forever).
+    if cfg.warmup_on_start and not args.skip_warmup:
+        def _warmup() -> None:
+            try:
+                print(f"[server] warming up {len(cfg.modes)} mode(s) in the background; "
+                      "/v1/* returns 503 until ready…")
+                run_warmup(generator, cfg)
+                app.state.ready.set()
+                print("[server] warmup complete; ready")
+            except BaseException:  # noqa: BLE001
+                traceback.print_exc()
+                print("[server] warmup FAILED; exiting for the supervisor to restart", flush=True)
+                os._exit(1)
+
+        threading.Thread(target=_warmup, name="ltx23-warmup", daemon=True).start()
+    else:
+        app.state.ready.set()
+        print("[server] warmup skipped — ready; first request per shape pays the dynamo trace")
+
     import uvicorn
     try:
         uvicorn.run(app, host=args.host or cfg.host, port=args.port or cfg.port, workers=1)
