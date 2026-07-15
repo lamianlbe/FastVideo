@@ -3,9 +3,16 @@
 #
 #   bash examples/inference/ltx23_server/deploy/install.sh
 #
-# Run inside the target Python environment (conda/venv) of a machine that
-# already has the matching torch + CUDA stack. Also used by the Dockerfile
-# in this directory — keep it the single source of truth for install steps.
+# Run inside the target Python environment (conda / venv / uv venv) of a
+# machine that already has the matching torch + CUDA stack. Also used by the
+# Dockerfile in this directory — keep it the single source of truth.
+#
+# uv venvs: activate it (or export PYTHON=$VIRTUAL_ENV/bin/python) and make
+# sure pip is present (`uv pip install pip` once). The kernel is built with
+# --no-build-isolation so CMake finds this env's Python headers + torch.
+# If you hit "Could NOT find Python (missing: Development.Module)" the venv's
+# Python has no headers — use a uv-managed Python, or `apt install python3-dev`
+# for a system-Python venv.
 #
 # Env knobs:
 #   PYTHON=python           interpreter to install into
@@ -99,7 +106,15 @@ if [ -n "$WHEELHOUSE" ] && compgen -G "$WHEELHOUSE/fastvideo_kernel-*.whl" > /de
     pip_install "$WHEELHOUSE"/fastvideo_kernel-*.whl
 else
     echo "   building from in-tree source (slow; consider WHEELHOUSE for fleets)"
-    pip_install -v ./fastvideo-kernel
+    # Build deps into THIS env + --no-build-isolation, mirroring the kernel's
+    # own build.sh. With pip's default build isolation, scikit-build-core's
+    # CMake find_package(Python COMPONENTS Development.Module) fails against
+    # the isolated env (and uv-managed standalone Pythons):
+    #   "Could NOT find Python (missing: Development.Module)".
+    # Without isolation, CMake targets this venv's Python (headers present)
+    # and the torch installed in step 0.
+    pip_install scikit-build-core cmake ninja setuptools wheel
+    pip_install -v --no-build-isolation ./fastvideo-kernel
 fi
 
 echo "== [3/6] purge deb python packages pip cannot upgrade =="
