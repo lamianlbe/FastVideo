@@ -387,6 +387,8 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                     audio=result.get("audio"),
                     audio_sample_rate=result.get("audio_sample_rate"),
                     threads=cfg.encode_threads,
+                    codec=cfg.video_codec,
+                    extra_video_args=cfg.extra_video_args,
                 )
             if not video_path.is_file():
                 raise RuntimeError("encode produced no video file")
@@ -491,6 +493,8 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 audio=audio,
                 audio_sample_rate=audio_sr,
                 threads=cfg.encode_threads,
+                codec=cfg.video_codec,
+                extra_video_args=cfg.extra_video_args,
             )
             t_up = time.perf_counter()
             url = upload_file_to_s3(s3_client, cfg.s3, path, key)
@@ -518,6 +522,8 @@ def build_app(generator, cfg: Ltx23ServerConfig, s3_client=None) -> FastAPI:
                 audio_bitrate_kbps=64,
                 audio_mono=True,
                 threads=cfg.encode_threads,
+                codec=cfg.video_codec,
+                extra_video_args=cfg.extra_video_args,
             )
             t_up = time.perf_counter()
             url = upload_file_to_s3(s3_client, cfg.s3, path, key)

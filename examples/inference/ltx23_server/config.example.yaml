@@ -60,6 +60,11 @@ video_bitrate_kbps: 3000  # average bitrate; per-request override available
 x264_preset: veryfast     # HQ preset; ultrafast ~2x faster at same bitrate
 encode_threads: 0         # x264 -threads; 0 = auto
 max_concurrent_encodes: 2 # cap simultaneous encodes (HQ+LQ pair = 1 unit)
+video_codec: libx264      # e.g. libx265 (needs an ffmpeg with that encoder)
+# Extra ffmpeg video-encoder args (applied to HQ + LQ), e.g. to enable
+# x265 AVX-512 or tag HEVC for QuickTime:
+# extra_video_args: "-x265-params asm=avx512 -tag:v hvc1"
+extra_video_args: ""
 
 # /v1/generate_s3 low-quality variant: half width/height + GPU gaussian
 # blur, constrained baseline @ lq_bitrate_kbps (preset fast), AAC-LC mono

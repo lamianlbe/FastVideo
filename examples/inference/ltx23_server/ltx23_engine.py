@@ -141,6 +141,13 @@ class Ltx23ServerConfig:
     # overrides it.
     video_bitrate_kbps: int = 3000
     x264_preset: str = "medium"
+    # H.264 by default; set e.g. libx265 (needs an ffmpeg with that encoder;
+    # the main/baseline profile is skipped for non-H.264 codecs). Applies to
+    # both HQ and LQ.
+    video_codec: str = "libx264"
+    # Extra ffmpeg video-encoder args (shlex-split), appended after the
+    # built-in opts, e.g. "-x265-params asm=avx512 -tag:v hvc1".
+    extra_video_args: str = ""
     # x264 encoder threads (0 = auto ~1.5x logical cores). If encoding is
     # slow, check the container's ACTUAL cpu allocation first (nproc) and
     # consider x264_preset: faster / veryfast — at a fixed VBR bitrate the
@@ -472,11 +479,19 @@ def encode_video_h264(
     audio_mono: bool = False,
     threads: int = 0,
     gpu_yuv: bool = True,
+    codec: str = "libx264",
+    extra_video_args: str = "",
 ) -> float:
     """Encode RGB frames (+ optional audio) to MP4 via an ffmpeg subprocess:
-    libx264 at the given profile/preset, VBR at the average bitrate with a
+    ``codec`` at the given profile/preset, VBR at the average bitrate with a
     2x/4x VBV envelope, AAC audio (optionally mono at a fixed bitrate),
     +faststart for web delivery. Returns wall time in seconds.
+
+    ``extra_video_args`` (shlex-split) is appended to the video-encoder
+    options for codec tuning without code edits, e.g.
+    ``-x265-params asm=avx512 -tag:v hvc1``. ``-profile:v`` is emitted only
+    for H.264 encoders (the main/baseline profile names are H.264-specific);
+    for other codecs set the profile via extra_video_args.
 
     The RGB->YUV420 color conversion is done on the GPU (``gpu_yuv``, when
     CUDA is present) and yuv420p is piped straight to ffmpeg, bypassing
@@ -528,10 +543,16 @@ def encode_video_h264(
            "-i", "pipe:0"]
     if audio_path:
         cmd += ["-i", audio_path]
-    cmd += ["-c:v", "libx264", "-preset", preset, "-profile:v", profile, "-pix_fmt", "yuv420p",
+    cmd += ["-c:v", codec, "-preset", preset]
+    if "264" in codec:  # main/baseline profile names are H.264-specific
+        cmd += ["-profile:v", profile]
+    cmd += ["-pix_fmt", "yuv420p",
             "-b:v", f"{int(bitrate_kbps)}k", "-maxrate", f"{int(bitrate_kbps) * 2}k",
             "-bufsize", f"{int(bitrate_kbps) * 4}k", "-threads", str(max(0, int(threads)))]
     cmd += color_args
+    if extra_video_args.strip():
+        import shlex
+        cmd += shlex.split(extra_video_args)
     if audio_path:
         cmd += ["-c:a", "aac"]
         if audio_bitrate_kbps:
@@ -697,6 +718,8 @@ def run_warmup(
                         audio=result.get("audio"),
                         audio_sample_rate=result.get("audio_sample_rate"),
                         threads=cfg.encode_threads,
+                        codec=cfg.video_codec,
+                        extra_video_args=cfg.extra_video_args,
                     )
                     log(f"[warmup] CPU H.264 encode check passed ({encode_seconds:.1f}s)")
     finally:

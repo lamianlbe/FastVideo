@@ -270,7 +270,13 @@ Needs an `ffmpeg` binary (system, or the `imageio-ffmpeg` pip bundle that
 
 Per-request parameters — prompt, images, seed, CRF values, bitrate,
 `last_in_upscale`, FLF vs i2v — are all value-level and never trigger
-recompilation. Only the mode list defines compiled shapes, and **fps is
+recompilation.
+
+The encoder is configurable: `video_codec` (default `libx264`; e.g.
+`libx265` if your ffmpeg has it — the H.264 main/baseline profile is
+skipped for non-H.264 codecs) and `extra_video_args` (shlex-split, appended
+to the video-encoder options for both HQ and LQ), e.g.
+`extra_video_args: "-x265-params asm=avx512 -tag:v hvc1"`. Only the mode list defines compiled shapes, and **fps is
 part of the shape**: the audio latent length is derived from the clip
 duration (`num_frames / fps`), so the same frame count at a different
 frame rate is a different DiT sequence length. To add a mode, add it to
