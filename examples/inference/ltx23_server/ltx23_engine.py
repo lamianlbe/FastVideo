@@ -215,8 +215,8 @@ def load_config(path: str | Path) -> Ltx23ServerConfig:
     cfg = Ltx23ServerConfig(modes=modes, s3=s3_cfg, **raw)
     if not cfg.model_path:
         raise ValueError(f"{path}: 'model_path' is required")
-    if cfg.quant not in ("nvfp4", "none"):
-        raise ValueError(f"{path}: quant must be nvfp4 or none, got {cfg.quant}")
+    if cfg.quant not in ("nvfp4", "fp8", "fp8_channel", "none"):
+        raise ValueError(f"{path}: quant must be nvfp4 | fp8 | fp8_channel | none, got {cfg.quant}")
     if any(not isinstance(k, str) or not k.strip() for k in cfg.api_keys):
         raise ValueError(f"{path}: api_keys entries must be non-empty strings")
     cvd = cfg.cuda_visible_devices
@@ -290,14 +290,24 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
 
     from fastvideo import VideoGenerator
     from fastvideo.configs.pipelines.base import PipelineConfig
-    from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
     from fastvideo.utils import maybe_download_model
 
     model_root = maybe_download_model(cfg.model_path)
     upsampler_path = resolve_upsampler(model_root, cfg.upsampler_path)
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
-    pipeline_config.dit_config.quant_config = (NVFP4Config() if cfg.quant == "nvfp4" else None)
+    # Linear quantization ladder (loss high -> none): nvfp4 (e2m1, fastest),
+    # fp8 (e4m3 per-tensor), fp8_channel (per-channel weights + per-token
+    # activations, most conservative quantized tier), none (bf16).
+    if cfg.quant == "nvfp4":
+        from fastvideo.layers.quantization.nvfp4_config import NVFP4Config
+        pipeline_config.dit_config.quant_config = NVFP4Config()
+    elif cfg.quant in ("fp8", "fp8_channel"):
+        from fastvideo.layers.quantization.fp8_config import FP8Config
+        pipeline_config.dit_config.quant_config = FP8Config(
+            granularity="channel" if cfg.quant == "fp8_channel" else "tensor")
+    else:
+        pipeline_config.dit_config.quant_config = None
 
     compile_kwargs: dict[str, Any] = {}
     if cfg.compile:

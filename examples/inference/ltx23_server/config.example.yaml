@@ -10,7 +10,11 @@ model_path: /workspace/10Eros_v1.4_Stack_Diffusers
 # "" = auto-detect <model_path>/spatial_upscaler or spatial_upsampler.
 upsampler_path: ""
 
-quant: nvfp4              # nvfp4 | none
+# Linear quant tier: nvfp4 (fastest, most lossy) | fp8 | fp8_channel
+# (per-channel weights + per-token activations, most conservative
+# quantized tier, ~1.2x e2e vs bf16) | none (bf16). Changing this changes
+# the compiled graphs -> re-run build_compile_cache.py.
+quant: nvfp4
 num_gpus: 1
 # Which physical GPU this instance uses. "" = all visible / shell default.
 # On a multi-GPU box, run ONE server per GPU: give each its own

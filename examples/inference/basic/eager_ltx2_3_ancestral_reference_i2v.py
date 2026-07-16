@@ -17,7 +17,9 @@ the first frame. Stage-1 and stage-2 conditioning CRF are independent
                            compile is ~30-40 min on GB200/B200 and is cached
                            in $TORCHINDUCTOR_CACHE_DIR — point that at a
                            persistent volume on RunPod.
-    LTX23_QUANT=nvfp4|none NVFP4 linear quantization (default nvfp4).
+    LTX23_QUANT=nvfp4|fp8|fp8_channel|none
+                           Linear quantization tier (default nvfp4; fp8 is
+                           the conservative quantized tier, ~1.2x e2e).
     LTX23_WARMUP_RUNS      untimed warmups before measuring (default 2 when
                            compiling, else 0).
     LTX23_MEASURED_RUNS    timed runs (default 2).
@@ -64,7 +66,7 @@ NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitl
                    "stand-up ")
 
 COMPILE = os.getenv("LTX23_COMPILE", "0") == "1"
-QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | none
+QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | fp8 | fp8_channel | none
 WARMUP_RUNS = int(os.getenv("LTX23_WARMUP_RUNS", "2" if COMPILE else "0"))
 MEASURED_RUNS = int(os.getenv("LTX23_MEASURED_RUNS", "2"))
 
@@ -152,8 +154,8 @@ def main() -> None:
         raise SystemExit(f"--first-frame not found: {args.first_frame!r}")
     if args.last_frame and not Path(args.last_frame).is_file():
         raise SystemExit(f"--last-frame not found: {args.last_frame}")
-    if QUANT not in ("nvfp4", "none"):
-        raise SystemExit(f"LTX23_QUANT must be nvfp4 or none, got {QUANT}")
+    if QUANT not in ("nvfp4", "fp8", "fp8_channel", "none"):
+        raise SystemExit(f"LTX23_QUANT must be nvfp4 | fp8 | fp8_channel | none, got {QUANT}")
     if not 0.0 <= args.last_strength <= 1.0:
         raise SystemExit(f"--last-strength must be in [0, 1], got {args.last_strength}")
 
@@ -191,7 +193,16 @@ def main() -> None:
         print(f"inductor cache: {os.getenv('TORCHINDUCTOR_CACHE_DIR', '(default, not persistent!)')}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
-    pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
+    # Linear quant ladder: nvfp4 (fastest, most lossy) | fp8 | fp8_channel
+    # (most conservative quantized tier) | none (bf16).
+    if QUANT == "nvfp4":
+        pipeline_config.dit_config.quant_config = NVFP4Config()
+    elif QUANT in ("fp8", "fp8_channel"):
+        from fastvideo.layers.quantization.fp8_config import FP8Config
+        pipeline_config.dit_config.quant_config = FP8Config(
+            granularity="channel" if QUANT == "fp8_channel" else "tensor")
+    else:
+        pipeline_config.dit_config.quant_config = None
 
     compile_kwargs: dict = {}
     if COMPILE:

@@ -19,8 +19,9 @@ stabilizer (blocks 10-30, snapshot locked at step 2), the x1.5 spatial
 upscaler, guide-strength 0.8 frame-0 anchoring, and a stage-2 text
 cross-attention amplifier (x1.3, blocks 36-47, center-weighted).
 
-Eager-only: the latent anchor's per-block snapshot cache is incompatible
-with torch.compile (the stage rejects the combination).
+The latent anchor's snapshot cache is torch.compile-compatible (tensor
+buffers + torch.where capture flags); compile support pending B200
+validation.
 
 Model: the all-in-one merged repo (base + 3 style LoRAs + gated condsafe
 distill LoRA), e.g. built with merge_ltx2_lora_stack.py + convert_ltx23_weights.py.
@@ -81,7 +82,7 @@ NEGATIVE_PROMPT = ("still image, bad quality, subtitles, text, watermark, overla
                    "language, russian, chinese, japanese, mutant, horror, 70's, film grain, "
                    "cinematic, comedy, stand-up ")
 
-QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | none
+QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | fp8 | fp8_channel | none
 MEASURED_RUNS = int(os.getenv("LTX23_MEASURED_RUNS", "1"))
 
 os.environ.setdefault("FASTVIDEO_ATTENTION_BACKEND", "FLASH_ATTN")
@@ -143,8 +144,8 @@ def main() -> None:
         raise SystemExit(f"--first-frame not found: {args.first_frame!r}")
     if args.last_frame and not Path(args.last_frame).is_file():
         raise SystemExit(f"--last-frame not found: {args.last_frame}")
-    if QUANT not in ("nvfp4", "none"):
-        raise SystemExit(f"LTX23_QUANT must be nvfp4 or none, got {QUANT}")
+    if QUANT not in ("nvfp4", "fp8", "fp8_channel", "none"):
+        raise SystemExit(f"LTX23_QUANT must be nvfp4 | fp8 | fp8_channel | none, got {QUANT}")
     if not 0.0 <= args.last_strength <= 1.0:
         raise SystemExit(f"--last-strength must be in [0, 1], got {args.last_strength}")
 
@@ -182,7 +183,16 @@ def main() -> None:
     print(f"quant:      {QUANT}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
-    pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
+    # Linear quant ladder: nvfp4 (fastest, most lossy) | fp8 | fp8_channel
+    # (most conservative quantized tier) | none (bf16).
+    if QUANT == "nvfp4":
+        pipeline_config.dit_config.quant_config = NVFP4Config()
+    elif QUANT in ("fp8", "fp8_channel"):
+        from fastvideo.layers.quantization.fp8_config import FP8Config
+        pipeline_config.dit_config.quant_config = FP8Config(
+            granularity="channel" if QUANT == "fp8_channel" else "tensor")
+    else:
+        pipeline_config.dit_config.quant_config = None
 
     generator = VideoGenerator.from_pretrained(
         model_root,

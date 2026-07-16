@@ -23,7 +23,8 @@ FLF specifics:
   the last image only enters through the latent anchor, so switching between
   i2v and FLF never changes tensor shapes (no recompile under torch.compile).
 
-Toggles: LTX23_COMPILE=1 / LTX23_QUANT=nvfp4|none, same as the DMD example,
+Toggles: LTX23_COMPILE=1 / LTX23_QUANT=nvfp4|fp8|fp8_channel|none, same as
+the DMD example,
 plus LTX23_LAST_IN_UPSCALE=1 to also feed the tail anchor into the stage-2
 refine pass (default off — this misbehaved in ComfyUI testing).
 """
@@ -80,7 +81,7 @@ NEGATIVE_PROMPT = ("3D, phasing, captions, VR, still image, bad quality, subtitl
                    "stand-up ")
 
 COMPILE = os.getenv("LTX23_COMPILE", "0") == "1"
-QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | none
+QUANT = os.getenv("LTX23_QUANT", "nvfp4").lower()  # nvfp4 | fp8 | fp8_channel | none
 WARMUP_RUNS = int(os.getenv("LTX23_WARMUP_RUNS", "2" if COMPILE else "0"))
 MEASURED_RUNS = int(os.getenv("LTX23_MEASURED_RUNS", "1"))
 
@@ -135,7 +136,16 @@ def main() -> None:
     print(f"image_crf:  stage1={IMAGE_CRF} stage2={IMAGE_CRF_STAGE2 if IMAGE_CRF_STAGE2 is not None else '(same)'}")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
-    pipeline_config.dit_config.quant_config = (NVFP4Config() if QUANT == "nvfp4" else None)
+    # Linear quant ladder: nvfp4 (fastest, most lossy) | fp8 | fp8_channel
+    # (most conservative quantized tier) | none (bf16).
+    if QUANT == "nvfp4":
+        pipeline_config.dit_config.quant_config = NVFP4Config()
+    elif QUANT in ("fp8", "fp8_channel"):
+        from fastvideo.layers.quantization.fp8_config import FP8Config
+        pipeline_config.dit_config.quant_config = FP8Config(
+            granularity="channel" if QUANT == "fp8_channel" else "tensor")
+    else:
+        pipeline_config.dit_config.quant_config = None
 
     compile_kwargs: dict = {}
     if COMPILE:
