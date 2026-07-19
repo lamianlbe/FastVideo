@@ -27,7 +27,9 @@ Wan2.2 diffusers repo). Run four times (sfw/nsfw x high/low):
       --base-config Wan2.2-I2V-A14B-Diffusers/transformer \
       --out out/sfw/transformer
 
-CPU-only, streams key-by-key (peak RAM ~= one layer + one shard).
+Streams key-by-key (peak RAM ~= one layer + one shard). CPU by default;
+``--device cuda`` runs the dequant + LoRA GEMMs on GPU (saves ~1-3 min per
+conversion — disk I/O dominates on network storage either way).
 """
 
 from __future__ import annotations
@@ -175,15 +177,15 @@ class LoraFile:
         self.entries.setdefault(base_key, {})[kind] = payload
 
     # -- application ------------------------------------------------------
-    def delta_for(self, base_key: str) -> torch.Tensor | None:
+    def delta_for(self, base_key: str, device: str = "cpu") -> torch.Tensor | None:
         entry = self.entries.get(base_key)
         if entry is None:
             return None
         total: torch.Tensor | None = None
         if "lora" in entry:
             down_k, up_k, alpha_k = entry["lora"]
-            down = self.handle.get_tensor(down_k).to(torch.float32)
-            up = self.handle.get_tensor(up_k).to(torch.float32)
+            down = self.handle.get_tensor(down_k).to(device=device, dtype=torch.float32)
+            up = self.handle.get_tensor(up_k).to(device=device, dtype=torch.float32)
             rank = down.shape[0]
             scale = self.strength
             if alpha_k is not None:
@@ -191,7 +193,7 @@ class LoraFile:
             total = scale * (up @ down)
         for kind in ("diff_b", "diff", "diff_m"):
             if kind in entry:
-                d = self.handle.get_tensor(entry[kind]).to(torch.float32) * self.strength
+                d = self.handle.get_tensor(entry[kind]).to(device=device, dtype=torch.float32) * self.strength
                 total = d if total is None else total + d
         return total
 
@@ -200,7 +202,7 @@ class LoraFile:
 # Main conversion
 # ---------------------------------------------------------------------------
 def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
-            base_config: Path | None, shard_gb: float) -> None:
+            base_config: Path | None, shard_gb: float, device: str = "cpu") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stats = {"dequant": 0, "merged": 0, "plain": 0}
 
@@ -213,12 +215,12 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
         limit = int(shard_gb * 1e9)
 
         for key in sorted(base_keys):
-            t = base.get_tensor(key)
+            t = base.get_tensor(key).to(device)
             if t.dtype == torch.float8_e4m3fn:
                 sk = f"{key[:-len('.weight')]}.scale_weight" if key.endswith(".weight") else None
                 if sk not in scale_keys:
                     raise RuntimeError(f"fp8 tensor without scale: {key}")
-                scale = base.get_tensor(sk).to(torch.float32)
+                scale = base.get_tensor(sk).to(device=device, dtype=torch.float32)
                 t = t.to(torch.float32) * scale
                 stats["dequant"] += 1
             else:
@@ -226,7 +228,7 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
                 stats["plain"] += 1
 
             for lora in loras:
-                delta = lora.delta_for(key)
+                delta = lora.delta_for(key, device=device)
                 if delta is not None:
                     if delta.shape != t.shape:
                         raise RuntimeError(f"delta shape {tuple(delta.shape)} != base "
@@ -235,7 +237,7 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
                     stats["merged"] += 1
 
             dk = to_diffusers_key(key)
-            t = t.to(torch.bfloat16).contiguous()
+            t = t.to(torch.bfloat16).cpu().contiguous()
             nbytes = t.numel() * t.element_size()
             if shard_bytes[-1] + nbytes > limit and shards[-1]:
                 shards.append({})
@@ -285,7 +287,12 @@ def main() -> None:
     ap.add_argument("--base-config", default=None,
                     help="Official Wan2.2 diffusers transformer dir (its config.json is copied)")
     ap.add_argument("--shard-gb", type=float, default=9.5, help="Max shard size in GB")
+    ap.add_argument("--device", default="cpu",
+                    help="cpu (default) or cuda — GPU accelerates the LoRA GEMMs (~1-3 min/run "
+                    "saved); disk I/O dominates on network storage either way")
     args = ap.parse_args()
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise SystemExit("--device cuda requested but no CUDA device is available")
 
     base_path = Path(args.base)
     with safe_open(str(base_path), framework="pt", device="cpu") as f:
@@ -298,7 +305,7 @@ def main() -> None:
 
     print(f"base: {base_path.name} ({len(base_keys)} tensors) + {len(loras)} lora(s)")
     convert(base_path, loras, Path(args.out),
-            Path(args.base_config) if args.base_config else None, args.shard_gb)
+            Path(args.base_config) if args.base_config else None, args.shard_gb, device=args.device)
 
 
 if __name__ == "__main__":
