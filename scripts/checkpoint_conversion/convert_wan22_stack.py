@@ -202,8 +202,14 @@ class LoraFile:
 # Main conversion
 # ---------------------------------------------------------------------------
 def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
-            base_config: Path | None, shard_gb: float, device: str = "cpu") -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+            base_config: Path | None, shard_gb: float, device: str = "cpu",
+            naming: str = "diffusers") -> None:
+    single_file = out_dir.suffix == ".safetensors"
+    if single_file:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        shard_gb = 10_000.0  # one file
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
     stats = {"dequant": 0, "merged": 0, "plain": 0}
 
     with safe_open(str(base_path), framework="pt", device="cpu") as base:
@@ -236,7 +242,7 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
                     t = t + delta
                     stats["merged"] += 1
 
-            dk = to_diffusers_key(key)
+            dk = to_diffusers_key(key) if naming == "diffusers" else key
             t = t.to(torch.bfloat16).cpu().contiguous()
             nbytes = t.numel() * t.element_size()
             if shard_bytes[-1] + nbytes > limit and shards[-1]:
@@ -250,9 +256,13 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
     weight_map: dict[str, str] = {}
     total = 0
     for i, shard in enumerate(shards, 1):
-        fname = (f"diffusion_pytorch_model-{i:05d}-of-{n:05d}.safetensors"
-                 if n > 1 else "diffusion_pytorch_model.safetensors")
-        save_file(shard, str(out_dir / fname))
+        if single_file:
+            fname = out_dir.name
+            save_file(shard, str(out_dir))
+        else:
+            fname = (f"diffusion_pytorch_model-{i:05d}-of-{n:05d}.safetensors"
+                     if n > 1 else "diffusion_pytorch_model.safetensors")
+            save_file(shard, str(out_dir / fname))
         for k, v in shard.items():
             weight_map[k] = fname
             total += v.numel() * v.element_size()
@@ -261,7 +271,9 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
         index = {"metadata": {"total_size": total}, "weight_map": weight_map}
         (out_dir / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps(index, indent=2))
 
-    if base_config is not None:
+    if single_file or naming == "comfy":
+        pass  # comfy-style checkpoints carry no config.json
+    elif base_config is not None:
         cfg = base_config / "config.json" if base_config.is_dir() else base_config
         shutil.copyfile(cfg, out_dir / "config.json")
         print(f"  copied config from {cfg}")
@@ -287,6 +299,10 @@ def main() -> None:
     ap.add_argument("--base-config", default=None,
                     help="Official Wan2.2 diffusers transformer dir (its config.json is copied)")
     ap.add_argument("--shard-gb", type=float, default=9.5, help="Max shard size in GB")
+    ap.add_argument("--naming", default="diffusers", choices=("diffusers", "comfy"),
+                    help="Output key naming: diffusers (FastVideo) or comfy "
+                    "(LightX2V *_original_ckpt / ComfyUI UNETLoader; keys kept native). "
+                    "With --naming comfy, --out may be a single .safetensors path.")
     ap.add_argument("--device", default="cpu",
                     help="cpu (default) or cuda — GPU accelerates the LoRA GEMMs (~1-3 min/run "
                     "saved); disk I/O dominates on network storage either way")
@@ -305,7 +321,8 @@ def main() -> None:
 
     print(f"base: {base_path.name} ({len(base_keys)} tensors) + {len(loras)} lora(s)")
     convert(base_path, loras, Path(args.out),
-            Path(args.base_config) if args.base_config else None, args.shard_gb, device=args.device)
+            Path(args.base_config) if args.base_config else None, args.shard_gb,
+            device=args.device, naming=args.naming)
 
 
 if __name__ == "__main__":
