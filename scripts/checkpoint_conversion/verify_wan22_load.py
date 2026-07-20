@@ -96,13 +96,15 @@ def check_text_encoder(comp_dir: Path) -> bool:
         model = UMT5EncoderModel(cfg)
     expected = {k: tuple(v.shape) for k, v in model.state_dict().items()}
     got = _load_shards(comp_dir)
-    # HF ties/derives some buffers; ignore position-bias/rotary buffers that
-    # are not saved as weights.
-    ignore = {k for k in expected if k.endswith(".relative_attention_bias.weight") and k not in got}
-    if ignore:
-        print(f"    (note: {len(ignore)} relative_attention_bias buffers are shared/derived; ignoring)")
-        for k in ignore:
-            expected.pop(k, None)
+    # UMT5 ties the input embedding: `encoder.embed_tokens.weight` IS
+    # `shared.weight`, saved once as `shared.weight` and re-bound by
+    # from_pretrained. Its absence from the file is correct, not a missing
+    # weight — accept it when the shared source is present with a matching
+    # shape.
+    tied = "encoder.embed_tokens.weight"
+    if tied in expected and tied not in got and expected.get(tied) == got.get("shared.weight"):
+        print("    (note: encoder.embed_tokens is tied to shared.weight; re-bound on load, ignoring)")
+        expected.pop(tied, None)
     return _diff("text_encoder (UMT5EncoderModel)", expected, got)
 
 
