@@ -210,7 +210,7 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
         shard_gb = 10_000.0  # one file
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
-    stats = {"dequant": 0, "merged": 0, "plain": 0}
+    stats = {"dequant": 0, "merged": 0, "plain": 0, "dropped": 0}
 
     with safe_open(str(base_path), framework="pt", device="cpu") as base:
         base_keys = [k for k in base.keys() if not k.endswith(".scale_weight")]
@@ -221,6 +221,11 @@ def convert(base_path: Path, loras: list[LoraFile], out_dir: Path,
         limit = int(shard_gb * 1e9)
 
         for key in sorted(base_keys):
+            if key == "scaled_fp8":
+                # ComfyUI's scaled-fp8 format MARKER (empty (0,) fp8 tensor,
+                # not a weight). The output is dequantized bf16, so drop it.
+                stats["dropped"] += 1
+                continue
             t = base.get_tensor(key).to(device)
             if t.dtype == torch.float8_e4m3fn:
                 sk = f"{key[:-len('.weight')]}.scale_weight" if key.endswith(".weight") else None
