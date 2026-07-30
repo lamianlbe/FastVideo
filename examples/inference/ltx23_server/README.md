@@ -17,7 +17,8 @@ the two share compiled graphs, so switching between them never recompiles.
 | `deploy/install.sh` | One-shot dependency install (kernel, FA4, flashinfer, server extras) |
 | `deploy/Dockerfile` | Fleet image: deps + server baked in, model/cache on a volume |
 | `deploy/ltx23@.service` + `ltx23.env.example` | systemd template unit — one service per GPU (VMs) |
-| `deploy/run_server.sh` | Fallback supervisor for hosts without systemd (containers): restart loop |
+| `deploy/supervisord.conf` + `runpod_start.sh` | Container process manager for systemd-less hosts (RunPod): auto-restart via supervisord |
+| `deploy/run_server.sh` | Zero-dependency restart-loop supervisor (quick/debug on systemd-less hosts) |
 
 ## Installing dependencies
 
@@ -349,7 +350,49 @@ Manage: `systemctl status ltx23@0`, `journalctl -u ltx23@0 -f` (warmup +
 `[request]` lines), `systemctl restart ltx23@1`. The JSON request log
 still lands in each instance's `LOG_DIR/requests.jsonl`.
 
-**Containers without systemd:** `deploy/run_server.sh` wraps the server in
-a restart loop with backoff, teeing each run to `logs/server-<ts>.log`
-(`CONFIG=config.yaml bash deploy/run_server.sh`). Use this only where
-systemd isn't available; on a VM prefer the unit above.
+**RunPod / containers without systemd (recommended: supervisord).** RunPod
+runs your container exactly once and will **not** restart a crashed PID 1 —
+there is no systemd (`Restart=on-failure`) and you don't control the
+`docker run` line (`--restart unless-stopped`). So the *only* way to get
+auto-restart is a supervisor **inside** the container. `deploy/supervisord.conf`
+is the 1:1 port of `ltx23@.service`: same `on-failure` semantics (exit 0 =
+clean, no restart; anything else = crash or the wedged-GPU self-exit → fresh
+process), same SIGINT drain, same `startretries=5` give-up. Launch it via
+`deploy/runpod_start.sh`, which prepares the log dirs and hands PID 1 to
+`supervisord -n`.
+
+Set the pod's **Container Start Command** (overrides the image ENTRYPOINT, so
+the docker path above is untouched):
+
+```bash
+bash /opt/FastVideo/examples/inference/ltx23_server/deploy/runpod_start.sh
+```
+
+Tunable via pod env vars (all default): `CONFIG` `GPU` `PORT` `LOG_DIR`.
+Control it like systemctl:
+
+```bash
+supervisorctl status              # like systemctl status
+supervisorctl restart ltx23
+supervisorctl tail -f ltx23       # live stdout ([request] JSON lines)
+```
+
+RunPod gotchas that bite this server specifically:
+
+- **Mount a Network Volume at `/workspace`.** The container root fs is wiped
+  on pod restart/redeploy; the config, merged checkpoints, and especially the
+  `inductor_cache` must live on the volume or every restart re-pays the full
+  warmup (the `HEALTHCHECK` `start-period` is 60m for a reason).
+- **Expose a TCP port, not the HTTP proxy.** The `*.proxy.runpod.net` proxy
+  has a ~100s timeout and buffers responses (built for web UIs); use direct
+  TCP port mapping for the synchronous mp4 API.
+- **supervisor restarts the process, not the host.** A dead pod host does not
+  migrate (only serverless does) — for HA run two pods behind your own LB.
+
+Prefer a persistent **Pod** over Serverless: the 100+GB weights and per-shape
+compile make serverless cold starts prohibitive.
+
+**Quick/debug fallback (no supervisor install):** `deploy/run_server.sh` wraps
+the server in a bash restart loop with backoff, teeing each run to
+`logs/server-<ts>.log` (`CONFIG=config.yaml bash deploy/run_server.sh`). Fine
+for a first bring-up; use supervisord above for anything long-running.

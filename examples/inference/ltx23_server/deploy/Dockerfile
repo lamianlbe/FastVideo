@@ -37,6 +37,12 @@ COPY . .
 RUN TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     bash examples/inference/ltx23_server/deploy/install.sh
 
+# supervisord: in-container process manager for systemd-less hosts (RunPod).
+# Only used when the container start command is overridden to run
+# deploy/runpod_start.sh; the default ENTRYPOINT below is unaffected, so the
+# `docker run --restart unless-stopped` path on normal hosts is unchanged.
+RUN python -m pip install --no-cache-dir supervisor
+
 # Big mutable state stays on the volume, not in the image:
 #   /workspace/ltx23/config.yaml     server config (modes, paths, api keys)
 #   /workspace/<model dirs>          merged checkpoints
