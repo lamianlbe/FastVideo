@@ -154,8 +154,8 @@ def test_dashboard_endpoints_filter_and_return_run_source_metadata():
     assert summary["count"] == 1
     assert summary["rows"][0]["run_source"] == "pr"
     assert summary["rows"][0]["pr_number"] == "123"
-    assert summary["rows"][0]["baseline_n"] == 1
-    assert summary["rows"][0]["metrics"]["latency"]["baseline"] == 11.0
+    assert summary["rows"][0]["baseline_n"] == 0
+    assert summary["rows"][0]["metrics"]["latency"]["baseline"] is None
     assert summary["filters"]["run_source"] == "pr"
     assert trends["count"] == 1
     assert trends["groups"][0]["points"][0]["run_source"] == "pr"
@@ -175,6 +175,55 @@ def test_records_and_trends_endpoints_filter_by_model_and_gpu():
     assert records["records"][0]["model_id"] == "wan"
     assert trends["count"] == 1
     assert trends["groups"][0]["gpu_type"] == "NVIDIA L40S"
+
+
+def test_v2_display_filters_keep_renamed_cohort_history():
+    identity = {
+        "result_schema_version": 2,
+        "workload_id": "wan-t2v",
+        "variant_id": "1.3b-sp2",
+        "benchmark_version": 2,
+        "recipe_fingerprint": "recipe-a",
+        "hardware_profile_id": "hw-l40s",
+        "software_profile_id": "sw-cu130",
+    }
+    app = create_app(FakeStore([
+        _record(
+            "old-display",
+            "NVIDIA L40S old label",
+            "2026-01-01T00:00:00+00:00",
+            "a" * 40,
+            10.0,
+            10.0,
+            run_source="scheduled_main",
+            baseline_eligible=True,
+            **identity,
+        ),
+        _record(
+            "new-display",
+            "NVIDIA L40S",
+            "2026-01-02T00:00:00+00:00",
+            "b" * 40,
+            11.0,
+            9.0,
+            **identity,
+        ),
+    ]))
+    client = TestClient(app)
+
+    filters = {"model_id": "new-display", "gpu_type": "NVIDIA L40S"}
+    summary = client.get("/api/performance/summary", params=filters).json()
+    trends = client.get("/api/performance/trends", params=filters).json()
+    raw_old_records = client.get("/api/performance/records", params={"model_id": "old-display"}).json()
+    stale_display = client.get("/api/performance/summary", params={"model_id": "old-display"}).json()
+
+    assert summary["count"] == 1
+    assert summary["rows"][0]["baseline_n"] == 1
+    assert summary["rows"][0]["metrics"]["latency"]["baseline"] == 10.0
+    assert trends["count"] == 1
+    assert len(trends["groups"][0]["points"]) == 2
+    assert raw_old_records["count"] == 1
+    assert stale_display["count"] == 0
 
 
 def test_refresh_endpoint_reports_sync_metadata():

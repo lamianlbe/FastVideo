@@ -52,9 +52,12 @@ V2_REQUIRED_IDENTITY_FIELDS = (
 # declaring it now fails validation loudly instead of being silently
 # overwritten by the generated one.
 V2_OPTIONAL_METADATA_FIELDS = (
-    "metric_threshold_policy",
     "quality_metadata",
 )
+COMMON_OBJECT_FIELDS = ("regression_thresholds",)
+RESULT_SCHEMA_VERSION = 2
+VALID_RUN_SOURCES = {"pr", "local", "scheduled_main", "unknown"}
+OPTIONAL_RESULT_METADATA_FIELDS = ("quality_metadata", "variant_metadata")
 
 # -- Config discovery -------------------------------------------------------
 
@@ -92,6 +95,10 @@ def _validate_benchmark_config(cfg, path="<memory>"):
     missing_common = [field for field in ("benchmark_id",) if field not in cfg]
     if missing_common:
         raise ValueError(f"{path}: missing required benchmark config fields: {', '.join(missing_common)}")
+
+    for field in COMMON_OBJECT_FIELDS:
+        if field in cfg and not isinstance(cfg[field], Mapping):
+            raise ValueError(f"{path}: benchmark config field {field!r} must be an object")
 
     schema_version = cfg.get("config_schema_version")
     if schema_version is None:
@@ -231,6 +238,56 @@ def _run_generation(generator, prompt, generation_kwargs):
     component_times = _extract_component_times(result)
     return elapsed, peak_memory_mb, component_times
 
+
+def _validate_run_counts(run_config: Mapping[str, Any], benchmark_id: str) -> tuple[int, int]:
+    num_warmup = run_config.get("num_warmup_runs", 1)
+    num_measure = run_config.get("num_measurement_runs", 3)
+    if isinstance(num_warmup, bool) or not isinstance(num_warmup, int) or num_warmup < 0:
+        raise ValueError(f"{benchmark_id}: run_config.num_warmup_runs must be a non-negative integer")
+    if isinstance(num_measure, bool) or not isinstance(num_measure, int) or num_measure < 1:
+        raise ValueError(f"{benchmark_id}: run_config.num_measurement_runs must be a positive integer")
+    return num_warmup, num_measure
+
+
+def _resolve_num_gpus(
+    init_kwargs: Mapping[str, Any],
+    run_config: Mapping[str, Any],
+    benchmark_id: str,
+) -> int:
+    init_num_gpus = init_kwargs.get("num_gpus")
+    required_gpus = run_config.get("required_gpus")
+    for field, value in (
+        ("init_kwargs.num_gpus", init_num_gpus),
+        ("run_config.required_gpus", required_gpus),
+    ):
+        if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"{benchmark_id}: {field} must be a positive integer")
+    parallel_sizes = []
+    for field in ("tp_size", "sp_size"):
+        value = init_kwargs.get(field)
+        if value is None or value == -1:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{benchmark_id}: init_kwargs.{field} must be -1 or a positive integer")
+        parallel_sizes.append(value)
+    if (
+        init_num_gpus is not None
+        and required_gpus is not None
+        and init_num_gpus != required_gpus
+    ):
+        raise ValueError(
+            f"{benchmark_id}: init_kwargs.num_gpus ({init_num_gpus}) must match "
+            f"run_config.required_gpus ({required_gpus})")
+    declared_num_gpus = init_num_gpus or required_gpus
+    parallel_num_gpus = max(parallel_sizes, default=1)
+    if declared_num_gpus is not None and declared_num_gpus < parallel_num_gpus:
+        raise ValueError(
+            f"{benchmark_id}: declared GPU count ({declared_num_gpus}) must be at least "
+            f"max(tp_size, sp_size) ({parallel_num_gpus})")
+    return declared_num_gpus or parallel_num_gpus
+
+
 def _write_results(results):
     """Write JSON results to the results directory."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -325,15 +382,31 @@ def _build_identity_fields(cfg, init_kwargs, prompt, runtime_identity):
     # identity fields, so v2 records always get the full identity block.
     if cfg.get("config_schema_version") is None:
         return {}
+    run_config = cfg.get("run_config") or {}
+    num_gpus = _resolve_num_gpus(init_kwargs, run_config, cfg["benchmark_id"])
+    recipe_cfg = dict(cfg)
+    recipe_cfg["init_kwargs"] = {
+        **dict(init_kwargs),
+        "num_gpus": num_gpus,
+    }
     recipe = build_recipe_from_benchmark_config(
-        cfg,
+        recipe_cfg,
         resolved_attention_backend=runtime_identity.get("resolved_attention_backend"),
         resolved_model_revision=runtime_identity.get("resolved_model_revision"),
         measured_prompts=[prompt],
     )
-    num_gpus = init_kwargs.get("num_gpus", cfg.get("run_config", {}).get("required_gpus", 1))
     hw_profile = hardware_profile(num_gpus=num_gpus)
     sw_profile = software_profile()
+    sw_profile.update({
+        "attention_backend": os.environ.get("FASTVIDEO_ATTENTION_BACKEND") or "auto",
+        "flash_attention_4_enabled": os.environ.get("FASTVIDEO_FA4", "0") != "0",
+    })
+    performance_profile_version = os.environ.get("FASTVIDEO_PERFORMANCE_PROFILE_VERSION")
+    if performance_profile_version:
+        sw_profile["performance_profile_version"] = performance_profile_version
+    image_version = os.environ.get("IMAGE_VERSION")
+    if image_version:
+        sw_profile["container_image_version"] = image_version
     env_metadata = environment_metadata(
         hardware=hw_profile,
         software=sw_profile,
@@ -351,23 +424,126 @@ def _build_identity_fields(cfg, init_kwargs, prompt, runtime_identity):
     }
 
 
+def _truthy_pr_number(value: str | None) -> bool:
+    return bool(value and value not in {"false", "0", "None", "none"})
+
+
+def _detect_run_source() -> str:
+    explicit = os.environ.get("PERF_RUN_SOURCE", "").strip().lower()
+    if explicit in VALID_RUN_SOURCES:
+        return explicit
+    if _truthy_pr_number(os.environ.get("BUILDKITE_PULL_REQUEST")):
+        return "pr"
+    if os.environ.get("BUILDKITE_BRANCH") == "main" and os.environ.get("TEST_SCOPE") == "full":
+        return "scheduled_main"
+    if not os.environ.get("BUILDKITE_COMMIT"):
+        return "local"
+    return "unknown"
+
+
+def _ci_provenance_fields() -> dict[str, str]:
+    pr_number = os.environ.get("BUILDKITE_PULL_REQUEST", "")
+    if not _truthy_pr_number(pr_number):
+        pr_number = ""
+    return {
+        "run_source": _detect_run_source(),
+        "branch": os.environ.get("BUILDKITE_BRANCH", ""),
+        "pr_number": pr_number,
+        "test_scope": os.environ.get("TEST_SCOPE", ""),
+        "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
+        "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
+        "job_id": os.environ.get("BUILDKITE_JOB_ID", ""),
+    }
+
+
+def _configured_result_metadata(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        field: cfg[field]
+        for field in OPTIONAL_RESULT_METADATA_FIELDS
+        if field in cfg and cfg[field] is not None
+    }
+
+
+def _build_result_record(
+    *,
+    cfg: Mapping[str, Any],
+    model_info: Mapping[str, Any],
+    init_kwargs: Mapping[str, Any],
+    gen_kwargs: Mapping[str, Any],
+    num_warmup: int,
+    num_measure: int,
+    thresholds: Mapping[str, Any],
+    times: list[float],
+    peak_memories: list[float],
+    all_component_times: list[dict],
+    prompt: str,
+    runtime_identity: Mapping[str, Any],
+    device_name: str,
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    if not times or not peak_memories:
+        raise ValueError("Cannot build a performance result record without measurement runs")
+    num_gpus = _resolve_num_gpus(init_kwargs, cfg.get("run_config") or {}, cfg["benchmark_id"])
+    avg_time = sum(times) / len(times)
+    max_peak_memory = max(peak_memories)
+    num_frames = gen_kwargs.get("num_frames")
+    throughput_fps = (1.0 / avg_time) if avg_time > 0 else None
+    if isinstance(num_frames, (int, float)) and avg_time > 0:
+        throughput_fps = num_frames / avg_time
+
+    result_schema_fields = (
+        {"result_schema_version": RESULT_SCHEMA_VERSION}
+        if _is_v2_config(cfg)
+        else {}
+    )
+
+    return {
+        "benchmark_id": cfg["benchmark_id"],
+        **result_schema_fields,
+        "model_short_name": model_info.get("model_short_name", ""),
+        "device": device_name,
+        "num_gpus": num_gpus,
+        "num_warmup_runs": num_warmup,
+        "num_measurement_runs": num_measure,
+        "avg_generation_time_s": round(avg_time, 3),
+        "individual_times_s": [round(t, 3) for t in times],
+        "throughput_fps": round(throughput_fps, 3)
+        if throughput_fps is not None else None,
+        "max_peak_memory_mb": round(max_peak_memory, 1),
+        "individual_peak_memories_mb": [round(m, 1) for m in peak_memories],
+        "thresholds": dict(thresholds),
+        "regression_thresholds": cfg.get("regression_thresholds", {}),
+        "commit": os.environ.get("BUILDKITE_COMMIT", ""),
+        **_ci_provenance_fields(),
+        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+        **_configured_result_metadata(cfg),
+        "text_encoder_time_s": _avg_component(all_component_times,
+                                              "text_encoder_time_s"),
+        "dit_time_s": _avg_component(all_component_times, "dit_time_s"),
+        "vae_decode_time_s": _avg_component(all_component_times,
+                                            "vae_decode_time_s"),
+        **_build_identity_fields(cfg, init_kwargs, prompt, runtime_identity),
+    }
+
+
 # -- Test -------------------------------------------------------------------
 
 def _run_benchmark(cfg):
-    run_config = cfg.get("run_config", {})
-    required_gpus = run_config.get("required_gpus", 1)
-    available = torch.cuda.device_count()
-    if available < required_gpus:
-        pytest.skip(f"Need {required_gpus} GPUs, only {available} available")
-
+    run_config = cfg.get("run_config") or {}
     model_info = cfg["model"]
     init_kwargs = dict(cfg.get("init_kwargs", {}))
+    num_gpus = _resolve_num_gpus(init_kwargs, run_config, cfg["benchmark_id"])
+    init_kwargs["num_gpus"] = num_gpus
+
+    available = torch.cuda.device_count()
+    if available < num_gpus:
+        pytest.skip(f"Need {num_gpus} GPUs, only {available} available")
+
     gen_kwargs = dict(cfg.get("generation_kwargs", {}))
     prompts = cfg.get("test_prompts", ["A cinematic video."])
     prompt = prompts[0]
 
-    num_warmup = run_config.get("num_warmup_runs", 1)
-    num_measure = run_config.get("num_measurement_runs", 3)
+    num_warmup, num_measure = _validate_run_counts(run_config, cfg["benchmark_id"])
     thresholds = _get_thresholds(cfg)
 
     # Remap JSON keys to VideoGenerator kwargs
@@ -414,37 +590,21 @@ def _run_benchmark(cfg):
     avg_time = sum(times) / len(times)
     max_peak_memory = max(peak_memories)
     device_name = torch.cuda.get_device_name()
-    num_frames = gen_kwargs.get("num_frames")
-    throughput_fps = (1.0 / avg_time) if avg_time > 0 else None
-    if isinstance(num_frames, (int, float)) and avg_time > 0:
-        throughput_fps = num_frames / avg_time
-
-    results = {
-        "benchmark_id": cfg["benchmark_id"],
-        **_config_identity_metadata(cfg),
-        "model_short_name": model_info.get("model_short_name", ""),
-        "device": device_name,
-        "num_gpus": init_kwargs.get("num_gpus", 1),
-        "num_warmup_runs": num_warmup,
-        "num_measurement_runs": num_measure,
-        "avg_generation_time_s": round(avg_time, 3),
-        "individual_times_s": [round(t, 3) for t in times],
-        "throughput_fps": round(throughput_fps, 3)
-        if throughput_fps is not None else None,
-        "max_peak_memory_mb": round(max_peak_memory, 1),
-        "individual_peak_memories_mb": [round(m, 1) for m in peak_memories],
-        "thresholds": thresholds,
-        "regression_thresholds": cfg.get("regression_thresholds", {}),
-        "commit": os.environ.get("BUILDKITE_COMMIT", ""),
-        "pr_number": os.environ.get("BUILDKITE_PULL_REQUEST", ""),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "text_encoder_time_s": _avg_component(all_component_times,
-                                              "text_encoder_time_s"),
-        "dit_time_s": _avg_component(all_component_times, "dit_time_s"),
-        "vae_decode_time_s": _avg_component(all_component_times,
-                                            "vae_decode_time_s"),
-        **_build_identity_fields(cfg, init_kwargs, prompt, runtime_identity),
-    }
+    results = _build_result_record(
+        cfg=cfg,
+        model_info=model_info,
+        init_kwargs=init_kwargs,
+        gen_kwargs=gen_kwargs,
+        num_warmup=num_warmup,
+        num_measure=num_measure,
+        thresholds=thresholds,
+        times=times,
+        peak_memories=peak_memories,
+        all_component_times=all_component_times,
+        prompt=prompt,
+        runtime_identity=runtime_identity,
+        device_name=device_name,
+    )
 
     logger.info(
         "Performance results: avg_time=%.2fs, "

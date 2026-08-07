@@ -95,11 +95,17 @@ image = (
         "PATH": "/root/.cargo/bin:$PATH",
         "HF_HOME": "/root/data/.cache",
         "TOKENIZERS_PARALLELISM": "false",
+        "IMAGE_VERSION": IMAGE_VERSION,
+        "FASTVIDEO_CONTAINER_IMAGE_REF": IMAGE_REF,
         **({"UV_TORCH_BACKEND": uv_torch_backend_override} if uv_torch_backend_override else {}),
         "FASTVIDEO_ATTENTION_BACKEND": os.environ.get("FASTVIDEO_ATTENTION_BACKEND", "FLASH_ATTN"),
-        # FA4 is opt-in (FASTVIDEO_FA4); keep CI parity with the seeded
-        # references. Caller override wins.
-        "FASTVIDEO_FA4": os.environ.get("FASTVIDEO_FA4", "1"),
+        **({
+            "FASTVIDEO_PERFORMANCE_PROFILE_VERSION": os.environ["FASTVIDEO_PERFORMANCE_PROFILE_VERSION"]
+        } if os.environ.get("FASTVIDEO_PERFORMANCE_PROFILE_VERSION") else {}),
+        # FA4 is opt-in (FASTVIDEO_FA4). Generic ad hoc jobs should follow the
+        # product default unless a caller opts in through the local env or
+        # --env-vars.
+        "FASTVIDEO_FA4": os.environ.get("FASTVIDEO_FA4", "0"),
     })
 )
 

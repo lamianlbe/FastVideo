@@ -282,7 +282,26 @@ def _parse_pipeline_config(
 
     pipeline_config = PipelineConfig.from_kwargs(kwargs)
     _apply_training_dit_arch_overrides(pipeline_config, dit_arch_overrides)
+    _resolve_dit_quant_config(pipeline_config)
     return pipeline_config
+
+
+def _resolve_dit_quant_config(pipeline_config: Any) -> None:
+    """Resolve a string ``pipeline.dit_config.quant_config`` (e.g.
+    ``nvfp4_qat_train``) into its registered QuantizationConfig instance.
+
+    Model construction calls ``quant_config.get_quant_method()`` inside
+    ``LinearBase.__init__``, so a bare YAML string would crash there.
+    This must live in ``_parse_pipeline_config`` (not ``load_run_config``)
+    because ``dcp_to_diffusers`` rebuilds models from a checkpoint's raw
+    config by calling ``_parse_pipeline_config`` directly.
+    """
+    dit_config = getattr(pipeline_config, "dit_config", None)
+    quant = getattr(dit_config, "quant_config", None)
+    if isinstance(quant, str):
+        from fastvideo.layers.quantization import (
+            get_quantization_config, )
+        dit_config.quant_config = get_quantization_config(quant)()
 
 
 def _split_training_dit_arch_overrides(pipeline_raw: Any) -> tuple[Any, dict[str, Any]]:
@@ -343,6 +362,15 @@ def _build_training_config(
             if init_from is not None:
                 model_path = str(init_from)
 
+    raw_data_path = da.get("data_path", "") or ""
+    data_path: str | list[str] | dict[str, int]
+    if isinstance(raw_data_path, dict):
+        data_path = {str(path): int(repeat) for path, repeat in raw_data_path.items()}
+    elif isinstance(raw_data_path, list | tuple):
+        data_path = [str(path) for path in raw_data_path]
+    else:
+        data_path = str(raw_data_path)
+
     preprocessed_data_type = str(da.get("preprocessed_data_type", "t2v") or "t2v").strip().lower()
     if preprocessed_data_type not in {"t2v", "text_only"}:
         raise ValueError("training.data.preprocessed_data_type must be one of "
@@ -359,7 +387,7 @@ def _build_training_config(
             pin_cpu_memory=bool(d.get("pin_cpu_memory", False)),
         ),
         data=DataConfig(
-            data_path=str(da.get("data_path", "") or ""),
+            data_path=data_path,
             preprocessed_data_type=preprocessed_data_type,
             train_batch_size=int(da.get("train_batch_size", 1) or 1),
             dataloader_num_workers=int(da.get("dataloader_num_workers", 0) or 0),
@@ -392,6 +420,7 @@ def _build_training_config(
         ),
         tracker=TrackerConfig(
             trackers=list(tr.get("trackers", []) or []),
+            entity=str(tr.get("entity", "") or ""),
             project_name=str(tr.get("project_name", "fastvideo") or "fastvideo"),
             run_name=str(tr.get("run_name", "") or ""),
         ),

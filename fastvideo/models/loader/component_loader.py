@@ -7,6 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import cast
 
@@ -18,6 +19,12 @@ from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from fastvideo.attention.selector import (
+    _active_component_attention_backend_scope,
+    _component_attention_backend_scope,
+    coerce_attn_backend,
+    record_resolved_attention_backend,
+)
 from fastvideo.configs.models import EncoderConfig
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -77,7 +84,9 @@ class ComponentLoader(ABC):
         # Map of module types to their loader classes and expected library
         module_loaders = {
             "scheduler": (SchedulerLoader, "diffusers"),
+            "audio_scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
+            "transformer_ref": (TransformerLoader, "diffusers"),
             "sr_transformer": (TransformerLoader, "diffusers"),
             "transformer_2": (TransformerLoader, "diffusers"),
             "transformer_3": (TransformerLoader, "diffusers"),
@@ -95,6 +104,8 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "feature_extractor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
+            "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
+            "processor": (ProcessorLoader, "transformers"),
             "upsampler": (UpsamplerLoader, "diffusers"),
             "upsampler_2": (UpsamplerLoader, "diffusers"),
             # Stable Audio's `StableAudioMultiConditioner` bundles T5 +
@@ -334,6 +345,7 @@ class TextEncoderLoader(ComponentLoader):
             }
             model_config["architectures"] = ["CLIPTextModel"]
         encoder_config.update_model_arch(model_config)
+        record_resolved_attention_backend(encoder_config)
         if idx < 0 or idx >= len(encoder_precisions):
             raise IndexError(
                 f"text encoder index {idx} out of range for text_encoder_precisions (len={len(encoder_precisions)}), model_path={model_path}"
@@ -389,18 +401,22 @@ class TextEncoderLoader(ComponentLoader):
             model_config.quant_config = quant_cls()
 
         with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
-            with target_device:
-                architectures = getattr(model_config, "architectures", [])
-                model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                if getattr(model_cls, "supports_hf_from_pretrained", False):
-                    model = model_cls.from_pretrained_local(  # type: ignore[attr-defined]
-                        model_path,
-                        model_config,  # type: ignore[arg-type]
-                        dtype=PRECISION_TO_TYPE[dtype],
-                        device=target_device,
-                    )
-                    return model.eval()
+            architectures = getattr(model_config, "architectures", [])
+            model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+            if getattr(model_cls, "supports_hf_from_pretrained", False):
+                model = model_cls.from_pretrained_local(  # type: ignore[attr-defined]
+                    model_path,
+                    model_config,  # type: ignore[arg-type]
+                    dtype=PRECISION_TO_TYPE[dtype],
+                    device=target_device,
+                )
+                # HF passthrough encoders return before FastVideo's FSDP
+                # wrapping path, so the text stage needs their placement to
+                # put token tensors on the same device.
+                model._fastvideo_input_device = target_device
+                return model.eval()
 
+            with target_device:
                 model = model_cls(model_config)  # type: ignore
 
             weights_to_load = {name for name, _ in model.named_parameters()}
@@ -502,6 +518,7 @@ class ImageEncoderLoader(TextEncoderLoader):
 
         encoder_config = fastvideo_args.pipeline_config.image_encoder_config
         encoder_config.update_model_arch(model_config)
+        record_resolved_attention_backend(encoder_config)
 
         from fastvideo.platforms import current_platform
 
@@ -521,6 +538,39 @@ class ImageEncoderLoader(TextEncoderLoader):
             fastvideo_args,
             fastvideo_args.pipeline_config.image_encoder_precision,
         )
+
+
+class VisionLanguageEncoderLoader(ComponentLoader):
+    """Loader for vision-language autoregressive encoders."""
+
+    def load(self, model_path: str, fastvideo_args: FastVideoArgs):
+        from fastvideo.distributed.parallel_state import get_local_torch_device
+        from fastvideo.models.encoders.glm_image_ar_loader import (
+            GlmImageARLoader)
+
+        logger.info("Loading vision-language encoder from %s", model_path)
+        target_device = get_local_torch_device()
+        loader = GlmImageARLoader(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=fastvideo_args.trust_remote_code,
+        ).to(target_device).eval()
+        return loader
+
+
+class ProcessorLoader(ComponentLoader):
+    """Loader for HF processors that pair with vision-language encoders."""
+
+    def load(self, model_path: str, fastvideo_args: FastVideoArgs):
+        from transformers import AutoProcessor
+
+        logger.info("Loading processor from %s", model_path)
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=fastvideo_args.trust_remote_code,
+        )
+        logger.info("Loaded processor: %s", processor.__class__.__name__)
+        return processor
 
 
 class ImageProcessorLoader(ComponentLoader):
@@ -785,6 +835,24 @@ class VAELoader(ComponentLoader):
                 vae.load_state_dict(sd, strict=False)
                 return vae.eval()
 
+            if class_name == "LingBotWorld2WanVAE":
+                dtype = PRECISION_TO_TYPE[fastvideo_args.pipeline_config.vae_precision]
+                config.pop("_class_name", None)
+                vae_config = fastvideo_args.pipeline_config.vae_config
+                vae_config.update_model_arch(config)
+                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+                weight_path = os.path.join(model_path, "Wan2.1_VAE.pth")
+                if not os.path.exists(weight_path):
+                    raise FileNotFoundError(
+                        f"Missing LingBot World 2 VAE weights: {weight_path}"
+                    )
+                vae = vae_cls(
+                    vae_config,
+                    checkpoint_path=weight_path,
+                    dtype=dtype,
+                ).to(target_device)
+                return vae.eval()
+
             # LTX-2 uses CausalVideoAutoencoder with nested "vae" config
             if class_name == "CausalVideoAutoencoder" and "vae" in config:
                 vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
@@ -845,7 +913,7 @@ class VAELoader(ComponentLoader):
 
         # Diffusers-format AutoencoderKL checkpoints should match exactly; load
         # strictly so missing/unexpected keys are surfaced early.
-        strict_load = class_name == "AutoencoderKL"
+        strict_load = class_name in {"AutoencoderKL", "AutoencoderKLMiniMaxH3"}
         vae.load_state_dict(loaded, strict=strict_load)
         if (class_name == "AutoencoderKLWan"
                 and getattr(vae.config, "use_light_vae", False)
@@ -857,14 +925,35 @@ class VAELoader(ComponentLoader):
 
 
 class AudioDecoderLoader(ComponentLoader):
-    """Loader for LTX-2 audio decoder (audio_vae component)."""
+    """Loader for full audio VAEs and legacy decode-only audio components."""
 
     def load(self, model_path: str, fastvideo_args: FastVideoArgs):
         config = get_diffusers_config(model=model_path)
         class_name = config.pop("_class_name", None) or "LTX2AudioDecoder"
-
         model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
         target_device = get_local_torch_device()
+
+        if class_name == "AutoencoderKLMiniMaxH3Audio":
+            from fastvideo.platforms import current_platform
+
+            configured_audio_vae = getattr(fastvideo_args.pipeline_config, "audio_vae_config", None)
+            if configured_audio_vae is None:
+                raise ValueError("MiniMax H3 requires audio_vae_config.")
+            config.pop("_name_or_path", None)
+            audio_vae_config = deepcopy(configured_audio_vae)
+            audio_vae_config.update_model_arch(config)
+            if getattr(fastvideo_args, "vae_cpu_offload", False):
+                target_device = torch.device("mps") if current_platform.is_mps() else torch.device("cpu")
+            with set_default_torch_dtype(torch.float32):
+                audio_vae = model_cls(audio_vae_config).to(device=target_device, dtype=torch.float32)
+            safetensors_list = glob.glob(os.path.join(str(model_path), "*.safetensors"))
+            if not safetensors_list:
+                raise ValueError(f"No safetensors files found in {model_path}")
+            loaded: dict[str, torch.Tensor] = {}
+            for sf_file in safetensors_list:
+                loaded.update(safetensors_load_file(sf_file))
+            audio_vae.load_state_dict(loaded, strict=True)
+            return audio_vae.eval()
 
         precision = getattr(
             fastvideo_args.pipeline_config, "audio_decoder_precision", "bf16"
@@ -960,16 +1049,14 @@ class TransformerLoader(ComponentLoader):
         # Generator-only QAT for DMD distillation: the teacher (real_score) and
         # critic (fake_score) transformers load with this flag set and must stay
         # full precision. Drop the nvfp4_qat quant from their copied config, and
-        # mask the global ATTN_QAT_TRAIN env so their attention falls back to dense
-        # (the backend is read globally at build time). The generator loads without
-        # the flag and keeps both.
+        # build their attention under a scope that ignores any process-wide
+        # ATTN_QAT_TRAIN request so it falls back to dense. The generator loads
+        # without the flag and keeps both. The scope is exception-safe and
+        # needs no env mutation or selector cache flush (the request is part
+        # of the resolution cache key).
         _qat_generator_only = hasattr(fastvideo_args, "_loading_teacher_critic_model")
-        _qat_prev_attn_env = None
         if _qat_generator_only:
             dit_config.quant_config = None
-            from fastvideo.attention.selector import _cached_get_attn_backend
-            _qat_prev_attn_env = os.environ.pop("FASTVIDEO_ATTENTION_BACKEND", None)
-            _cached_get_attn_backend.cache_clear()
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -1036,39 +1123,42 @@ class TransformerLoader(ComponentLoader):
             or cls_name == "Cosmos25Transformer3DModel"
             or getattr(fastvideo_args.pipeline_config, "prefix", "") == "Cosmos25"
         )
-        model = maybe_load_fsdp_model(
-            model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": hf_config},
-            weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
-            hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
-            hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
-            strict=strict_load,
-            cpu_offload=fastvideo_args.dit_cpu_offload,
-            pin_cpu_memory=fastvideo_args.pin_cpu_memory,
-            fsdp_inference=fastvideo_args.use_fsdp_inference,
-            # TODO(will): make these configurable
-            default_dtype=default_dtype,
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            training_mode=fastvideo_args.training_mode,
-            enable_torch_compile=fastvideo_args.enable_torch_compile,
-            torch_compile_kwargs=fastvideo_args.torch_compile_kwargs,
-        )
-
-        if _qat_generator_only:
-            from fastvideo.attention.selector import _cached_get_attn_backend
-            if _qat_prev_attn_env is not None:
-                os.environ["FASTVIDEO_ATTENTION_BACKEND"] = _qat_prev_attn_env
-            _cached_get_attn_backend.cache_clear()
+        attention_context = (_component_attention_backend_scope(None, component="transformer")
+                             if _qat_generator_only else nullcontext())
+        with attention_context:
+            # dit_config is what the model is handed and keeps as `self.config`,
+            # so recording here makes the decision readable from the loaded
+            # transformer — and records the narrowed one for teacher/critic.
+            resolved = record_resolved_attention_backend(dit_config)
+            logger.info("transformer attention backend: %s", resolved.name if resolved else "automatic selection")
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={"config": dit_config, "hf_config": hf_config},
+                weight_dir_list=safetensors_list,
+                device=get_local_torch_device(),
+                hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
+                hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
+                strict=strict_load,
+                cpu_offload=fastvideo_args.dit_cpu_offload,
+                pin_cpu_memory=fastvideo_args.pin_cpu_memory,
+                fsdp_inference=fastvideo_args.use_fsdp_inference,
+                # TODO(will): make these configurable
+                default_dtype=default_dtype,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                training_mode=fastvideo_args.training_mode,
+                enable_torch_compile=fastvideo_args.enable_torch_compile,
+                torch_compile_kwargs=fastvideo_args.torch_compile_kwargs,
+            )
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
-        assert next(model.parameters()).dtype == default_dtype, (
-            "Model dtype does not match default dtype"
-        )
+        first_name, first_parameter = next(model.named_parameters())
+        dtype_selector = getattr(model, "_get_parameter_dtype", None)
+        expected_dtype = dtype_selector(first_name, default_dtype) if callable(dtype_selector) else default_dtype
+        assert first_parameter.dtype == expected_dtype, "Model dtype does not match the configured parameter dtype"
 
         model = model.eval()
 
@@ -1314,5 +1404,22 @@ class PipelineComponentLoader:
             module_name, transformers_or_diffusers
         )
 
-        # Load the module
-        return loader.load(component_model_path, fastvideo_args)
+        # Resolve this component's attention backend ONCE, here, from the
+        # explicit request and the environment. A per-role request already
+        # resolved upstream (the train stack's moduleloader) wins; otherwise
+        # fastvideo_args.attention_backend is the process-wide default, applied
+        # per component.
+        #
+        # The loaders record the decision on their own config rather than this
+        # function doing it after the fact, because a loader may narrow it for
+        # one component: the DMD teacher/critic transformers build dense inside
+        # a nested scope (see `record_resolved_attention_backend`).
+        if _active_component_attention_backend_scope() is not None:
+            attention_context = nullcontext()
+        else:
+            resolved = coerce_attn_backend(getattr(fastvideo_args, "attention_backend", None))
+            attention_context = (_component_attention_backend_scope(resolved, component=module_name)
+                                 if resolved is not None else nullcontext())
+
+        with attention_context:
+            return loader.load(component_model_path, fastvideo_args)

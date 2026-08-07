@@ -155,6 +155,7 @@ def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:
     assert t.distributed.pin_cpu_memory is True
 
     assert t.data.train_batch_size == 2
+    assert t.data.data_path == "/some/path"
     assert t.data.num_frames == 33
     assert t.data.seed == 42
 
@@ -242,6 +243,88 @@ def test_betas_parses_list_and_string_forms(
     data["training"] = {"optimizer": {"betas": betas_value}}
     cfg = load_run_config(_write_yaml(tmp_path, data))
     assert cfg.training.optimizer.betas == expected
+
+
+def test_pipeline_quant_config_resolves_for_load_and_export(tmp_path: Path) -> None:
+    from fastvideo.layers.quantization.nvfp4_qat_train_config import (
+        NVFP4QATTrainConfig, )
+    from fastvideo.train.entrypoint.dcp_to_diffusers import (
+        _run_config_from_raw, )
+
+    data = _minimal_yaml()
+    data["models"]["student"]["init_from"] = (
+        "FastVideo/LTX2-Distilled-Diffusers")
+    data["pipeline"] = {
+        "dit_config": {
+            "quant_config": "nvfp4_qat_train"
+        }
+    }
+
+    cfg = load_run_config(_write_yaml(tmp_path, data))
+    assert isinstance(cfg.training.pipeline_config.dit_config.quant_config,
+                      NVFP4QATTrainConfig)
+
+    export_cfg = _run_config_from_raw(cfg.raw)
+    assert isinstance(
+        export_cfg.training.pipeline_config.dit_config.quant_config,
+        NVFP4QATTrainConfig,
+    )
+
+
+def test_pipeline_quant_config_rejects_unknown_name(tmp_path: Path) -> None:
+    data = _minimal_yaml()
+    data["models"]["student"]["init_from"] = (
+        "FastVideo/LTX2-Distilled-Diffusers")
+    data["pipeline"] = {
+        "dit_config": {
+            "quant_config": "not_a_quantization_method"
+        }
+    }
+
+    with pytest.raises(ValueError, match="Invalid quantization method"):
+        load_run_config(_write_yaml(tmp_path, data))
+
+
+def test_data_path_mapping_parses_repeat_counts(tmp_path: Path) -> None:
+    # Config loading should preserve structured multi-dataset paths so the
+    # dataset layer can interpret repeat counts later.
+    data = _minimal_yaml()
+    data["training"] = {
+        "data": {
+            "data_path": {
+                "data/path1": 1,
+                "data/path2": 2,
+            }
+        }
+    }
+
+    cfg = load_run_config(_write_yaml(tmp_path, data))
+
+    assert cfg.training.data.data_path == {
+        "data/path1": 1,
+        "data/path2": 2,
+    }
+
+
+def test_dotted_override_replaces_mapping_data_path(tmp_path: Path) -> None:
+    # A dict-valued data_path is a single leaf for overrides: a scalar
+    # --training.data.data_path replaces the whole mapping.
+    data = _minimal_yaml()
+    data["training"] = {
+        "data": {
+            "data_path": {
+                "data/path1": 1,
+                "data/path2": 2,
+            }
+        }
+    }
+
+    cfg = load_run_config(
+        _write_yaml(tmp_path, data),
+        overrides=["--training.data.data_path=data/only"],
+    )
+
+    assert cfg.training.data.data_path == "data/only"
 
 
 def test_dotted_overrides_apply_with_type_coercion(tmp_path: Path) -> None:

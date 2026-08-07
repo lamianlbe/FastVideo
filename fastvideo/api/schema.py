@@ -125,11 +125,16 @@ class InputConfig:
     image_path: str | list[str] | None = None
     video_path: str | list[str] | None = None
     pil_image: Any | None = None
+    last_image: Any | None = None
+    references: list[Any] | None = None
+    latents: Any | None = None
+    audio_latents: Any | None = None
     pose: str | None = None
     mouse_cond: Any | None = None
     keyboard_cond: Any | None = None
     grid_sizes: Any | None = None
     c2ws_plucker_emb: Any | None = None
+    action_path: str | None = None
     refine_from: str | None = None
     stage1_video: Any | None = None
 
@@ -138,6 +143,7 @@ class InputConfig:
 class SamplingConfig:
     num_videos_per_prompt: int = 1
     seed: int = 1024
+    max_sequence_length: int | None = None
     num_frames: int = 125
     height: int = 720
     width: int = 1280
@@ -147,9 +153,13 @@ class SamplingConfig:
     num_inference_steps: int = 50
     num_inference_steps_sr: int = 50
     guidance_scale: float = 1.0
+    batch_cfg: bool = False
     guidance_scale_2: float | None = None
+    cfg_normalization: bool = False
+    cfg_truncation: float | None = 1.0
     guidance_rescale: float = 0.0
     true_cfg_scale: float | None = None
+    use_embedded_guidance: bool | None = None
     boundary_ratio: float | None = None
     sigmas: list[float] | None = None
 

@@ -57,10 +57,12 @@ image = (
     .run_commands("echo 'source ~/.cargo/env' >> ~/.bashrc")
     .env(
         {
+            # INVARIANT: keep this image identical for every CI job at a given
+            # base digest -- per-job/per-commit values (BUILDKITE_*) must never
+            # be baked here as image layers or every job rebuilds its own image
+            # variant. repo/commit/PR already reach the container as
+            # run_ssim_partition() arguments.
             "PATH": "/root/.cargo/bin:$PATH",
-            "BUILDKITE_REPO": os.environ.get("BUILDKITE_REPO", ""),
-            "BUILDKITE_COMMIT": os.environ.get("BUILDKITE_COMMIT", ""),
-            "BUILDKITE_PULL_REQUEST": os.environ.get("BUILDKITE_PULL_REQUEST", ""),
             "IMAGE_VERSION": image_version,
             **({"UV_TORCH_BACKEND": uv_torch_backend_override} if uv_torch_backend_override else {}),
             # FA4 is opt-in (FASTVIDEO_FA4); the SSIM references were seeded
@@ -505,9 +507,7 @@ def _prepare_ssim_workspace(
     rm -rf fastvideo/tests/ssim/reference_videos
     git_retry git submodule update --init --recursive
     uv pip install -e ".[test]"
-    cd fastvideo-kernel
-    ./build.sh
-    cd ..
+    python fastvideo/tests/modal/kernel_build_cache.py install
     uv pip install git+https://github.com/microsoft/MoGe.git
     # Stable Audio Open 1.0 inference deps (optional in basic install,
     # required by `StableAudioDenoisingStage`; consumed by
@@ -525,9 +525,11 @@ def _prepare_ssim_workspace(
             "HF_API_KEY": hf_api_key,
         },
     )
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
     if result.returncode != 0:
-        print(result.stdout)
-        print(result.stderr)
         raise RuntimeError(f"Workspace setup failed with exit code {result.returncode}")
 
     ssim_dir = os.path.join(repo_root, "fastvideo", "tests", "ssim")
@@ -548,6 +550,7 @@ def _spawn_ssim_task(
     log_dir: str,
     task_index: int,
     pytest_extra_args: list[str],
+    hf_api_key: str,
 ) -> _RunningTask:
     import shlex
 
@@ -557,6 +560,7 @@ def _spawn_ssim_task(
     command = f"set -euo pipefail && source $HOME/.local/bin/env && source /opt/venv/bin/activate && {pytest_command}"
     env = os.environ.copy()
     env["HF_HOME"] = "/root/data/.cache"
+    env["HF_API_KEY"] = hf_api_key
     # MultiprocExecutor returns CUDA tensors through mp pipes (CUDA IPC).
     # On kernels without pidfd_open support, PyTorch fails when
     # expandable_segments=True. Force False for CI compatibility.
@@ -673,6 +677,7 @@ def _build_pytest_extra_args(
     ssim_full_quality: bool,
     ssim_reference_repo: str,
     skip_ssim_reference_download: bool,
+    ssim_bootstrap_mode: bool,
     pytest_k: str,
 ) -> list[str]:
     args = []
@@ -682,6 +687,8 @@ def _build_pytest_extra_args(
         args.extend(["--ssim-reference-repo", ssim_reference_repo.strip()])
     if skip_ssim_reference_download:
         args.append("--skip-ssim-reference-download")
+    if ssim_bootstrap_mode:
+        args.append("--ssim-bootstrap-mode")
     if pytest_k.strip():
         args.extend(["-k", pytest_k.strip()])
     return args
@@ -691,6 +698,7 @@ def _schedule_ssim_tasks(
     repo_root: str,
     tasks: list[SSIMTask],
     pytest_extra_args: list[str],
+    hf_api_key: str,
     fail_fast: bool = True,
 ) -> dict[int, _TaskResult]:
     import tempfile
@@ -733,6 +741,7 @@ def _schedule_ssim_tasks(
                 log_dir=log_dir,
                 task_index=task.task_id,
                 pytest_extra_args=pytest_extra_args,
+                hf_api_key=hf_api_key,
             )
             print(f"Started {task.test_name} on GPUs {','.join(assigned_gpu_ids)}")
             running_tasks.append(running_task)
@@ -883,6 +892,7 @@ def run_ssim_partition(
     ssim_full_quality: bool = False,
     ssim_reference_repo: str = "",
     skip_ssim_reference_download: bool = False,
+    ssim_bootstrap_mode: bool = False,
     pytest_k: str = "",
     sync_generated_to_volume: bool = False,
     generated_volume_subdir: str = "",
@@ -911,12 +921,14 @@ def run_ssim_partition(
         ssim_full_quality=ssim_full_quality,
         ssim_reference_repo=ssim_reference_repo,
         skip_ssim_reference_download=skip_ssim_reference_download,
+        ssim_bootstrap_mode=ssim_bootstrap_mode,
         pytest_k=pytest_k,
     )
     results = _schedule_ssim_tasks(
         repo_root,
         partition,
         pytest_extra_args=pytest_extra_args,
+        hf_api_key=hf_api_key,
         fail_fast=fail_fast,
     )
     summaries = _collect_task_summaries(partition, results)
@@ -953,6 +965,7 @@ def run_ssim_tests(
     full_quality: bool = False,
     reference_repo: str = "",
     skip_reference_download: bool = False,
+    bootstrap_mode: bool = False,
     pytest_k: str = "",
     sync_generated_to_volume: bool = False,
     generated_volume_subdir: str = "",
@@ -973,15 +986,24 @@ def run_ssim_tests(
         print(f"Selected model ids: {model_ids}")
     if pytest_k.strip():
         print(f"Using pytest -k filter: {pytest_k}")
+    if bootstrap_mode:
+        print(
+            "SSIM bootstrap mode enabled: missing references will upload "
+            "draft artifacts and xfail."
+        )
     quality_tier = _resolve_output_quality_tier(full_quality)
     if sync_generated_to_volume:
         resolved_subdir = _resolve_generated_volume_subdir(
             generated_volume_subdir,
             resolved_git_commit,
         )
+        generated_volume_path = _build_generated_volume_relative_path(
+            generated_volume_subdir=resolved_subdir,
+            quality_tier=quality_tier,
+        )
         print(
             "Raw generated videos will be saved to Modal volume path: "
-            f"{_build_generated_volume_relative_path(generated_volume_subdir=resolved_subdir, quality_tier=quality_tier)}"
+            f"{generated_volume_path}"
         )
     else:
         resolved_subdir = ""
@@ -996,6 +1018,7 @@ def run_ssim_tests(
         ssim_full_quality=full_quality,
         ssim_reference_repo=reference_repo,
         skip_ssim_reference_download=skip_reference_download,
+        ssim_bootstrap_mode=bootstrap_mode,
         pytest_k=pytest_k,
         sync_generated_to_volume=sync_generated_to_volume,
         generated_volume_subdir=resolved_subdir,

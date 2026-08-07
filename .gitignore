@@ -6,6 +6,7 @@ results/
 wandb/
 *.ipynb
 *.jpg
+!examples/datasets/lingbotworld2/image.jpg
 *.safetensors
 *.mp4
 *.png
@@ -34,6 +35,7 @@ env
 *.log
 weights/
 logs/
+/Z-Image/
 official_weights/
 converted_weights/
 
@@ -72,8 +74,8 @@ docs/distillation/examples/
 # Python pickle files
 *.pkl
 
-# Reference videos
-!fastvideo/tests/ssim/reference_videos/**/*.mp4
+# Reference videos (negations must come after the catch-all on line below)
+!fastvideo/tests/nightly/reference_video_*.mp4
 
 # Static images
 !docs/assets/images/**/*.png
@@ -127,6 +129,8 @@ apps/dreamverse/web/.env.production.local
 .sisyphus/
 openspec/
 fastvideo/tests/ssim/reference_videos/**
+!fastvideo/tests/ssim/reference_videos/**/*.mp4
+!fastvideo/tests/ssim/reference_videos/**/*.png
 
 # Editor logs and local Python version pins (accidentally committed)
 *.nvimlog

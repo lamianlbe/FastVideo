@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
 import os
-
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
 
-from fastvideo import envs
+from fastvideo.attention.utils.flash_attn_default import (
+    fa_version,
+    flash_attn_func_compilable,
+)
+
 from fastvideo.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -17,119 +19,6 @@ from fastvideo.attention.backends.abstract import (
 from fastvideo.logger import init_logger
 
 logger = init_logger(__name__)
-
-# FA4 (flash_attn.cute) is explicit opt-in via FASTVIDEO_FA4=1, mirroring the
-# kernel package's FASTVIDEO_VSA_CUTEDSL: its CuTeDSL kernels JIT-compile per
-# shape family and can fail at runtime on some arch/shape combinations, so it
-# is never auto-selected just because it is installed. Below sm90 a capability
-# gate in flash_attn_cute routes to FA2 the calls FA4 cannot serve there:
-# grad-enabled (its backward asserts sm90+) and GQA (pack_gqa fails CuTeDSL
-# JIT, observed on sm_89).
-if envs.FASTVIDEO_FA4:
-    try:
-        from fastvideo.attention.utils.flash_attn_cute import flash_attn_func
-    except ImportError as e:
-        raise RuntimeError(f"FASTVIDEO_FA4=1 but flash_attn.cute (FA4) is not usable ({e}); "
-                           "fix the FA4 install (see the flash-attn-4 pin in pyproject.toml) "
-                           "or unset FASTVIDEO_FA4.") from e
-    fa_version = "4"
-else:
-    try:
-        from flash_attn_interface import flash_attn_func as flash_attn_3_func
-
-        # flash_attn 3 no longer have a different API, see following commit:
-        # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-        flash_attn_func = flash_attn_3_func
-        fa_version = "3"
-    except ImportError:
-        from flash_attn import flash_attn_func as flash_attn_2_func
-        flash_attn_func = flash_attn_2_func
-        fa_version = "2"
-    try:
-        if importlib.util.find_spec("flash_attn.cute") is not None:
-            logger.info("flash_attn.cute (FA4) is installed but not enabled; "
-                        "set FASTVIDEO_FA4=1 to use it for inference.")
-    except ImportError:
-        pass
-
-# torch.compile traceability: the FA4/cute path (fa_version=="4") is
-# already a registered torch.library custom op, so dynamo treats it as a
-# graph node. The external FA2/FA3 `flash_attn_func` is NOT — dynamo
-# breaks the graph at the call site (observed: wanvideo.py self-attn,
-# once per layer every step), which fragments the compiled region and
-# blocks CUDA-graph capture. Wrap the FA2/FA3 default call in a custom
-# op (mirrors the FP4 `flash_attn_cute` template) so it becomes an
-# opaque-but-traceable node. The kernel still runs eager inside the op
-# (correct — flash-attn must run eager); only dynamo's treatment of the
-# boundary changes, so numerics are unchanged (SSIM-gate to confirm).
-if fa_version in ("2", "3"):
-    _fa_default = flash_attn_func
-
-    # Scope: this op covers exactly the q/k/v + softmax_scale + causal
-    # call shape used by FlashAttentionImpl.forward's default branch
-    # (see `flash_attn_func_compilable(...)` call site below). The
-    # masked/no-pad and varlen / cross-attn paths use different
-    # entry points (`flash_attn_no_pad`, `flash_attn_varlen_*`) which
-    # are intentionally out of scope for this PR — wrapping them is a
-    # natural follow-up. The wrapper's signature is the contract: any
-    # extra kwarg (dropout_p, window_size, alibi_slopes, deterministic,
-    # return_attn_probs, ...) raises TypeError at the call site, so
-    # silent loss of kwargs is not a failure mode.
-    @torch.library.custom_op(
-        "fastvideo::_flash_attn_default_forward",
-        mutates_args=(),
-        device_types="cuda",
-    )
-    def _flash_attn_default_forward(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        softmax_scale: float | None,
-        causal: bool,
-    ) -> torch.Tensor:
-        return _fa_default(q, k, v, softmax_scale=softmax_scale, causal=causal)
-
-    @torch.library.register_fake("fastvideo::_flash_attn_default_forward")
-    def _flash_attn_default_forward_fake(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        softmax_scale: float | None,
-        causal: bool,
-    ) -> torch.Tensor:
-        del softmax_scale, causal
-        # FA2/FA3 default path: [batch, seqlen_q, nheads, head_dim_v],
-        # same dtype/device as q (head dim taken from v).
-        return q.new_empty(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
-
-    def flash_attn_func_compilable(q, k, v, softmax_scale=None, causal=False):
-        # Autograd carve-out. The custom op above registers a forward + fake
-        # kernel but NO backward (register_autograd), so it is opaque to
-        # autograd. Inference runs under no_grad / inference_mode and routes
-        # through the traceable custom op — that is the torch.compile win, and
-        # the only path this PR claims. Training backprops through attention,
-        # so route grad-enabled calls to the original FA2/FA3 `flash_attn_func`
-        # (itself an autograd.Function, so backward is correct) at the cost of a
-        # dynamo graph break on the training path — i.e. pre-PR behavior, no
-        # regression. Full autograd parity for the custom op (mirroring the FP4
-        # cute template) is a tracked follow-up.
-        if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
-            return _fa_default(q, k, v, softmax_scale=softmax_scale, causal=causal)
-        return torch.ops.fastvideo._flash_attn_default_forward(q, k, v, softmax_scale, causal)
-elif fa_version == "4":
-    # FA4 path: `flash_attn_func` (from `flash_attn_cute`) goes through a
-    # registered torch.library custom op (with an FA4 backward on sm90+;
-    # grad-enabled and GQA calls below sm90 route to FA2), so a passthrough
-    # is enough — no extra registration needed.
-    def flash_attn_func_compilable(q, k, v, softmax_scale=None, causal=False):
-        return flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal)
-else:
-    # Defensive: the probe above only ever sets fa_version to "2", "3",
-    # or "4"; an unexpected value means an import/probe regression and
-    # we want a loud error at import, not a silent NameError later.
-    raise RuntimeError(f"Unsupported FlashAttention version: {fa_version!r} — expected "
-                       f"'2', '3', or '4' from the import probe above.")
-
 logger.info("Using FlashAttention-%s backend", fa_version)
 
 # FP4 FA4 support: quantize Q/K to NVFP4 E2M1 for block-scaled MMA on Blackwell.
@@ -154,8 +43,30 @@ except ImportError:
 # share one transformer instance).
 from fastvideo.attention.utils.fp8_utils import fa4_fp8_stage_active, fp8_quantize_for_fa4
 
+_FA4_QUANT_OPS: tuple | None = None
 
-def _nvfp4_quantize_for_fa4(tensor_4d: torch.Tensor, ) -> tuple[torch.Tensor, torch.Tensor]:
+
+def _import_fa4_quant_ops() -> tuple:
+    """The slow path: resolves flashinfer's FP4 quantization entry points
+    (imports + JIT-module lookup, which probes the CUDA toolchain via a
+    subprocess on first use). Kept as its own function so tests can pin
+    that it runs at most once per process."""
+    from flashinfer.quantization import SfLayout, nvfp4_quantize
+    return (nvfp4_quantize, SfLayout)
+
+
+def _resolve_fa4_quant_ops() -> tuple:
+    # Lazy (construct-anywhere/fail-at-forward stays intact) but memoized:
+    # re-resolving per forward graph-breaks dynamo every step (making
+    # fullgraph compilation impossible for the NVFP4 path) and keeps eager
+    # dispatch overhead on the hot path.
+    global _FA4_QUANT_OPS
+    if _FA4_QUANT_OPS is None:
+        _FA4_QUANT_OPS = _import_fa4_quant_ops()
+    return _FA4_QUANT_OPS
+
+
+def _nvfp4_quantize_for_fa4_impl(tensor_4d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a (batch, seqlen, nheads, headdim) BF16 tensor to FP4.
 
     Returns:
@@ -164,7 +75,7 @@ def _nvfp4_quantize_for_fa4(tensor_4d: torch.Tensor, ) -> tuple[torch.Tensor, to
             Caller should slice [:, :orig_seqlen] before passing to FA4.
         sf_tensor:  torch.uint8, shape (32, 4, rest_m, 4, rest_k, nheads, batch) with stride[3]=1
     """
-    from flashinfer.quantization import nvfp4_quantize, SfLayout
+    nvfp4_quantize, SfLayout = _resolve_fa4_quant_ops()
 
     batch, seqlen, nheads, headdim = tensor_4d.shape
     sf_vec_size = 16
@@ -202,6 +113,43 @@ def _nvfp4_quantize_for_fa4(tensor_4d: torch.Tensor, ) -> tuple[torch.Tensor, to
     sf_mma = sf_canonical.permute(4, 5, 2, 6, 3, 1, 0)
 
     return fp4_tensor, sf_mma
+
+
+# Dynamo boundary for the FP4 quantize path (same pattern as the masked
+# flash-attention entry points in flash_attn_no_pad.py): tracing a python
+# body that resolves flashinfer's JIT module descends into its toolchain
+# probe (a subprocess) regardless of any runtime memoization -- a cache hit
+# is invisible at trace time. Registering the whole quantize step as a
+# custom op makes it one opaque graph node, unlocking
+# torch.compile(fullgraph=True) for the NVFP4 attention path.
+@torch.library.custom_op(
+    "fastvideo::nvfp4_quantize_fa4",
+    mutates_args=(),
+    device_types="cuda",
+)
+def _nvfp4_quantize_fa4_op(tensor_4d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return _nvfp4_quantize_for_fa4_impl(tensor_4d)
+
+
+@torch.library.register_fake("fastvideo::nvfp4_quantize_fa4")
+def _nvfp4_quantize_fa4_fake(tensor_4d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, seqlen, nheads, headdim = tensor_4d.shape
+    seqlen_padded = (seqlen + 127) // 128 * 128
+    fp4 = tensor_4d.new_empty((batch, seqlen_padded, nheads, headdim // 2), dtype=torch.float4_e2m1fn_x2)
+    rest_m = seqlen_padded // 128
+    rest_k = (headdim // 16) // 4
+    # Must reproduce the impl's output STRIDES, not just its shape: the real
+    # sf is a permuted view of a contiguous (batch, nheads, rest_m, rest_k,
+    # 32, 4, 4) buffer, and torch.compile bakes the fake's strides into the
+    # generated code (a contiguous fake here asserts at runtime).
+    sf = tensor_4d.new_empty((batch, nheads, rest_m, rest_k, 32, 4, 4), dtype=torch.uint8).permute(4, 5, 2, 6, 3, 1, 0)
+    return fp4, sf
+
+
+def _nvfp4_quantize_for_fa4(tensor_4d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize (batch, seqlen, nheads, headdim) BF16 to FP4 via the custom
+    op boundary; see _nvfp4_quantize_for_fa4_impl for the layout contract."""
+    return torch.ops.fastvideo.nvfp4_quantize_fa4(tensor_4d)
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -314,8 +262,11 @@ class FlashAttentionImpl(AttentionImpl):
         # SP). Cast through bf16 and restore, matching TORCH_SDPA's tolerance.
         orig_dtype = query.dtype
         if orig_dtype not in (torch.float16, torch.bfloat16):
-            logger.warning_once(f"FLASH_ATTN received {orig_dtype} inputs; casting to "
-                                f"bfloat16 for the kernel and restoring on output.")
+            # Keep logging (and its Python lru_cache) out of compiled traces
+            # so that the AOTAutograd cache can serialize.
+            if not torch.compiler.is_compiling():
+                logger.warning_once(f"FLASH_ATTN received {orig_dtype} inputs; casting to "
+                                    f"bfloat16 for the kernel and restoring on output.")
             query = query.to(torch.bfloat16)
             key = key.to(torch.bfloat16)
             value = value.to(torch.bfloat16)
@@ -332,9 +283,17 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: FlashAttnMetadata,
     ):
         if (attn_metadata is not None and hasattr(attn_metadata, "attn_mask") and attn_metadata.attn_mask is not None):
+            # Route through the *_compilable wrappers so dynamo sees one
+            # traceable node for each masked entry point (the unpad/pad
+            # bookkeeping runs eager inside the custom op). On FA2 these
+            # wrappers go through ops with full register_autograd, so
+            # training also backprops through the op (no graph break on
+            # the training path); on FA3/FA4 they carve out to the
+            # autograd.Function for grad-enabled calls — see
+            # fastvideo/attention/utils/flash_attn_no_pad.py.
             from fastvideo.attention.utils.flash_attn_no_pad import (
-                flash_attn_no_pad,
-                flash_attn_varlen_qk_no_pad,
+                flash_attn_no_pad_compilable as flash_attn_no_pad,
+                flash_attn_varlen_qk_no_pad_compilable as flash_attn_varlen_qk_no_pad,
             )
 
             attn_mask = attn_metadata.attn_mask

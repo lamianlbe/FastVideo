@@ -112,6 +112,40 @@ def _infer_latent_batch_size(batch: ForwardBatch) -> int:
     return latent_batch_size
 
 
+def _resolve_output_size(
+    samples: torch.Tensor,
+    fallback: tuple[int, int, int],
+    *,
+    pixel_output: bool,
+) -> tuple[int, int, int]:
+    """Report the final decoded video's `(height, width, frames)`.
+
+    Refiner stages can produce a different resolution from the base request, so
+    pixel outputs use the final `[batch, channels, frames, height, width]` tensor.
+    Latent and audio outputs keep the requested fallback because their tensor
+    dimensions do not describe decoded pixels.
+    """
+    if pixel_output and samples.ndim == 5:
+        return (int(samples.shape[-2]), int(samples.shape[-1]), int(samples.shape[-3]))
+    return fallback
+
+
+def _validate_request_stage_overrides(model_path: str, request: GenerationRequest) -> None:
+    """Validate typed stage overrides against the model's registered preset."""
+    if not request.stage_overrides:
+        return
+    from fastvideo.api.presets import validate_preset_selection
+    from fastvideo.registry import get_preset_selection
+    preset_name, model_family = get_preset_selection(model_path)
+    if preset_name is None or model_family is None:
+        raise ValueError(f"Model {model_path!r} has no preset for stage override validation")
+    validate_preset_selection(
+        preset_name,
+        model_family,
+        stage_overrides=request.stage_overrides,
+    )
+
+
 class VideoGenerator:
     """
     A unified class for generating videos using diffusion models.
@@ -443,6 +477,7 @@ class VideoGenerator:
         self,
         request: GenerationRequest,
     ) -> GenerationResult | list[GenerationResult]:
+        _validate_request_stage_overrides(self.fastvideo_args.model_path, request)
         if isinstance(request.prompt, list):
             if request.inputs.prompt_path is not None:
                 raise ValueError("request.prompt list cannot be combined with request.inputs.prompt_path")
@@ -748,13 +783,16 @@ class VideoGenerator:
         thread = threading.Thread(target=execute_forward_thread)
         thread.start()
         latent_batch_size = _infer_latent_batch_size(batch)
+        is_latent_output = fastvideo_args.output_type == "latent"
+        needs_frame_output = batch.return_frames or (batch.save_video and not is_latent_output)
+        needs_samples_buffer = batch.return_frames or needs_frame_output
         # When ``output_type == "latent"`` the forward output has latent
         # shape (e.g. ``[B, C_latent, T_latent, H_latent, W_latent]``)
         # rather than the pre-allocation's pixel shape. Skip the pinned
-        # ~50 MB buffer entirely; we always fall through to the
-        # ``samples = output_batch.output.cpu()`` branch below in that
-        # mode. ``skip_pixel_prealloc`` also gates the slow-path warning.
-        skip_pixel_prealloc = fastvideo_args.output_type == "latent"
+        # ~50 MB buffer entirely. Also skip it for metadata-only calls;
+        # neither the result nor save path will consume the decoded tensor.
+        # ``skip_pixel_prealloc`` also gates the slow-path warning.
+        skip_pixel_prealloc = is_latent_output or not needs_samples_buffer
         if skip_pixel_prealloc:
             samples = torch.empty(0, device='cpu')
         else:
@@ -773,7 +811,16 @@ class VideoGenerator:
             raise RuntimeError("Forward execution returned no output tensor. "
                                "This usually means the executor/pipeline failed earlier.")
 
-        if output_batch.output.shape == samples.shape:
+        audio_only = bool(output_batch.extra.get("audio_only"))
+        if not needs_samples_buffer or (audio_only and not batch.return_frames):
+            # Metadata-only/audio-only request: keep the empty placeholder and
+            # avoid the decoded tensor D->H copy.
+            pass
+        elif audio_only:
+            # Audio-only return-frames requests expose the small placeholder
+            # without warning about expected video shape.
+            samples = output_batch.output.cpu()
+        elif output_batch.output.shape == samples.shape:
             samples.copy_(output_batch.output)
         else:
             if not skip_pixel_prealloc:
@@ -796,13 +843,21 @@ class VideoGenerator:
         #   2. Audio-only workload — `samples` is a 1×3×1×8×8 placeholder
         #      no caller will use; skip the grid loop and save a `.wav`.
         #   3. Pixel video / image — the historical happy path.
-        is_latent_output = fastvideo_args.output_type == "latent"
-        audio_only = bool(output_batch.extra.get("audio_only"))
+        # `GenerationResult.size` describes the produced media, not only the
+        # base-stage request. Refiner pipelines can change the final pixel
+        # dimensions, so derive this result metadata from the decoded output.
+        output_size = _resolve_output_size(
+            samples,
+            (target_height, target_width, batch.num_frames),
+            pixel_output=not is_latent_output and not audio_only,
+        )
 
         postprocess_start = time.perf_counter()
         frames: list[np.ndarray] | None
         if is_latent_output or audio_only:
-            frames = None if is_latent_output else []
+            frames = [] if audio_only and batch.return_frames else None
+        elif not needs_frame_output:
+            frames = None
         else:
             videos = rearrange(samples, "b c t h w -> t b c h w")
             frames = []
@@ -905,7 +960,7 @@ class VideoGenerator:
             "audio": output_batch.extra.get("audio"),
             "audio_sample_rate": output_batch.extra.get("audio_sample_rate"),
             "ltx2_audio_latents": output_batch.extra.get("ltx2_audio_latents"),
-            "size": (target_height, target_width, batch.num_frames),
+            "size": output_size,
             "generation_time": gen_time,
             "e2e_latency": e2e_time,
             "logging_info": logging_info,

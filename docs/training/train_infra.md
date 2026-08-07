@@ -81,6 +81,7 @@ Common model parameters:
 | `disable_custom_init_weights` | `false` | Skip custom weight initialization (use for teacher/critic) |
 | `flow_shift` | `3.0` | Timestep shifting factor |
 | `enable_gradient_checkpointing_type` | `null` | Gradient checkpointing (`"full"` or `null`) |
+| `attention_backend` | `null` | Optional role-local backend for Wan models (for example `ATTN_QAT_TRAIN`); overrides the process default only while this role's transformer is built |
 
 Which roles are needed depends on the training method:
 
@@ -161,6 +162,18 @@ training:
     decay_interval_steps: 0
 ```
 
+`training.data.data_path` can also mix multiple preprocessed datasets by using a mapping from dataset path to repeat count:
+
+```yaml
+training:
+  data:
+    data_path:
+      data/zeldam2-clean: 1
+      data/multi3d_games: 2
+```
+
+The repeat count duplicates that dataset's parquet file list before shuffling/sampling, so the example above trains with roughly twice as much `multi3d_games` exposure as `zeldam2-clean`. Paths are just suggested locations; use any local path that contains a FastVideo preprocessed parquet dataset.
+
 See [Training Trackers](trackers.md) to configure Weights & Biases or SwanLab,
 including SwanLab installation and authentication.
 
@@ -198,6 +211,29 @@ Optional overrides for the inference pipeline used during validation:
 pipeline:
   flow_shift: 8
 ```
+
+Registered transformer linear-quantization configs can also be selected by
+name. For example, the LTX-2 NVFP4-QAT recipe applies real FP4 forward GEMMs
+with a straight-through-estimator backward to its deployment-targeted
+attention/FFN projections:
+
+```yaml
+pipeline:
+  dit_config:
+    quant_config: nvfp4_qat_train
+```
+
+The LTX-2 recipe in
+`examples/train/configs/overfit_ltx2_t2v_nvfp4_qat.yaml` combines that linear
+configuration with `models.student.attention_backend: ATTN_QAT_TRAIN` for
+video-attention forward/backward. On sm120, its validation callback temporarily
+switches those layers to `ATTN_QAT_INFER`.
+On GB200, set `callbacks.validation.attn_qat_infer: false` to keep validation on
+the train-time QAT backend; the inference kernel is sm120-only.
+
+User-adaptable LTX-2 fine-tuning recipes (full, LoRA, and NVFP4 QAT) live in
+`examples/train/configs/fine_tuning/ltx2/`, alongside the other model
+families under `examples/train/configs/fine_tuning/`.
 
 ---
 
@@ -286,6 +322,8 @@ method:
 | `dmd_denoising_steps` | *(required)* | Timestep schedule for student rollout |
 | `generator_update_interval` | `1` | Update student every N critic steps |
 | `real_score_guidance_scale` | `1.0` | CFG scale for teacher predictions |
+| `min_timestep_ratio` | `0.0` | Lower bound for randomly sampled teacher/critic score timesteps |
+| `max_timestep_ratio` | `1.0` | Upper bound for randomly sampled teacher/critic score timesteps |
 | `fake_score_learning_rate` | *(required)* | Critic optimizer learning rate |
 | `fake_score_betas` | *(required)* | Critic optimizer Adam betas |
 | `fake_score_lr_scheduler` | *(required)* | Critic LR scheduler type |
@@ -325,6 +363,40 @@ Self-Forcing inherits all DMD2 parameters, plus:
 | `context_noise` | `0.0` | Noise added to context frames (0 = clean) |
 | `enable_gradient_in_rollout` | `true` | Enable backprop through rollout |
 | `start_gradient_frame` | `0` | Frame index where gradients begin |
+
+### Streaming Long Tuning
+
+`StreamingLongTuningMethod` extends Self-Forcing for LongLive-style rollouts. It
+keeps a streaming state, generates overlapping chunks, and trains only the new
+frames while preserving context from earlier chunks.
+
+For the MatrixGame2/Zelda world-model example, self-forcing and long tuning are
+separate runs: first train or load the 1k-step self-forcing checkpoint using
+`examples/train/scenario/worldmodel/zelda/self_forcing_causal_i2v.yaml`,
+then run
+`examples/train/scenario/worldmodel/zelda/streaming_long_tuning_causal_i2v.yaml`
+from that checkpoint for the 3k-step streaming long-tuning stage.
+
+```yaml
+method:
+  _target_: fastvideo.train.methods.distribution_matching.streaming_long_tuning.StreamingLongTuningMethod
+  streaming_chunk_size: 9
+  streaming_max_length: 39
+  streaming_fixed_overlap_latents: 3
+  streaming_reencode_overlap_anchor: true
+  streaming_anchor_inject_k: 1
+  streaming_require_full_blocks: true
+  multi_phased_distill_schedule:
+    - stage: streaming_long
+      start_step: 0
+      end_step: 3000
+      num_latent_t: 39
+      streaming_training: true
+```
+
+See
+`examples/train/scenario/worldmodel/zelda/streaming_long_tuning_causal_i2v.yaml`
+for a complete MatrixGame2/Zelda configuration.
 
 ---
 

@@ -78,6 +78,8 @@ class ForwardBatch:
     image_path: str | None = None
     image_embeds: list[torch.Tensor] = field(default_factory=list)
     pil_image: torch.Tensor | PIL.Image.Image | None = None
+    last_image: torch.Tensor | PIL.Image.Image | None = None
+    references: list[Any] | None = None
     preprocessed_image: torch.Tensor | None = None
     # Text inputs
     prompt: str | list[str] | None = None
@@ -109,6 +111,10 @@ class ForwardBatch:
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
+    # When True, ``guidance_scale`` is passed into models that use embedded guidance (e.g. FLUX)
+    # and must not imply classic dual-forward CFG. Use ``true_cfg_scale > 1`` for true CFG.
+    use_embedded_guidance: bool = False
+    true_cfg_scale: float = 1.0
 
     # Batch info
     batch_size: int | None = None
@@ -121,6 +127,7 @@ class ForwardBatch:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    audio_latents: torch.Tensor | None = None
     lq_latents: torch.Tensor | None = None
     raw_latent_shape: tuple[int, ...] | None = None
     noise_pred: torch.Tensor | None = None
@@ -143,8 +150,9 @@ class ForwardBatch:
     camera_trajectory: str | None = None  # Camera trajectory file/identifier
     action_list: list[str] | None = None  # List of actions (e.g., ['forward', 'left'])
     action_speed_list: list[float] | None = None  # Speed for each action
-    # Camera control inputs (LingBotWorld)
+    # Camera control inputs (LingBotWorld and LingBotWorld2)
     c2ws_plucker_emb: torch.Tensor | None = None  # Plucker embedding: [B, C, F_lat, H_lat, W_lat]
+    action_path: str | None = None  # Directory containing poses.npy and intrinsics.npy
 
     # Camera control inputs (GEN3C)
     trajectory_type: str | None = None
@@ -173,7 +181,10 @@ class ForwardBatch:
     num_inference_steps: int = 50
     num_inference_steps_sr: int = 50
     guidance_scale: float = 1.0
+    batch_cfg: bool = False
     guidance_scale_2: float | None = None
+    cfg_normalization: bool = False
+    cfg_truncation: float | None = 1.0
     guidance_rescale: float = 0.0
     eta: float = 0.0
     sigmas: list[float] | None = None
@@ -263,9 +274,12 @@ class ForwardBatch:
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
 
-        # Enable CFG for standard guidance_scale and LTX-2 text CFG scales.
+        # LTX-2 text CFG scales; FLUX uses ``use_embedded_guidance`` so ``guidance_scale > 1`` alone
+        # does not enable classifier-free guidance.
         ltx2_text_cfg_enabled = (self.ltx2_cfg_scale_video != 1.0 or self.ltx2_cfg_scale_audio != 1.0)
-        if self.guidance_scale > 1.0 or ltx2_text_cfg_enabled:
+        if self.use_embedded_guidance:
+            self.do_classifier_free_guidance = (self.true_cfg_scale > 1.0) or ltx2_text_cfg_enabled
+        elif self.guidance_scale > 1.0 or ltx2_text_cfg_enabled:
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []

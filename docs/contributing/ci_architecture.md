@@ -99,6 +99,13 @@ status.
 Full Suite is also path-filtered. It validates broader behavior before Mergify
 can merge a PR.
 
+A `ready`-labeled PR does not hit Buildkite immediately:
+`ci-trigger-full-suite.yml` first runs `.github/scripts/gate_full_suite.sh`,
+which waits for the cheap Tier-1 checks (pre-commit, docs build) on the PR
+head. A red cheap check blocks the suite (fail closed; the next push re-arms
+it), while a GitHub outage or a >25 min wait lets it run anyway (fail open).
+`/test full` bypasses the gate.
+
 | Buildkite label | `TEST_TYPE` | Main watched paths |
 |---|---|---|
 | SSIM Tests | `ssim` | `fastvideo/**/*.py`, `pyproject.toml`, `docker/Dockerfile` |
@@ -261,15 +268,27 @@ The docs job:
 
 ### Docker Images
 
-`.github/workflows/infra-build-image.yml` is a manual `workflow_dispatch`
-workflow. Maintainers choose which image families to build. The
+`.github/workflows/infra-build-image.yml` supports manual `workflow_dispatch`
+runs and automatically rebuilds the CUDA matrix when a repository-controlled
+image input changes on `main` in the canonical repository. Those inputs include
+the CUDA Dockerfile and reusable workflow, dependency metadata, Docker context
+policy, `fastvideo-kernel/**`, and the kernel artifact metadata/key helper.
+Manual runs let maintainers choose which image families to build. The
 `fastvideo-dev` matrix builds Python 3.12 images for CUDA 12.6 and CUDA 13 on
 native `amd64` and `arm64` runners, then publishes one multi-platform manifest
-per CUDA version. CUDA 12.6 owns the `py3.12-latest` and global `latest` tags,
-as well as the explicit `py3.12-cuda12.6.3-latest` alias. CUDA 13 is published
-under the explicit `py3.12-cuda13.0.0-latest` tag. This publication policy does
-not change the unparameterized `docker/Dockerfile` build defaults, which remain
-CUDA 13 and `cu130`.
+per CUDA version. CUDA 12.6 owns the `py3.12-latest` and global `latest` tags, as
+well as the explicit `py3.12-cuda12.6.3-latest` alias. CUDA 13 is published under
+the explicit `py3.12-cuda13.0.0-latest` tag. This publication policy does not
+change the unparameterized `docker/Dockerfile` build defaults, which remain CUDA
+13 and `cu130`.
+
+Published amd64 development images keep their configured Hopper kernel wheel
+installed and also carry an immutable SM89 wheel under
+`/opt/fastvideo-kernel-prebuilt`. Modal PR and SSIM jobs select the exact
+source, ABI, and GPU-architecture match from that directory, so L40S jobs reuse
+the trusted image artifact while kernel-changing PRs still build locally. Once
+a kernel or artifact-key change reaches `main`, the image workflow republishes
+the matching trusted artifact before later jobs consume the updated image tag.
 
 The optional Dreamverse matrix builds backend and UI images for CUDA 12.6 and
 CUDA 13 on `amd64`. Dreamverse remains `amd64`-only because its FA4 dependency
@@ -309,7 +328,7 @@ The reusable implementation lives in
 | `fastvideo/tests/modal/ssim_test.py` | Modal functions and partitioning for SSIM |
 | `.buildkite/performance-benchmarks/tests/*.json` | Performance benchmark configs and thresholds |
 | `.github/workflows/infra-docs.yml` | Docs build and GitHub Pages deploy |
-| `.github/workflows/infra-build-image.yml` | Manual Docker image builds |
+| `.github/workflows/infra-build-image.yml` | Automatic CUDA matrix and manual Docker image builds |
 | `.github/workflows/publish-fastvideo.yml` | FastVideo PyPI publishing |
 | `.github/workflows/publish-kernel.yml` | FastVideo kernel PyPI publishing |
 | `.github/workflows/publish-comfyui.yml` | ComfyUI registry publishing |
