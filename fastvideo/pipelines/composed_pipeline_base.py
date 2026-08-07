@@ -107,14 +107,26 @@ class ComposedPipelineBase(ABC):
         if not compile_conditions:
             return 0
 
-        compiled_count = 0
-        for name, submodule in module.named_modules():
-            if not name:
-                continue
-            if any(cond(name, submodule) for cond in compile_conditions):
-                submodule.forward = torch.compile(submodule.forward, **compile_kwargs)
-                compiled_count += 1
-        return compiled_count
+        targets = [
+            submodule for name, submodule in module.named_modules()
+            if name and any(cond(name, submodule) for cond in compile_conditions)
+        ]
+        if targets:
+            # Repeated submodules share one forward code object, so its dynamo
+            # cache accumulates one entry per served shape — and per instance
+            # if any guard specializes on a per-block attribute. The defaults
+            # (recompile_limit=8, accumulated=256) are far below what a
+            # 48-block model can legitimately need, and overflowing them under
+            # fullgraph=True is a hard runtime failure, not a slowdown. Raise
+            # both proportionally to the compile fan-out; only ever raise —
+            # imports elsewhere (e.g. lora/linear.py) also write this config.
+            cfg = torch._dynamo.config
+            needed = max(64, 16 * len(targets))
+            cfg.recompile_limit = max(cfg.recompile_limit, needed)
+            cfg.accumulated_recompile_limit = max(cfg.accumulated_recompile_limit, 4 * needed)
+        for submodule in targets:
+            submodule.forward = torch.compile(submodule.forward, **compile_kwargs)
+        return len(targets)
 
     def _maybe_compile_pipeline_module(
         self,

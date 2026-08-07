@@ -1798,6 +1798,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # LTX-2.3 cross-attention AdaLN + per-sample STG (defaults reproduce 2.0).
         self.cross_attention_adaln = cross_attention_adaln
         self.stg_block_idx = stg_block_idx
+        # Precomputed so the compiled forward never reads self.idx: dynamo
+        # guards int attributes by VALUE, so an `idx == stg_block_idx`
+        # comparison in forward would specialize every block separately
+        # (48 graphs instead of 2) and defeat cross-block compile sharing.
+        self.is_stg_block = idx == stg_block_idx
 
         # Choose attention class based on SP mode
         # Self-attention and audio-video cross-attention use DistributedAttention when SP > 1
@@ -2069,7 +2074,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             """
             bsz = values.shape[0]
             keep = torch.ones((bsz, ), device=values.device, dtype=values.dtype)
-            if self.idx == self.stg_block_idx:
+            if self.is_stg_block:
                 if torch.is_tensor(skip_flag):
                     if skip_flag.ndim == 0:
                         perturb = skip_flag.reshape(1).expand(bsz)

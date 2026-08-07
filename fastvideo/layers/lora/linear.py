@@ -15,7 +15,9 @@ from fastvideo.layers.linear import (ColumnParallelLinear, LinearBase, MergedCol
 from fastvideo.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from fastvideo.utils import get_mixed_precision_state
 
-torch._dynamo.config.recompile_limit = 16
+# Raise, never lower: other modules (e.g. per-block DiT compile) may have
+# already set a higher limit, and import order is arbitrary.
+torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 16)
 
 
 class BaseLayerWithLoRA(nn.Module):
