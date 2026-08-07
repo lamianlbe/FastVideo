@@ -2785,6 +2785,13 @@ class LTXModel(torch.nn.Module):
         return vx, ax
 
 
+# All transformer_blocks share one forward code object, so its dynamo cache
+# collects one entry per distinct input shape (served modes x pipeline
+# stages). Past the limit dynamo silently falls back to eager — raise it
+# well clear of any realistic mode count.
+torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
+
+
 class LTX2Transformer3DModel(BaseDiT):
     """
     LTX-2 transformer using native FastVideo LTX-2 modules.
@@ -2794,6 +2801,15 @@ class LTX2Transformer3DModel(BaseDiT):
     reverse_param_names_mapping = LTX2VideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2VideoConfig().lora_param_names_mapping
     _fsdp_shard_conditions = LTX2VideoConfig()._fsdp_shard_conditions
+    # Regional compilation: compile each transformer block instead of one
+    # whole-model graph. Dynamo's single-threaded trace then covers ONE
+    # block (reused across all 48 via the shared code object) rather than
+    # the fully inlined model, which is what dominates per-shape warmup;
+    # only cross-block fusion is lost. Same convention as the other DiTs
+    # (wanvideo, hunyuan, longcat). Escape hatch for A/B:
+    # FASTVIDEO_LTX2_WHOLE_GRAPH_COMPILE=1 restores the old behavior.
+    if os.getenv("FASTVIDEO_LTX2_WHOLE_GRAPH_COMPILE", "0") != "1":
+        _compile_conditions = LTX2VideoConfig()._compile_conditions
 
     def __init__(self, config: LTX2VideoConfig, hf_config: dict[str, Any]):
         super().__init__(config=config, hf_config=hf_config)
