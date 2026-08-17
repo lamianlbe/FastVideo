@@ -179,8 +179,12 @@ class FlashAttentionBackend(AttentionBackend):
 def _key_padding_mask_from_attn_mask(attn_mask: torch.Tensor, key_len: int) -> torch.Tensor:
     # Normalize attn_mask to [B, key_len] where True means valid token.
     if attn_mask.dim() == 4:
+        if attn_mask.shape[1] != 1 or attn_mask.shape[-2] != 1:
+            raise ValueError("FLASH_ATTN only supports 4D key-padding masks with shape [B, 1, 1, K]")
         attn_mask = attn_mask[:, 0, 0, :]
     elif attn_mask.dim() == 3:
+        if attn_mask.shape[-2] != 1:
+            raise ValueError("FLASH_ATTN only supports 3D key-padding masks with shape [B, 1, K]")
         attn_mask = attn_mask[:, 0, :]
     elif attn_mask.dim() != 2:
         raise ValueError(f"Unsupported attn_mask shape for FLASH_ATTN: {attn_mask.shape}")
@@ -297,6 +301,14 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
             attn_mask = attn_metadata.attn_mask
+            if getattr(attn_metadata, "is_causal", False):
+                return flash_attn_func_compilable(
+                    query,
+                    key,
+                    value,
+                    softmax_scale=self.softmax_scale,
+                    causal=True,
+                )
 
             # flash_attn_no_pad packs q/k/v as one tensor and assumes equal q/k
             # sequence lengths. Cross-attention can violate this.
@@ -325,7 +337,7 @@ class FlashAttentionImpl(AttentionImpl):
                 raise ValueError("Invalid key padding mask length for FLASH_ATTN: "
                                  f"expected at most {qkv.shape[1]}, got {key_padding_mask.shape[-1]}")
             attn_mask_padded = F.pad(key_padding_mask, (qkv.shape[1] - key_padding_mask.shape[-1], 0), value=True)
-            output = flash_attn_no_pad(qkv, attn_mask_padded, causal=False, dropout_p=0, softmax_scale=None)
+            output = flash_attn_no_pad(qkv, attn_mask_padded, causal=self.causal, dropout_p=0, softmax_scale=None)
         elif self._fa4_fp8_active():
             # FP8 wins over the FP4 path when both are enabled for a stage:
             # it quantizes both attention GEMMs (vs QK^T only) at lower

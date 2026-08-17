@@ -65,6 +65,9 @@ class MiniMaxH3Qwen3VLArchConfig(TextEncoderArchConfig):
     num_attention_heads: int = 64
     num_key_value_heads: int = 8
     head_dim: int = 128
+    # H3 text conditioning truncates at 1,024 tokens. The parquet loader reads
+    # the same field when padding stored embeddings and attention masks.
+    text_len: int = 1024
     hidden_act: str = "silu"
     max_position_embeddings: int = 262144
     initializer_range: float = 0.02
@@ -125,10 +128,6 @@ class MiniMaxH3Qwen3VLArchConfig(TextEncoderArchConfig):
         self.mrope_section = (int(section[0]), int(section[1]), int(section[2]))
         if sum(self.mrope_section) * 2 != self.head_dim:
             raise ValueError("MiniMax H3 Qwen3-VL mRoPE sections must cover exactly half of each attention head.")
-        rope_scaling["mrope_interleaved"] = self.mrope_interleaved
-        rope_scaling["mrope_section"] = list(self.mrope_section)
-        rope_scaling.setdefault("rope_type", "default")
-        self.rope_scaling = rope_scaling
 
         if self.vision_out_hidden_size != self.hidden_size:
             raise ValueError("MiniMax H3 Qwen3-VL vision_out_hidden_size must match the language hidden_size "
