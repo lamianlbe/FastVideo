@@ -15,7 +15,7 @@ Example usage:
         --diffusers-version "0.33.0.dev0" \\
         --gemma-path "<PATH_TO_LOCAL_REPO>/google/gemma-3-12b-it"
 
-LTX-2.5 uses separate official component files. Convert that layout with:
+LTX-2.5 uses separate official comfy-style component files. Convert that layout with:
 
     python scripts/checkpoint_conversion/convert_ltx2_weights.py \
         --transformer-source diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
@@ -26,6 +26,36 @@ LTX-2.5 uses separate official component files. Convert that layout with:
         --distilled-lora-source loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
         --variant dev \
         --output converted_weights/ltx2-5-dev
+
+Every ``--*-source`` argument is independent: passing a subset converts (or replaces) just those
+components inside ``--output``, so individual components can be swapped without re-converting the
+rest. Examples:
+
+    # Swap the conv video VAE for the diffusion/HQ one in an existing directory:
+    python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+        --vae-source vae/ltx-2.5-video-vae-bf16.safetensors \
+        --output converted_weights/ltx2-5-dev
+
+    # Swap the dev transformer for the distilled one (also refreshes the connectors
+    # that live inside text_encoder/model.safetensors):
+    python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+        --transformer-source diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
+        --variant distilled \
+        --output converted_weights/ltx2-5-dev
+
+Cross-component notes:
+
+- The transformer file also carries the video/audio embeddings connectors, which belong to
+  ``text_encoder/model.safetensors``; converting the transformer refreshes exactly those keys
+  in-place (or stages them for a later ``--text-encoder-source`` run on a fresh directory).
+- Converting only the text encoder needs the transformer's architecture metadata for the
+  text-encoder config; it is read from an already-converted ``<output>/transformer/config.json``
+  when ``--transformer-source`` is not given in the same run.
+- ``model_index.json`` is (re)written whenever the output directory contains a complete
+  component set, preserving previously recorded refine/variant fields unless overridden.
+
+Only the official ``-bf16`` files are supported; quantized variants (``-comfy-int8-convrot``,
+``-nvfp4``) are rejected with an error.
 
 --vae-source accepts either LTX-2.5 video VAE file; the decoder flavor is detected from the
 checkpoint's safetensors metadata (``config.vae._class_name``):
@@ -44,6 +74,7 @@ import json
 import os
 import re
 import shutil
+import struct
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -112,6 +143,16 @@ DIFFUSION_DECODER_RENAMES: dict[str, str] = {
 
 _DIFFUSION_GATE_SUFFIXES = (".gate_msa", ".gate_mlp", ".gate_ctx")
 
+# Intentionally skipped diffusion-decoder keys (key after the ``decoder.`` strip -> reason).
+# Verified against the real ltx-2.5-video-vae-bf16.safetensors header (2026-08).
+DIFFUSION_DECODER_SKIPPED_KEYS: dict[str, str] = {
+    # Shipped in the released 2.5 HQ checkpoint but consumed by no released decoder:
+    # the official ltx-core NADiffusionDecoder has no such attribute (its non-strict
+    # load ignores the tensor) and the diffusers LTX2VideoDiffusionDecoderModel has
+    # no such parameter either. Dropped explicitly so strict loads stay clean.
+    "type_emb": "training-only type embedding; unused by every released decoder implementation",
+}
+
 # Static AdaLN gates carried by distilled checkpoints are folded into the Linear they gate
 # (W <- g * W, b <- g * b) and dropped: the decoder's residuals are ungated. Post-rename leaf
 # suffix -> sibling gate key suffix (official _GATE_FOLD_TARGETS).
@@ -145,6 +186,7 @@ def convert_diffusion_vae_weights(weights: dict[str, torch.Tensor]) -> OrderedDi
     passthrough), ``decoder.*`` (diffusion decoder), and ``per_channel_statistics.*`` (shared
     latent stats, mirrored under both halves). Per the official loader chain this
     - drops bundled preview heads (``coarse_*``),
+    - drops the documented :data:`DIFFUSION_DECODER_SKIPPED_KEYS` (e.g. ``type_emb``),
     - folds static AdaLN gates into the Linear they gate and drops the gates,
     - renames ``t_embedder.mlp.{0,2}`` to the timestep-embedder Linears,
     - splits fused ``qkv.{weight,bias}`` into ``qkv.to_q`` / ``qkv.to_k`` / ``qkv.to_v``.
@@ -173,6 +215,10 @@ def convert_diffusion_vae_weights(weights: dict[str, torch.Tensor]) -> OrderedDi
             continue
         stripped = key[len("decoder."):]
         if stripped.startswith("coarse_") or ".coarse_" in stripped:
+            continue
+        if stripped in DIFFUSION_DECODER_SKIPPED_KEYS:
+            print(f"Skipping diffusion-VAE key decoder.{stripped}: "
+                  f"{DIFFUSION_DECODER_SKIPPED_KEYS[stripped]}")
             continue
 
         new_key = stripped
@@ -204,6 +250,44 @@ def convert_diffusion_vae_weights(weights: dict[str, torch.Tensor]) -> OrderedDi
         raise ValueError("Diffusion VAE source contained no decoder.diff_blocks.* weights; "
                          "is this really the LTX-2.5 diffusion video VAE?")
     return converted
+
+
+# Official quantized releases this converter refuses (bf16 files only).
+_QUANTIZED_NAME_MARKERS = ("int8", "nvfp4", "fp8")
+_QUANTIZED_HEADER_DTYPES = {"F8_E4M3", "F8_E5M2", "I8"}
+
+
+def _read_safetensors_header_index(path: Path) -> dict[str, dict]:
+    """Read only the safetensors JSON header (tensor name -> {dtype, shape, offsets})."""
+    with path.open("rb") as f:
+        (header_len, ) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return header
+
+
+def _reject_quantized_source(source: Path, flag: str) -> None:
+    """Raise for the official quantized component variants (comfy-int8-convrot / nvfp4).
+
+    Detection is header-only: the filename markers plus any quantized tensor payload
+    (fp8 / int8 anywhere, or uint8 ``*.weight`` — the packed-nvfp4 layout). The packed
+    Gemma text encoder legitimately stores tokenizer assets as uint8 tensors, so plain
+    uint8 non-weight tensors pass.
+    """
+    for shard in _find_shards(source):
+        lowered = shard.name.lower()
+        marker = next((m for m in _QUANTIZED_NAME_MARKERS if m in lowered), None)
+        if marker is None:
+            for key, info in _read_safetensors_header_index(shard).items():
+                dtype = info.get("dtype")
+                if dtype in _QUANTIZED_HEADER_DTYPES or (dtype == "U8" and key.endswith(".weight")):
+                    marker = f"{dtype} tensor {key!r}"
+                    break
+        if marker is not None:
+            raise ValueError(
+                f"{flag}: {shard.name} is a quantized checkpoint ({marker}); quantized sources "
+                "are not supported by this converter. Pass the matching -bf16 file instead "
+                "(quantized deployment happens after conversion, not through it).")
 
 
 def _find_shards(model_path: Path) -> list[Path]:
@@ -393,7 +477,13 @@ def _build_split_text_encoder_config(transformer_config: dict, gemma_config: dic
         "connector_rope_type": transformer_config.get("rope_type", "split"),
         "connector_apply_gated_attention": bool(transformer_config.get("connector_apply_gated_attention", False)),
         "connector_ff_bias": bool(transformer_config.get("connector_ff_bias", True)),
-        "connector_double_precision_rope": transformer_config.get("frequencies_precision") == "float64",
+        # Official metadata carries frequencies_precision; an already-converted
+        # transformer/config.json carries the normalized double_precision_rope.
+        "connector_double_precision_rope": bool(
+            transformer_config.get(
+                "double_precision_rope",
+                transformer_config.get("frequencies_precision") == "float64",
+            )),
     })
     return config
 
@@ -751,48 +841,114 @@ def _source_metadata_config(source_path: Path) -> dict:
     return _read_metadata_config(shards[0])
 
 
-def convert_split_components(
+# text_encoder/model.safetensors is assembled from two sources: the packed Gemma file
+# contributes the aggregate projections, the transformer file contributes the embeddings
+# connectors. These target-key prefixes identify the connector half for in-place swaps.
+_TEXT_CONNECTOR_TARGET_PREFIXES = ("embeddings_connector.", "audio_embeddings_connector.")
+
+
+def _merge_text_encoder_weights(
+    output_dir: Path,
+    new_weights: OrderedDict,
     *,
-    transformer_source: Path,
-    text_encoder_source: Path,
-    vae_source: Path,
-    audio_vae_source: Path,
-    spatial_upscaler_source: Path,
+    replace: str,
+) -> None:
+    """Merge one half of text_encoder/model.safetensors in place.
+
+    ``replace`` is ``"connectors"`` (drop existing connector keys, keep projections)
+    or ``"projections"`` (the inverse); ``new_weights`` supplies the fresh half.
+    This is what lets a transformer swap refresh its connectors without touching a
+    previously converted packed-Gemma projection set, and vice versa.
+    """
+    if replace not in ("connectors", "projections"):
+        raise ValueError(f"Unknown text-encoder merge mode: {replace!r}")
+    target = output_dir / "text_encoder" / "model.safetensors"
+    merged: OrderedDict[str, torch.Tensor] = OrderedDict()
+    if target.exists():
+        for key, tensor in load_file(str(target)).items():
+            is_connector = key.startswith(_TEXT_CONNECTOR_TARGET_PREFIXES)
+            if (replace == "connectors") == is_connector:
+                continue
+            merged[key] = tensor
+    merged.update(new_weights)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    save_file(merged, str(target))
+    print(f"Saved text_encoder weights ({replace} refreshed) to {target}")
+
+
+def _converted_transformer_metadata(output_dir: Path) -> dict | None:
+    """Transformer architecture dict from an already-converted transformer/config.json."""
+    config_path = output_dir / "transformer" / "config.json"
+    if not config_path.exists():
+        return None
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    config.pop("_class_name", None)
+    return config
+
+
+def _convert_split_transformer(
+    source: Path,
     output_dir: Path,
     transformer_class_name: str,
-    variant: str,
-    distilled_lora_source: Path | None = None,
-    emit_diffusers_repo: bool = True,
-    pipeline_class_name: str = "LTX2Pipeline",
-    diffusers_version: str = "0.33.0.dev0",
-) -> None:
-    """Convert the official LTX-2.5 separate-component checkpoint layout.
+) -> dict:
+    """Convert one official transformer file; returns its full metadata config.
 
-    The public LTX-2.5 repository describes these files as independent
-    safetensors. Exact real-weight strict loading remains a post-conversion
-    verification step because the repository is gated; this function keeps all
-    routing explicit so key drift fails visibly rather than being dropped.
+    Also refreshes the connector half of ``text_encoder/model.safetensors`` — the
+    connectors ship inside the transformer file but belong to the text encoder
+    component, so a transformer swap must carry them along.
     """
-    transformer_metadata = _source_metadata_config(transformer_source)
+    transformer_metadata = _source_metadata_config(source)
     full_transformer_config = _metadata_config_for_component(transformer_metadata, "transformer")
     transformer_config = _filter_transformer_config(transformer_metadata)
     if not transformer_config:
         raise ValueError("Transformer source is missing config.transformer metadata.")
     transformer_config["_class_name"] = transformer_class_name
 
-    transformer_shards = _find_shards(transformer_source)
-    transformer_weights, connector_weights = _split_transformer_and_connectors(_load_weights(transformer_shards))
+    transformer_weights, connector_weights = _split_transformer_and_connectors(_load_weights(_find_shards(source)))
     if not transformer_weights:
         raise ValueError("Transformer source did not contain transformer weights.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    projection_weights, gemma_config = _unpack_packed_gemma(text_encoder_source, output_dir)
-    projection_weights.update(connector_weights)
-    if not projection_weights:
-        raise ValueError("Split sources did not contain LTX text projections or connectors.")
-    text_encoder_config = _build_split_text_encoder_config(full_transformer_config, gemma_config)
+    _write_component(output_dir, "transformer", transformer_weights, transformer_config)
+    if connector_weights:
+        _merge_text_encoder_weights(output_dir, connector_weights, replace="connectors")
+        if not (output_dir / "text_encoder" / "config.json").exists():
+            print("text_encoder/ holds only the transformer's connectors so far; also run "
+                  "--text-encoder-source to add the Gemma weights, projections, tokenizer, and config.")
+    return full_transformer_config
 
-    vae_metadata = _source_metadata_config(vae_source)
+
+def _convert_split_text_encoder(
+    source: Path,
+    output_dir: Path,
+    transformer_metadata: dict | None,
+) -> None:
+    """Convert the packed Gemma 4 text encoder file.
+
+    The text-encoder config derives from the transformer architecture metadata:
+    from a ``--transformer-source`` converted in the same run when available,
+    otherwise from the already-converted ``<output>/transformer/config.json``.
+    """
+    if transformer_metadata is None:
+        transformer_metadata = _converted_transformer_metadata(output_dir)
+    if transformer_metadata is None:
+        raise ValueError(
+            "Converting the text encoder requires transformer architecture metadata: pass "
+            "--transformer-source in the same run, or convert the transformer into this "
+            "--output first (text_encoder/config.json derives from transformer/config.json).")
+
+    projection_weights, gemma_config = _unpack_packed_gemma(source, output_dir)
+    if not projection_weights:
+        raise ValueError("Text encoder source did not contain LTX text projections.")
+    text_encoder_config = _build_split_text_encoder_config(transformer_metadata, gemma_config)
+    _merge_text_encoder_weights(output_dir, projection_weights, replace="projections")
+    _write_json(output_dir / "text_encoder" / "config.json", text_encoder_config)
+    print(f"Saved text_encoder config to {output_dir / 'text_encoder' / 'config.json'}")
+
+
+def _convert_split_vae(source: Path, output_dir: Path) -> str:
+    """Convert either LTX-2.5 video VAE file; returns the written vae class name."""
+    vae_metadata = _source_metadata_config(source)
     vae_config = _metadata_config_for_component(vae_metadata, "vae")
     # Metadata-driven decoder selection (mirrors the official is_diffusion_video_vae): the conv
     # VAE declares CausalVideoAutoencoder; anything else is the LTX-2.5 diffusion (HQ) decoder
@@ -800,40 +956,29 @@ def convert_split_components(
     metadata_vae_class = vae_config.get("_class_name", _CONV_VAE_CLASS_NAME)
     if metadata_vae_class == _CONV_VAE_CLASS_NAME:
         vae_class_name = _CONV_VAE_CLASS_NAME
-        vae_weights = _component_weights(vae_source, ("vae.", "model.vae."))
+        vae_weights = _component_weights(source, ("vae.", "model.vae."))
     else:
         if metadata_vae_class != _DIFFUSION_VAE_CLASS_NAME:
             print(f"VAE metadata declares {metadata_vae_class!r}; converting it as the "
                   f"diffusion video VAE ({_DIFFUSION_VAE_CLASS_NAME}).")
         vae_class_name = _DIFFUSION_VAE_CLASS_NAME
-        vae_weights = convert_diffusion_vae_weights(_component_weights(vae_source, ("vae.", "model.vae.")))
-
-    audio_metadata = _source_metadata_config(audio_vae_source)
-    audio_weights, vocoder_weights = _split_audio_vae_source(
-        _load_weights(_find_shards(audio_vae_source)))
-    audio_vae_config = _metadata_config_for_component(audio_metadata, "audio_vae")
-    vocoder_config = _metadata_config_for_component(audio_metadata, "vocoder")
-    if audio_vae_config is audio_metadata or vocoder_config is audio_metadata:
-        raise ValueError("Audio VAE source metadata must contain both config.audio_vae and config.vocoder.")
-
-    upscaler_metadata = _source_metadata_config(spatial_upscaler_source)
-    upscaler_config = dict(upscaler_metadata)
-    upscaler_config["_class_name"] = "LTX2LatentUpsampler"
-    upscaler_weights = _component_weights(
-        spatial_upscaler_source,
-        ("spatial_upscaler.", "spatial_upsampler.", "upsampler.", "model."),
-    )
-    upscaler_weights = OrderedDict((f"upsampler.{key}" if key.split(".", 1)[0].isdigit() else key, value)
-                                    for key, value in upscaler_weights.items())
-
-    _write_component(output_dir, "transformer", transformer_weights, transformer_config)
-    _write_component(output_dir, "text_encoder", projection_weights, text_encoder_config)
+        vae_weights = convert_diffusion_vae_weights(_component_weights(source, ("vae.", "model.vae.")))
     _write_component(
         output_dir,
         "vae",
         vae_weights,
         _wrap_component_config("vae", vae_config, class_name=vae_class_name),
     )
+    return vae_class_name
+
+
+def _convert_split_audio_vae(source: Path, output_dir: Path) -> None:
+    audio_metadata = _source_metadata_config(source)
+    audio_weights, vocoder_weights = _split_audio_vae_source(_load_weights(_find_shards(source)))
+    audio_vae_config = _metadata_config_for_component(audio_metadata, "audio_vae")
+    vocoder_config = _metadata_config_for_component(audio_metadata, "vocoder")
+    if audio_vae_config is audio_metadata or vocoder_config is audio_metadata:
+        raise ValueError("Audio VAE source metadata must contain both config.audio_vae and config.vocoder.")
     _write_component(
         output_dir,
         "audio_vae",
@@ -846,23 +991,158 @@ def convert_split_components(
         vocoder_weights,
         _wrap_component_config("vocoder", vocoder_config, class_name="LTX2Vocoder"),
     )
+
+
+def _convert_split_upscaler(source: Path, output_dir: Path) -> None:
+    upscaler_metadata = _source_metadata_config(source)
+    upscaler_config = dict(upscaler_metadata)
+    if "upsampler" in upscaler_config and isinstance(upscaler_config["upsampler"], dict):
+        # Official upsampler checkpoints nest the architecture under "upsampler";
+        # flatten so the loader-side configurator sees the plain field names.
+        upscaler_config = dict(upscaler_config["upsampler"])
+    upscaler_config["_class_name"] = "LTX2LatentUpsampler"
+    upscaler_weights = _component_weights(
+        source,
+        ("spatial_upscaler.", "spatial_upsampler.", "upsampler.", "model."),
+    )
+    upscaler_weights = OrderedDict((f"upsampler.{key}" if key.split(".", 1)[0].isdigit() else key, value)
+                                   for key, value in upscaler_weights.items())
     _write_component(output_dir, "spatial_upsampler", upscaler_weights, upscaler_config)
 
-    has_distilled_lora = distilled_lora_source is not None
+
+def _convert_split_distilled_lora(source: Path, output_dir: Path) -> None:
+    lora_weights = _component_weights(source, ())
+    lora_dir = output_dir / "distilled_lora"
+    lora_dir.mkdir(parents=True, exist_ok=True)
+    # Preserve source metadata (lora_rank / lora_alpha / model_version) — the runtime
+    # LoRA loader falls back to alpha == rank only when no alpha is recorded anywhere.
+    metadata = {
+        key: value
+        for key, value in _read_safetensors_metadata(_find_shards(source)[0]).items()
+        if key in ("lora_rank", "lora_alpha", "model_version", "license")
+    }
+    output_file = lora_dir / "model.safetensors"
+    save_file(lora_weights, str(output_file), metadata=metadata or None)
+    print(f"Saved distilled_lora weights to {output_file}")
+
+
+_SPLIT_INDEX_REQUIRED_DIRS = (
+    "transformer",
+    "text_encoder",
+    "vae",
+    "audio_vae",
+    "vocoder",
+    "spatial_upsampler",
+)
+
+
+def _refresh_split_model_index(
+    output_dir: Path,
+    *,
+    transformer_class_name: str,
+    pipeline_class_name: str,
+    diffusers_version: str,
+    variant: str | None,
+) -> None:
+    """(Re)write model_index.json from the output directory's current contents.
+
+    Runs after every split conversion, so swapping a single component keeps the
+    index consistent (e.g. the vae class after a conv <-> HQ swap). Fields not
+    derivable from the directory (variant) fall back to the existing index, so
+    partial re-runs don't silently reset refine defaults.
+    """
+    missing = [
+        name for name in _SPLIT_INDEX_REQUIRED_DIRS if not (output_dir / name / "config.json").exists()
+    ]
+    if missing:
+        print("Skipping model_index.json; convert the remaining components first: " + ", ".join(missing))
+        return
+
+    existing: dict = {}
+    model_index_path = output_dir / "model_index.json"
+    if model_index_path.exists():
+        with model_index_path.open("r", encoding="utf-8") as f:
+            existing = json.load(f)
+
+    if variant is None:
+        recorded = str(existing.get("fastvideo_ltx2_variant", ""))
+        variant = recorded.removeprefix("ltx2.5-") if recorded.startswith("ltx2.5-") else "dev"
+
+    with (output_dir / "vae" / "config.json").open("r", encoding="utf-8") as f:
+        vae_class_name = json.load(f).get("_class_name", _CONV_VAE_CLASS_NAME)
+
+    model_index = _build_split_model_index(
+        transformer_class_name=transformer_class_name,
+        pipeline_class_name=pipeline_class_name,
+        diffusers_version=diffusers_version,
+        variant=variant,
+        distilled_lora=(output_dir / "distilled_lora" / "model.safetensors").exists(),
+        vae_class_name=vae_class_name,
+    )
+    _write_model_index(output_dir, model_index)
+
+
+def convert_split_components(
+    *,
+    output_dir: Path,
+    transformer_source: Path | None = None,
+    text_encoder_source: Path | None = None,
+    vae_source: Path | None = None,
+    audio_vae_source: Path | None = None,
+    spatial_upscaler_source: Path | None = None,
+    distilled_lora_source: Path | None = None,
+    transformer_class_name: str = "LTX2Transformer3DModel",
+    variant: str | None = None,
+    emit_diffusers_repo: bool = True,
+    pipeline_class_name: str = "LTX2Pipeline",
+    diffusers_version: str = "0.33.0.dev0",
+) -> None:
+    """Convert the official LTX-2.5 separate-component (comfy-style) checkpoint layout.
+
+    Every source is optional and converted independently into ``output_dir``, so
+    components can be swapped one at a time (e.g. conv vs HQ video VAE, dev vs
+    distilled transformer) without re-converting the rest. All routing is explicit
+    so key drift fails visibly rather than being dropped. Quantized official
+    variants are rejected — bf16 files only.
+    """
+    sources = {
+        "--transformer-source": transformer_source,
+        "--text-encoder-source": text_encoder_source,
+        "--vae-source": vae_source,
+        "--audio-vae-source": audio_vae_source,
+        "--spatial-upscaler-source": spatial_upscaler_source,
+        "--distilled-lora-source": distilled_lora_source,
+    }
+    if not any(source is not None for source in sources.values()):
+        raise ValueError("LTX-2.5 split conversion needs at least one --*-source argument.")
+    for flag, source in sources.items():
+        if source is not None:
+            _reject_quantized_source(source, flag)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    transformer_metadata: dict | None = None
+    if transformer_source is not None:
+        transformer_metadata = _convert_split_transformer(transformer_source, output_dir, transformer_class_name)
+    if text_encoder_source is not None:
+        _convert_split_text_encoder(text_encoder_source, output_dir, transformer_metadata)
+    if vae_source is not None:
+        _convert_split_vae(vae_source, output_dir)
+    if audio_vae_source is not None:
+        _convert_split_audio_vae(audio_vae_source, output_dir)
+    if spatial_upscaler_source is not None:
+        _convert_split_upscaler(spatial_upscaler_source, output_dir)
     if distilled_lora_source is not None:
-        lora_weights = _component_weights(distilled_lora_source, ())
-        _write_component(output_dir, "distilled_lora", lora_weights, config=None)
+        _convert_split_distilled_lora(distilled_lora_source, output_dir)
 
     if emit_diffusers_repo:
-        model_index = _build_split_model_index(
+        _refresh_split_model_index(
+            output_dir,
             transformer_class_name=transformer_class_name,
             pipeline_class_name=pipeline_class_name,
             diffusers_version=diffusers_version,
             variant=variant,
-            distilled_lora=has_distilled_lora,
-            vae_class_name=vae_class_name,
         )
-        _write_model_index(output_dir, model_index)
 
 
 def update_transformer_config(config_path: Path, class_name: str) -> None:
@@ -993,25 +1273,25 @@ def main() -> None:
     parser.add_argument(
         "--distilled-lora-source",
         type=str,
-        help="Optional LTX-2.5 distilled LoRA safetensors used for dev stage-2 refinement.",
+        help="LTX-2.5 distilled LoRA safetensors (two-stage refine / distilled-recipe adapter).",
     )
     parser.add_argument(
         "--variant",
         choices=("dev", "distilled"),
-        default="dev",
-        help="LTX-2.5 split transformer variant; controls bundled refine defaults.",
+        default=None,
+        help=("LTX-2.5 split transformer variant; controls bundled refine defaults. When omitted "
+              "on a partial re-run, the existing model_index.json's recorded variant is kept "
+              "(fresh directories default to dev)."),
     )
 
     args = parser.parse_args()
 
     split_values = {name: getattr(args, name) for name in SPLIT_SOURCE_ARGUMENTS}
+    split_values["distilled_lora_source"] = args.distilled_lora_source
     split_mode = any(value is not None for value in split_values.values())
-    if args.distilled_lora_source is not None and not split_mode:
-        raise ValueError("--distilled-lora-source is only valid with the LTX-2.5 split source arguments.")
     if split_mode:
-        missing = [f"--{name.replace('_', '-')}" for name, value in split_values.items() if value is None]
-        if missing:
-            raise ValueError("LTX-2.5 split conversion requires: " + ", ".join(missing))
+        # Each LTX-2.5 split source converts independently; pass any subset to
+        # swap just those components inside --output.
         incompatible = []
         if args.source:
             incompatible.append("--source")
@@ -1028,13 +1308,13 @@ def main() -> None:
         if incompatible:
             raise ValueError("LTX-2.5 split source arguments cannot be combined with " + ", ".join(incompatible))
         convert_split_components(
-            transformer_source=Path(args.transformer_source),
-            text_encoder_source=Path(args.text_encoder_source),
-            vae_source=Path(args.vae_source),
-            audio_vae_source=Path(args.audio_vae_source),
-            spatial_upscaler_source=Path(args.spatial_upscaler_source),
-            distilled_lora_source=(Path(args.distilled_lora_source) if args.distilled_lora_source else None),
             output_dir=Path(args.output),
+            transformer_source=(Path(args.transformer_source) if args.transformer_source else None),
+            text_encoder_source=(Path(args.text_encoder_source) if args.text_encoder_source else None),
+            vae_source=(Path(args.vae_source) if args.vae_source else None),
+            audio_vae_source=(Path(args.audio_vae_source) if args.audio_vae_source else None),
+            spatial_upscaler_source=(Path(args.spatial_upscaler_source) if args.spatial_upscaler_source else None),
+            distilled_lora_source=(Path(args.distilled_lora_source) if args.distilled_lora_source else None),
             transformer_class_name=args.class_name,
             variant=args.variant,
             emit_diffusers_repo=args.diffusers_repo,

@@ -397,3 +397,186 @@ def test_legacy_monolithic_conversion_behavior_is_preserved(tmp_path: Path) -> N
     assert config["use_keyframes_abs_pos_embedding"] is False
     assert config["double_precision_rope"] is True
     assert (output / "model_index.json").is_file()
+
+
+def _tiny_diffusion_vae_source(tmp_path: Path) -> Path:
+    """Minimal HQ (diffusion) video-VAE source: enough decoder structure to convert."""
+    source = tmp_path / "vae_hq.safetensors"
+    _save(
+        source,
+        {
+            "encoder.conv.weight": torch.ones(1),
+            "per_channel_statistics.mean-of-means": torch.zeros(4),
+            "per_channel_statistics.std-of-means": torch.ones(4),
+            "decoder.conv_in.weight": torch.ones(8, 4),
+            "decoder.diff_blocks.0.attn.qkv.weight": torch.ones(12, 4),
+            "decoder.diff_blocks.0.scale_shift_table": torch.ones(7, 4),
+            "decoder.t_embedder.mlp.0.weight": torch.ones(8, 4),
+        },
+        config={
+            "vae": {
+                "_class_name": "CausalDiffusionVAE",
+                "model_output_type": "x0",
+                "decoder": {"stage_channels": [8, 4, 4, 4, 4]},
+                "encoder": {"blocks": []},
+            }
+        },
+    )
+    return source
+
+
+def test_split_component_swap_updates_only_that_component(tmp_path: Path) -> None:
+    """Re-running with a single --*-source swaps just that component and refreshes model_index."""
+    sources = _split_sources(tmp_path)
+    output = tmp_path / "converted_swap"
+    converter.convert_split_components(
+        transformer_source=sources["transformer"],
+        text_encoder_source=sources["text_encoder"],
+        vae_source=sources["vae"],
+        audio_vae_source=sources["audio_vae"],
+        spatial_upscaler_source=sources["spatial_upscaler"],
+        distilled_lora_source=sources["distilled_lora"],
+        output_dir=output,
+        transformer_class_name="LTX2Transformer3DModel",
+        variant="distilled",
+    )
+    model_index = json.loads((output / "model_index.json").read_text())
+    assert model_index["vae"] == ["diffusers", "CausalVideoAutoencoder"]
+    assert model_index["fastvideo_ltx2_variant"] == "ltx2.5-distilled"
+    text_before = load_file(str(output / "text_encoder" / "model.safetensors"))
+
+    # Swap only the video VAE for the diffusion/HQ one; no --variant repassed.
+    converter.convert_split_components(
+        vae_source=_tiny_diffusion_vae_source(tmp_path),
+        output_dir=output,
+    )
+    vae_config = json.loads((output / "vae" / "config.json").read_text())
+    assert vae_config["_class_name"] == "CausalDiffusionVAE"
+    vae_weights = load_file(str(output / "vae" / "model.safetensors"))
+    assert "decoder.diff_blocks.0.attn.qkv.to_q.weight" in vae_weights
+    assert "encoder.per_channel_statistics.mean-of-means" in vae_weights
+    model_index = json.loads((output / "model_index.json").read_text())
+    assert model_index["vae"] == ["diffusers", "CausalDiffusionVAE"]
+    # Fields not derivable from the swap survive from the previous index.
+    assert model_index["fastvideo_ltx2_variant"] == "ltx2.5-distilled"
+    assert model_index["fastvideo_refine_lora_path"] == "distilled_lora/model.safetensors"
+    # Untouched components stay byte-identical in key surface.
+    assert set(load_file(str(output / "text_encoder" / "model.safetensors"))) == set(text_before)
+
+
+def test_split_transformer_swap_refreshes_connectors(tmp_path: Path) -> None:
+    """A transformer-only re-run rewrites the connector half of text_encoder weights."""
+    sources = _split_sources(tmp_path)
+    output = tmp_path / "converted_tswap"
+    converter.convert_split_components(
+        transformer_source=sources["transformer"],
+        text_encoder_source=sources["text_encoder"],
+        vae_source=sources["vae"],
+        audio_vae_source=sources["audio_vae"],
+        spatial_upscaler_source=sources["spatial_upscaler"],
+        output_dir=output,
+        transformer_class_name="LTX2Transformer3DModel",
+        variant="dev",
+    )
+
+    # Second transformer with different connector values (the "distilled" swap).
+    swapped = tmp_path / "transformer_swapped.safetensors"
+    original_config = json.loads(
+        converter._read_safetensors_metadata(sources["transformer"])["config"])
+    _save(
+        swapped,
+        {
+            "model.diffusion_model.transformer_blocks.0.ff.net.0.proj.weight": torch.full((2, 2), 5.0),
+            "model.diffusion_model.video_embeddings_connector.transformer_1d_blocks.0.weight": torch.full((1,), 5.0),
+            "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.0.weight": torch.full((1,), 5.0),
+        },
+        config=original_config,
+    )
+    converter.convert_split_components(
+        transformer_source=swapped,
+        output_dir=output,
+        transformer_class_name="LTX2Transformer3DModel",
+    )
+
+    text_weights = load_file(str(output / "text_encoder" / "model.safetensors"))
+    assert torch.equal(
+        text_weights["embeddings_connector.transformer_1d_blocks.0.weight"], torch.full((1,), 5.0))
+    # Projections from the packed Gemma pass survive the transformer swap.
+    assert "video_feature_extractor_linear.weight" in text_weights
+    transformer_weights = load_file(str(output / "transformer" / "model.safetensors"))
+    assert torch.equal(
+        transformer_weights["transformer_blocks.0.ff.net.0.proj.weight"], torch.full((2, 2), 5.0))
+
+
+def test_split_text_encoder_alone_uses_converted_transformer_config(tmp_path: Path) -> None:
+    """Text-encoder-only conversion derives its config from <output>/transformer/config.json."""
+    sources = _split_sources(tmp_path)
+    output = tmp_path / "converted_te"
+
+    # Text encoder without any transformer context must fail loudly.
+    try:
+        converter.convert_split_components(
+            text_encoder_source=sources["text_encoder"],
+            output_dir=tmp_path / "converted_te_missing",
+        )
+    except ValueError as exc:
+        assert "transformer" in str(exc)
+    else:
+        raise AssertionError("text-encoder-only conversion without transformer metadata must fail")
+
+    converter.convert_split_components(
+        transformer_source=sources["transformer"],
+        output_dir=output,
+        transformer_class_name="LTX2Transformer3DModel",
+    )
+    # Transformer-only pass: connectors staged, no config yet, no model_index.
+    staged = load_file(str(output / "text_encoder" / "model.safetensors"))
+    assert set(staged) == {
+        "embeddings_connector.transformer_1d_blocks.0.weight",
+        "audio_embeddings_connector.transformer_1d_blocks.0.weight",
+    }
+    assert not (output / "text_encoder" / "config.json").exists()
+    assert not (output / "model_index.json").exists()
+
+    converter.convert_split_components(
+        text_encoder_source=sources["text_encoder"],
+        output_dir=output,
+    )
+    text_config = json.loads((output / "text_encoder" / "config.json").read_text())
+    # Derived through transformer/config.json (double_precision_rope normalization).
+    assert text_config["connector_double_precision_rope"] is True
+    assert text_config["connector_ff_bias"] is False
+    assert text_config["video_feature_extractor_out_features"] == 8
+    merged = load_file(str(output / "text_encoder" / "model.safetensors"))
+    assert "embeddings_connector.transformer_1d_blocks.0.weight" in merged
+    assert "video_feature_extractor_linear.weight" in merged
+
+
+def test_split_conversion_rejects_quantized_sources(tmp_path: Path) -> None:
+    """int8-convrot / nvfp4 official variants are refused with a clear error."""
+    # Filename marker.
+    marked = tmp_path / "ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors"
+    _save(marked, {"model.diffusion_model.x.weight": torch.ones(1)},
+          config={"transformer": {"num_attention_heads": 2}})
+    try:
+        converter.convert_split_components(transformer_source=marked, output_dir=tmp_path / "q1")
+    except ValueError as exc:
+        assert "quantized" in str(exc)
+    else:
+        raise AssertionError("int8-convrot filename must be rejected")
+
+    # Quantized payload dtype without a filename marker.
+    payload = tmp_path / "mystery-transformer.safetensors"
+    _save(payload, {"model.diffusion_model.x.weight": torch.ones(2, 2).to(torch.float8_e4m3fn)},
+          config={"transformer": {"num_attention_heads": 2}})
+    try:
+        converter.convert_split_components(transformer_source=payload, output_dir=tmp_path / "q2")
+    except ValueError as exc:
+        assert "quantized" in str(exc)
+    else:
+        raise AssertionError("fp8 payload must be rejected")
+
+    # uint8 non-weight tensors (packed tokenizer assets) are NOT quantization.
+    ok = tmp_path / "text-pack.safetensors"
+    _save(ok, {"tokenizer_json": _uint8("{}")}, metadata={"gemma_config": "{}"})
+    converter._reject_quantized_source(ok, "--text-encoder-source")

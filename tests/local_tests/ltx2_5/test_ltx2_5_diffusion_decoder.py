@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -277,6 +278,9 @@ def _official_state_dict_from(decoder: "dd.LTX2DiffusionVideoDecoder") -> tuple[
 
     official["decoder.coarse_head.weight"] = torch.randn(4, 4)
     official["decoder.diff_blocks.0.coarse_proj.weight"] = torch.randn(4, 4)
+    # Training-only type embedding shipped by the real 2.5 HQ checkpoint; no released
+    # decoder consumes it and the converter drops it explicitly.
+    official["decoder.type_emb"] = torch.randn(8)
     return official, gates
 
 
@@ -330,9 +334,41 @@ def test_conversion_key_names_and_shapes_round_trip() -> None:
     assert torch.equal(decoder_sd["diff_blocks.0.attn.qkv.to_k.weight"], fused[chunk:2 * chunk])
     assert torch.equal(decoder_sd["diff_blocks.0.attn.qkv.to_v.weight"], fused[2 * chunk:])
 
-    # Bundled preview heads are dropped.
+    # Bundled preview heads, gates, and documented skipped keys are dropped.
     assert not any("coarse" in key for key in converted)
     assert not any(key.endswith(("gate_msa", "gate_mlp", "gate_ctx")) for key in converted)
+    assert not any(key.endswith("type_emb") for key in converted)
+
+
+def test_cuda_backend_requires_natten() -> None:
+    """On CUDA without natten the resolver raises instead of silently degrading;
+    explicit env overrides and non-CUDA devices keep their fallbacks."""
+    saved_available = dd._NATTEN_AVAILABLE
+    saved_env = os.environ.pop("FASTVIDEO_LTX2_NA_BACKEND", None)
+    try:
+        dd._NATTEN_AVAILABLE = False
+        try:
+            dd._resolve_na3d_backend("cuda")
+        except ImportError as exc:
+            assert "natten" in str(exc)
+            assert "FASTVIDEO_LTX2_NA_BACKEND" in str(exc)
+        else:
+            raise AssertionError("CUDA without natten must raise ImportError")
+        # CPU keeps the eager fallback (this is what lets these tests run).
+        assert dd._resolve_na3d_backend("cpu") == "eager"
+        # An explicit eager override is honored even on CUDA.
+        os.environ["FASTVIDEO_LTX2_NA_BACKEND"] = "eager"
+        assert dd._resolve_na3d_backend("cuda") == "eager"
+        # natten present again: CUDA resolves to natten.
+        dd._NATTEN_AVAILABLE = True
+        os.environ.pop("FASTVIDEO_LTX2_NA_BACKEND", None)
+        assert dd._resolve_na3d_backend("cuda") == "natten"
+    finally:
+        dd._NATTEN_AVAILABLE = saved_available
+        if saved_env is None:
+            os.environ.pop("FASTVIDEO_LTX2_NA_BACKEND", None)
+        else:
+            os.environ["FASTVIDEO_LTX2_NA_BACKEND"] = saved_env
 
 
 def test_wrapper_encode_decode_with_conv_encoder() -> None:
@@ -371,6 +407,7 @@ ALL_TESTS = [
     test_min_latent_floor_pads_and_crops,
     test_configurator_reads_nested_checkpoint_config,
     test_conversion_key_names_and_shapes_round_trip,
+    test_cuda_backend_requires_natten,
     test_wrapper_encode_decode_with_conv_encoder,
 ]
 
