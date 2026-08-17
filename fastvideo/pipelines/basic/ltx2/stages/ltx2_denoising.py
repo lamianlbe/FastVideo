@@ -340,62 +340,6 @@ def repin_conditioned_latents(
     return (latents * mask + ideal.to(latents.dtype) * (1.0 - mask)).to(latents.dtype)
 
 
-def parse_block_range(spec: str, num_blocks: int) -> list[int]:
-    """Parse "36-47" / "10,12,14" style block filters (comfy semantics:
-    inclusive ranges, clamped to [0, num_blocks - 1])."""
-    blocks: set[int] = set()
-    for part in str(spec).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            lo_s, _, hi_s = part.partition("-")
-            lo, hi = int(lo_s), int(hi_s)
-        else:
-            lo = hi = int(part)
-        lo = max(0, lo)
-        hi = min(num_blocks - 1, hi)
-        blocks.update(range(lo, hi + 1))
-    if not blocks:
-        raise ValueError(f"Block filter {spec!r} selects no blocks (num_blocks={num_blocks})")
-    return sorted(blocks)
-
-
-def build_text_amp_weight(
-    *,
-    scale: float,
-    spatial_focus: float,
-    frames: int,
-    height_tokens: int,
-    width_tokens: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Per-token amplification weight for the text cross-attention output
-    (port of the ComfyUI LTXTextAttentionAmplifier math).
-
-    Returns ``[1, frames * H * W, 1]``. ``spatial_focus <= 0`` -> uniform
-    ``scale``; otherwise ``1 + (scale - 1) * g`` with ``g`` a min-max
-    normalized center Gaussian over the (H, W) grid (sigma =
-    ``max(0.3, 1 - 0.7 * focus) * min(H, W)``), identical for every frame.
-    """
-    hw = height_tokens * width_tokens
-    if spatial_focus <= 0.0:
-        grid = torch.full((hw, ), float(scale), device=device, dtype=torch.float32)
-    else:
-        sigma_g = max(0.3, 1.0 - 0.7 * float(spatial_focus)) * min(height_tokens, width_tokens)
-        cy = (height_tokens - 1) / 2.0
-        cx = (width_tokens - 1) / 2.0
-        dy = torch.arange(height_tokens, dtype=torch.float32, device=device) - cy
-        dx = torch.arange(width_tokens, dtype=torch.float32, device=device) - cx
-        dist_sq = dy.unsqueeze(1).pow(2) + dx.unsqueeze(0).pow(2)
-        gaussian = torch.exp(-dist_sq / (2.0 * sigma_g * sigma_g))
-        gaussian = (gaussian - gaussian.min()) / (gaussian.max() - gaussian.min() + 1e-6)
-        grid = (1.0 + (float(scale) - 1.0) * gaussian).reshape(hw)
-    weight = grid.repeat(frames).reshape(1, frames * hw, 1)
-    return weight.to(dtype=dtype)
-
-
 def _ltx2_euler_ancestral_step(
     sample: torch.Tensor,
     denoised_sample: torch.Tensor,
@@ -832,79 +776,6 @@ class LTX2DenoisingStage(PipelineStage):
             logger.info("[LTX2] Reference token conditioning active (%s, mode=%s)", ref_key,
                         fastvideo_args.ltx2_reference_position_mode)
 
-        # Text cross-attention amplification (LTXTextAttentionAmplifier port).
-        stage_name = "refine" if self.sigmas_override is not None else "base"
-        num_blocks = int(
-            getattr(self.transformer, "num_layers", None)
-            or len(getattr(getattr(self.transformer, "model", None), "transformer_blocks", [])) or 48)
-        amp_scale = float(fastvideo_args.ltx2_text_amp_scale)
-        if amp_scale != 1.0 and fastvideo_args.ltx2_text_amp_stage in (stage_name, "both"):
-            amp_blocks = parse_block_range(fastvideo_args.ltx2_text_amp_blocks, num_blocks)
-            amp_weight = build_text_amp_weight(
-                scale=amp_scale,
-                spatial_focus=float(fastvideo_args.ltx2_text_amp_spatial_focus),
-                frames=int(latents.shape[2]),
-                height_tokens=int(latents.shape[3]),
-                width_tokens=int(latents.shape[4]),
-                device=latents.device,
-                dtype=target_dtype,
-            )
-            extra_transformer_kwargs["text_amp_weight"] = amp_weight
-            extra_transformer_kwargs["text_amp_blocks"] = amp_blocks
-            logger.info("[LTX2] Text attention amplification x%.2f on blocks %s (%s stage, focus=%.2f)", amp_scale,
-                        amp_blocks, stage_name, fastvideo_args.ltx2_text_amp_spatial_focus)
-
-        # Latent anchor identity stabilizer (LTXLatentAnchorAware port),
-        # stage-1 only. Compile-safe: the snapshot cache is a preallocated
-        # tensor buffer with torch.where capture/use flags (see ltx2_anchor).
-        anchor_ctx = None
-        if fastvideo_args.ltx2_anchor_strength > 0.0 and self.sigmas_override is None:
-            from fastvideo.models.dits.ltx2_anchor import (
-                LatentAnchorContext,
-                resample_energy_map,
-            )
-            energy = batch.extra.get("ltx2_anchor_energy_map")
-            if isinstance(energy, torch.Tensor):
-                energy = resample_energy_map(
-                    energy.to(device=latents.device, dtype=torch.float32),
-                    int(latents.shape[3]),
-                    int(latents.shape[4]),
-                )
-            anchor_blocks = parse_block_range(fastvideo_args.ltx2_anchor_blocks, num_blocks)
-            anchor_ctx = LatentAnchorContext(
-                strength=float(fastvideo_args.ltx2_anchor_strength),
-                blocks=anchor_blocks,
-                frames=int(latents.shape[2]),
-                height_tokens=int(latents.shape[3]),
-                width_tokens=int(latents.shape[4]),
-                similarity_threshold=float(fastvideo_args.ltx2_anchor_similarity_threshold),
-                decay_with_distance=float(fastvideo_args.ltx2_anchor_decay_with_distance),
-                energy_threshold=float(fastvideo_args.ltx2_anchor_energy_threshold),
-                anchor_frame=int(fastvideo_args.ltx2_anchor_frame),
-                energy_grid=energy if isinstance(energy, torch.Tensor) else None,
-            )
-            # Preallocate the snapshot buffers here (outside the compiled
-            # forward) so per-step captures are functionalized in-place
-            # writes rather than a Python-dict mutation.
-            dit_cfg = fastvideo_args.pipeline_config.dit_config
-            anchor_dim = int(dit_cfg.num_attention_heads) * int(dit_cfg.attention_head_dim)
-            anchor_k = int(latents.shape[3]) * int(latents.shape[4])
-            anchor_ctx.slot_of = {b: i for i, b in enumerate(anchor_blocks)}
-            anchor_ctx.anchor_buf = torch.zeros(len(anchor_blocks),
-                                                anchor_k,
-                                                anchor_dim,
-                                                dtype=torch.float32,
-                                                device=latents.device)
-            anchor_ctx.anchor_mean_buf = torch.zeros(len(anchor_blocks),
-                                                     1,
-                                                     anchor_dim,
-                                                     dtype=torch.float32,
-                                                     device=latents.device)
-            extra_transformer_kwargs["latent_anchor"] = anchor_ctx
-            logger.info("[LTX2] Latent anchor active: strength=%.3f blocks=%s cache_at_step=%d energy=%s",
-                        anchor_ctx.strength, anchor_ctx.blocks, fastvideo_args.ltx2_anchor_cache_at_step,
-                        "on" if anchor_ctx.energy_grid is not None else "off")
-
         # Fresh-noise generator for the ancestral samplers. Seeded with an
         # offset so the ancestral draws don't replay the initial-latent
         # noise stream.
@@ -970,13 +841,6 @@ class LTX2DenoisingStage(PipelineStage):
             # so skip the pure-CFG++ uncond forward on that step. Deterministic
             # forward only: RNG draw order and outputs are unchanged.
             step_need_uncond = need_uncond and float(sigma) < 1.0
-            if anchor_ctx is not None:
-                # Capture the anchor snapshot at the cache step; use the
-                # frozen buffer on later steps. 0-d bool tensors so the
-                # block forward selects with torch.where (compile-safe).
-                cache_step = int(fastvideo_args.ltx2_anchor_cache_at_step)
-                anchor_ctx.capture = torch.tensor(step_index == cache_step, dtype=torch.bool, device=latents.device)
-                anchor_ctx.use_cache = torch.tensor(step_index > cache_step, dtype=torch.bool, device=latents.device)
             # Per-sample sigma for LTX-2.3 cross-attention AdaLN prompt
             # timestep. Ignored by LTX-2.0 (prompt_adaln is None).
             sigma_batch = sigma.reshape(1).expand(latents.shape[0])

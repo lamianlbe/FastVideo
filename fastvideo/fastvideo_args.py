@@ -256,27 +256,6 @@ class FastVideoArgs:
     # with batch.ltx2_rescale_scale=1.0 for the std-rescale the guider
     # applies on CFG steps. None = the scalar guidance_scale behavior.
     ltx2_stage1_cfg_values: list[float] | None = None
-    # Text cross-attention output amplification (port of the ComfyUI
-    # LTXTextAttentionAmplifier node): multiplies the video attn2 output in
-    # the selected blocks by ``1 + (scale - 1) * w`` where ``w`` is a
-    # center-weighted normalized Gaussian over the (H, W) token grid
-    # (``spatial_focus <= 0`` makes it uniform). 1.0 = disabled.
-    ltx2_text_amp_scale: float = 1.0
-    ltx2_text_amp_blocks: str = "36-47"
-    ltx2_text_amp_spatial_focus: float = 0.0
-    ltx2_text_amp_stage: str = "refine"  # base | refine | both
-    # Latent anchor identity stabilizer (port of the ComfyUI 10s-nodes
-    # LTXLatentAnchorAware; see fastvideo/models/dits/ltx2_anchor.py).
-    # Applied in stage 1 only; eager-only (rejected with torch.compile).
-    # cache_at_step is the sampling-step index at which the per-block anchor
-    # snapshot locks (the ComfyUI workflow's call-counting locks at step 2).
-    ltx2_anchor_strength: float = 0.0  # 0 = disabled
-    ltx2_anchor_blocks: str = "10-30"
-    ltx2_anchor_cache_at_step: int = 2
-    ltx2_anchor_similarity_threshold: float = 0.5
-    ltx2_anchor_decay_with_distance: float = 0.15
-    ltx2_anchor_energy_threshold: float = 0.3
-    ltx2_anchor_frame: int = 0
     # Reference token conditioning (port of the ComfyUI 10s-nodes
     # LTXReferenceEnable/Conditioning mechanism): the reference image is
     # VAE-encoded and prepended to the video token sequence as a clean
@@ -401,17 +380,6 @@ class FastVideoArgs:
             if any(v < 1.0 for v in vals):
                 raise ValueError(f"ltx2_stage1_cfg_values entries must be >= 1.0, got {vals}")
             self.ltx2_stage1_cfg_values = vals
-
-        if self.ltx2_anchor_strength < 0.0:
-            raise ValueError(f"ltx2_anchor_strength must be >= 0, got {self.ltx2_anchor_strength}")
-        if self.ltx2_anchor_strength > 0.0 and self.ltx2_anchor_cache_at_step < 0:
-            raise ValueError("ltx2_anchor_cache_at_step must be >= 0")
-
-        if self.ltx2_text_amp_stage not in ("base", "refine", "both"):
-            raise ValueError("ltx2_text_amp_stage must be 'base', 'refine' or 'both', "
-                             f"got {self.ltx2_text_amp_stage!r}")
-        if self.ltx2_text_amp_scale <= 0.0:
-            raise ValueError(f"ltx2_text_amp_scale must be > 0, got {self.ltx2_text_amp_scale}")
 
         # euler_ancestral_cfg_pp is valid in BOTH stages: the step function handles
         # the sigma == 1.0 first step of stage-1 schedules via ComfyUI's exact
