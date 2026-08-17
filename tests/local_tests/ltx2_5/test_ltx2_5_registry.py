@@ -39,19 +39,25 @@ def test_legacy_ltx_distilled_remains_deterministic() -> None:
     assert sampling.ltx2_image_crf == 33.0
 
 
-def test_ltx2_5_metadata_variant_selects_preset(tmp_path) -> None:
-    """Local directories with fastvideo_ltx2_variant metadata route to the correct preset."""
+def _write_minimal_model_dir(model_dir, variant: str) -> None:
+    """A local dir that passes model-directory verification with variant metadata."""
     import json
-    from pathlib import Path
 
-    # Create a local directory with LTX2Pipeline _class_name and distilled variant metadata
-    distilled_dir = tmp_path / "ltx2_5_distilled_local"
-    distilled_dir.mkdir()
+    model_dir.mkdir()
+    (model_dir / "transformer").mkdir()
     model_index = {
         "_class_name": "LTX2Pipeline",
-        "fastvideo_ltx2_variant": "ltx2.5-distilled",
+        "_diffusers_version": "0.33.0.dev0",
+        "fastvideo_ltx2_variant": variant,
     }
-    (distilled_dir / "model_index.json").write_text(json.dumps(model_index))
+    (model_dir / "model_index.json").write_text(json.dumps(model_index))
+
+
+def test_ltx2_5_metadata_variant_selects_preset(tmp_path) -> None:
+    """Local directories with fastvideo_ltx2_variant metadata route to the correct preset."""
+    # Create a local directory with LTX2Pipeline _class_name and distilled variant metadata
+    distilled_dir = tmp_path / "ltx2_5_distilled_local"
+    _write_minimal_model_dir(distilled_dir, "ltx2.5-distilled")
 
     preset, family = get_preset_selection(str(distilled_dir))
     assert preset == "ltx2_5_distilled_two_stage"
@@ -59,12 +65,7 @@ def test_ltx2_5_metadata_variant_selects_preset(tmp_path) -> None:
 
     # Create a local directory with LTX2Pipeline _class_name and dev variant metadata
     dev_dir = tmp_path / "ltx2_5_dev_local"
-    dev_dir.mkdir()
-    model_index = {
-        "_class_name": "LTX2Pipeline",
-        "fastvideo_ltx2_variant": "ltx2.5-dev",
-    }
-    (dev_dir / "model_index.json").write_text(json.dumps(model_index))
+    _write_minimal_model_dir(dev_dir, "ltx2.5-dev")
 
     preset, family = get_preset_selection(str(dev_dir))
     assert preset == "ltx2_5_dev"
@@ -73,16 +74,9 @@ def test_ltx2_5_metadata_variant_selects_preset(tmp_path) -> None:
 
 def test_ltx2_5_neutral_path_with_class_name_routes_correctly(tmp_path) -> None:
     """Neutral local paths with _class_name=LTX2Pipeline and variant metadata route correctly."""
-    import json
-
     # A path with no ltx-2.5 tokens but LTX2Pipeline class and distilled variant
     neutral_dir = tmp_path / "my_converted_checkpoint"
-    neutral_dir.mkdir()
-    model_index = {
-        "_class_name": "LTX2Pipeline",
-        "fastvideo_ltx2_variant": "ltx2.5-distilled",
-    }
-    (neutral_dir / "model_index.json").write_text(json.dumps(model_index))
+    _write_minimal_model_dir(neutral_dir, "ltx2.5-distilled")
 
     preset, family = get_preset_selection(str(neutral_dir))
     assert preset == "ltx2_5_distilled_two_stage"

@@ -326,6 +326,7 @@ def test_ltx2_typed_surface_preflight() -> None:
         "ltx2_5_dev",
         "ltx2_5_distilled",
         "ltx2_5_distilled_two_stage",
+        "ltx2_5_distilled_two_stage_i2v",
     }
 
     # Two-stage preset has the denoise + refine topology and pulls its

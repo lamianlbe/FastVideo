@@ -392,7 +392,23 @@ class LTX2UpsampleStage(PipelineStage):
 
 
 class LTX2RefineLoRAStage(PipelineStage):
-    """Apply a refinement-specific LoRA before stage-2 denoising."""
+    """(Re)merge the two-stage LoRA at a per-stage strength before a denoise pass.
+
+    Two placements exist in the pipeline:
+
+    * before the stage-2 denoise (the classic refine-LoRA slot, ``strength`` =
+      ``ltx2_refine_lora_strength``), and
+    * optionally before the stage-1 denoise (``strength`` =
+      ``ltx2_stage1_lora_strength``) so the SAME adapter runs both stages at
+      different merge strengths — the LTX-2.5 two-stage distilled recipe uses
+      ~0.7 for stage 1 and ~0.5 for stage 2.
+
+    With ``always_apply`` the stage calls ``set_lora_adapter`` every run;
+    the pipeline's own idempotence check makes the call free when nothing
+    changed, and a strength change triggers an exact unmerge-to-pristine +
+    re-merge (no drift accumulates). Without it (legacy single-slot mode) the
+    merge is applied once per process, preserving the validated 2.3 behavior.
+    """
 
     def __init__(
         self,
@@ -400,11 +416,15 @@ class LTX2RefineLoRAStage(PipelineStage):
         pipeline: Any,
         lora_path: str | None,
         lora_nickname: str = "ltx2_refine",
+        strength: float = 1.0,
+        always_apply: bool = False,
     ) -> None:
         super().__init__()
         self._pipeline_ref = (weakref.ref(pipeline) if pipeline is not None else None)
         self._lora_path = lora_path
         self._lora_nickname = lora_nickname
+        self._strength = float(strength)
+        self._always_apply = always_apply
         self._applied = False
 
     def forward(
@@ -415,7 +435,7 @@ class LTX2RefineLoRAStage(PipelineStage):
         if not fastvideo_args.ltx2_refine_enabled:
             return batch
         lora_path = fastvideo_args.ltx2_refine_lora_path or self._lora_path
-        if not lora_path or self._applied:
+        if not lora_path or (self._applied and not self._always_apply):
             return batch
 
         pipeline = (self._pipeline_ref() if self._pipeline_ref is not None else None)
@@ -423,9 +443,10 @@ class LTX2RefineLoRAStage(PipelineStage):
             raise ValueError("LTX2 refinement LoRA requested but pipeline does not "
                              "support LoRA adapters.")
 
-        pipeline.set_lora_adapter(self._lora_nickname, lora_path)
+        pipeline.set_lora_adapter(self._lora_nickname, lora_path, strength=self._strength)
+        if not self._applied:
+            logger.info("[LTX2] Applied two-stage LoRA from %s at strength %.3f", lora_path, self._strength)
         self._applied = True
-        logger.info("[LTX2] Applied refinement LoRA from %s", lora_path)
         return batch
 
 

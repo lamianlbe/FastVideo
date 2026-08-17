@@ -209,6 +209,59 @@ LTX2_5_DISTILLED_TWO_STAGE = InferencePreset(
     },
 )
 
+# The production ComfyUI two-stage distilled i2v/flf2v recipe on the LTX-2.5
+# dev transformer + distilled LoRA (per-stage strengths ~0.7 / ~0.5). These
+# defaults cover the per-request sampling surface; the engine-level half of
+# the recipe (euler_ancestral_cfg_pp both stages, LTXVScheduler stage-1 sigmas
+# with max_shift=4.0 / base_shift=1.5 / stretch / terminal=0.1, manual stage-2
+# sigmas [0.85, 0.7250, 0.4219, 0.0], refine + per-stage LoRA strengths) is
+# wired by examples/inference/basic/basic_ltx2_5_i2av_two_stage.py.
+LTX2_5_DISTILLED_TWO_STAGE_I2V = InferencePreset(
+    name="ltx2_5_distilled_two_stage_i2v",
+    version=1,
+    model_family="ltx2",
+    description=("LTX-2.5 two-stage distilled i2v/flf2v recipe (dev transformer + distilled LoRA): "
+                 "stage 1 at half resolution with CFG++ ancestral sampling, x2 latent upsample, "
+                 "stage-2 re-pin + refine, joint audio"),
+    workload_type="i2v",
+    stage_schemas=(_DENOISE_STAGE, _REFINE_STAGE),
+    defaults={
+        "seed": 10,
+        # Final (stage-2) resolution; LTX2RefineInitStage halves it for stage 1,
+        # putting the stage-1 long side at ~1024 like the ComfyUI recipe.
+        "height": 1152,
+        "width": 2048,
+        "num_frames": 121,
+        "fps": 24,
+        # CFG++ at cfg=1: the sampler still runs the uncond pass (except at the
+        # degenerate sigma=1.0 first step); an empty negative prompt suffices.
+        "guidance_scale": 1.0,
+        "num_inference_steps": 8,
+        "negative_prompt": "",
+        # LTXVPreprocess img_compression=38 (H.264 CRF re-encode of the
+        # conditioning image); stage 2 reuses the same value.
+        "ltx2_image_crf": 38.0,
+        # Plain CFG++ guider: no STG / modality-isolation / rescale terms.
+        "ltx2_cfg_scale_video": 1.0,
+        "ltx2_cfg_scale_audio": 1.0,
+        "ltx2_modality_scale_video": 1.0,
+        "ltx2_modality_scale_audio": 1.0,
+        "ltx2_rescale_scale": 0.0,
+        "ltx2_stg_scale_video": 0.0,
+        "ltx2_stg_scale_audio": 0.0,
+        # The recipe uses the ComfyUI-style cfg_pp sampler (ltx2_sampler /
+        # ltx2_refine_sampler engine args), not the official 2.5 ancestral path.
+        "ltx2_use_ancestral_sampler": False,
+    },
+    stage_defaults={
+        "refine": {
+            # Matches the manual stage-2 sigma list [0.85, 0.7250, 0.4219, 0.0].
+            "num_inference_steps": 3,
+            "guidance_scale": 1.0,
+        },
+    },
+)
+
 ALL_PRESETS = (
     LTX2_BASE,
     LTX2_3_BASE,
@@ -217,6 +270,7 @@ ALL_PRESETS = (
     LTX2_5_DEV,
     LTX2_5_DISTILLED,
     LTX2_5_DISTILLED_TWO_STAGE,
+    LTX2_5_DISTILLED_TWO_STAGE_I2V,
 )
 
 __all__ = [
@@ -228,4 +282,5 @@ __all__ = [
     "LTX2_5_DEV",
     "LTX2_5_DISTILLED",
     "LTX2_5_DISTILLED_TWO_STAGE",
+    "LTX2_5_DISTILLED_TWO_STAGE_I2V",
 ]

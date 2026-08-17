@@ -101,6 +101,29 @@ class LTX2Pipeline(LoRAPipeline):
             ),
         )
 
+        # Per-stage LoRA strengths (two-stage distilled recipe): when
+        # ltx2_stage1_lora_strength is set, the refine LoRA is (re)merged at
+        # that strength before every stage-1 denoise, and the stage-2 slot
+        # below re-merges it at ltx2_refine_lora_strength. Both slots share
+        # one adapter nickname so switching strengths is an exact
+        # unmerge-to-pristine + re-merge of the cached adapter.
+        stage1_lora_strength = fastvideo_args.ltx2_stage1_lora_strength
+        per_stage_lora = (refine_enabled and stage1_lora_strength is not None
+                          and bool(fastvideo_args.ltx2_refine_lora_path))
+        if refine_enabled and stage1_lora_strength is not None and not fastvideo_args.ltx2_refine_lora_path:
+            raise ValueError("ltx2_stage1_lora_strength is set but no refine LoRA is available "
+                             "(ltx2_refine_lora_path resolved to nothing).")
+        if per_stage_lora:
+            self.add_stage(
+                stage_name="ltx2_stage1_lora_stage",
+                stage=LTX2RefineLoRAStage(
+                    pipeline=self,
+                    lora_path=fastvideo_args.ltx2_refine_lora_path,
+                    strength=float(stage1_lora_strength),
+                    always_apply=True,
+                ),
+            )
+
         self.add_stage(
             stage_name="denoising_stage",
             stage=LTX2DenoisingStage(
@@ -166,6 +189,10 @@ class LTX2Pipeline(LoRAPipeline):
                     stage=LTX2RefineLoRAStage(
                         pipeline=self,
                         lora_path=fastvideo_args.ltx2_refine_lora_path,
+                        strength=float(fastvideo_args.ltx2_refine_lora_strength),
+                        # With a stage-1 slot the strengths alternate per run, so
+                        # the once-per-process latch must not stick.
+                        always_apply=per_stage_lora,
                     ),
                 )
 

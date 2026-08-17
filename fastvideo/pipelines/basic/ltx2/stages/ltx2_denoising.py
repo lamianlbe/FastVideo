@@ -64,17 +64,25 @@ def _nvtx_range(name: str):
         yield
 
 
-def _ltx2_sigmas(
+def compute_ltxv_scheduler_sigmas(
     steps: int,
-    latent: torch.Tensor | None,
-    device: torch.device,
+    *,
     max_shift: float = 2.05,
     base_shift: float = 0.95,
     stretch: bool = True,
     terminal: float = 0.1,
+    tokens: int | None = None,
+    device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    # Copied/following official LTX-2 scheduler (LTX2Scheduler.execute).
-    tokens = math.prod(latent.shape[2:]) if latent is not None else MAX_SHIFT_ANCHOR
+    """ComfyUI ``LTXVScheduler`` / official ``LTX2Scheduler.execute`` sigma schedule.
+
+    ``tokens`` is the latent token count (``T*H*W`` of the latent tensor) that the
+    ComfyUI node reads from its optional latent input; ``None`` uses the node's
+    no-latent default of 4096 (== ``MAX_SHIFT_ANCHOR``, where the shift equals
+    ``max_shift`` exactly). Returns ``steps + 1`` sigmas from 1.0 down to 0.0.
+    """
+    if tokens is None:
+        tokens = MAX_SHIFT_ANCHOR
     sigmas = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
 
     mm = (max_shift - base_shift) / (MAX_SHIFT_ANCHOR - BASE_SHIFT_ANCHOR)
@@ -98,6 +106,28 @@ def _ltx2_sigmas(
         sigmas[non_zero_mask] = stretched
 
     return sigmas
+
+
+def _ltx2_sigmas(
+    steps: int,
+    latent: torch.Tensor | None,
+    device: torch.device,
+    max_shift: float = 2.05,
+    base_shift: float = 0.95,
+    stretch: bool = True,
+    terminal: float = 0.1,
+) -> torch.Tensor:
+    # Copied/following official LTX-2 scheduler (LTX2Scheduler.execute).
+    tokens = math.prod(latent.shape[2:]) if latent is not None else None
+    return compute_ltxv_scheduler_sigmas(
+        steps,
+        max_shift=max_shift,
+        base_shift=base_shift,
+        stretch=stretch,
+        terminal=terminal,
+        tokens=tokens,
+        device=device,
+    )
 
 
 def _ltx2_first_frame_keyframes_mask(
@@ -218,7 +248,7 @@ def euler_ancestral_rf_step(
 def euler_ancestral_cfg_pp_step(
     x: torch.Tensor,
     denoised: torch.Tensor,
-    uncond_denoised: torch.Tensor,
+    uncond_denoised: torch.Tensor | None,
     sigma: float,
     sigma_next: float,
     *,
@@ -234,15 +264,37 @@ def euler_ancestral_cfg_pp_step(
     ``alpha = 1 - sigma``. Note that ComfyUI forces the unconditional pass
     even at cfg=1 (``disable_cfg1_optimization=True``), so this sampler is
     never equivalent to plain euler_ancestral.
+
+    Degenerate first step (``sigma >= 1.0``, i.e. ``alpha_s == 0``): LTXVScheduler
+    schedules start at exactly 1.0 and ComfyUI's tensor math survives there and
+    yields a well-defined limit — ``alpha_s = sigma * exp(half_log_snr) == 0``
+    zeroes the uncond contribution to the direction term (``d = x / sigma``), and
+    ``get_ancestral_step(inf, sigma_to)`` collapses to ``sigma_up = sigma_to``
+    / ``sigma_down = 0`` via NaN-vs-min semantics. Net effect with ``eta > 0``:
+
+        x = alpha_t * denoised (+ sigma_next * s_noise * noise  if s_noise > 0)
+
+    i.e. the uncond x0 is DISCARDED at that step (callers may skip its forward
+    pass and hand in ``uncond_denoised=None``). With ``eta == 0`` ComfyUI's
+    early-return branch instead keeps the deterministic direction term along
+    the initial noise: ``x = alpha_t * denoised + sigma_next * (x / sigma)``.
     """
     if sigma_next == 0.0:
         return denoised
-    if sigma >= 1.0:
-        raise ValueError("euler_ancestral_cfg_pp is undefined at sigma >= 1.0 for rectified-flow "
-                         "models (alpha = 1 - sigma hits 0; ComfyUI silently produces inf/NaN "
-                         "there). Start the sigma schedule below 1.0, e.g. 0.99.")
-    alpha_s = 1.0 - sigma
     alpha_t = 1.0 - sigma_next
+    if sigma >= 1.0:
+        # Exact ComfyUI limit at alpha_s == 0 (see docstring). Only sigma == 1.0
+        # occurs in practice: FastVideoArgs validates schedules to <= 1.0.
+        if eta > 0:
+            if s_noise > 0:
+                if noise is None:
+                    raise ValueError("euler_ancestral_cfg_pp_step needs a noise tensor when eta > 0 and s_noise > 0")
+                return alpha_t * denoised + sigma_next * s_noise * noise
+            return alpha_t * denoised
+        return alpha_t * denoised + sigma_next * (x / sigma)
+    if uncond_denoised is None:
+        raise ValueError("euler_ancestral_cfg_pp_step needs the unconditional x0 for sigma < 1.0 steps")
+    alpha_s = 1.0 - sigma
     d = (x - alpha_s * uncond_denoised) / sigma
     sigma_down, sigma_up = get_ancestral_step(sigma / alpha_s, sigma_next / alpha_t, eta=eta)
     sigma_down = alpha_t * sigma_down
@@ -913,6 +965,11 @@ class LTX2DenoisingStage(PipelineStage):
             step_do_cfg_text = (neg_prompt_embeds is not None and (step_cfg_video != 1.0 or step_cfg_audio != 1.0)
                                 if stage1_cfg_values is not None else do_cfg_text)
             step_do_guidance = step_do_cfg_text or do_mod or do_stg
+            # CFG++ discards the uncond x0 at sigma >= 1.0 (ComfyUI's own math
+            # collapses the direction term there — see euler_ancestral_cfg_pp_step),
+            # so skip the pure-CFG++ uncond forward on that step. Deterministic
+            # forward only: RNG draw order and outputs are unchanged.
+            step_need_uncond = need_uncond and float(sigma) < 1.0
             if anchor_ctx is not None:
                 # Capture the anchor snapshot at the cache step; use the
                 # frozen buffer on later steps. 0-d bool tensors so the
@@ -969,10 +1026,11 @@ class LTX2DenoisingStage(PipelineStage):
 
                 # Pass 2: unconditional (negative prompt) forward. Needed for
                 # text CFG and, independently, for CFG++'s direction term
-                # (which wants the raw unconditional x0 even at cfg=1).
+                # (which wants the raw unconditional x0 even at cfg=1 —
+                # except at sigma >= 1.0 where its output is discarded).
                 uncond_denoised = None
                 uncond_audio = None
-                if (step_do_guidance and step_do_cfg_text) or need_uncond:
+                if (step_do_guidance and step_do_cfg_text) or step_need_uncond:
                     with _nvtx_range("ltx2.denoise.pass.neg"):
                         neg_outputs = self.transformer(
                             hidden_states=latent_model_input,
@@ -984,6 +1042,10 @@ class LTX2DenoisingStage(PipelineStage):
                             audio_timestep=audio_timestep,
                             video_sigma=sigma_batch,
                             audio_sigma=sigma_batch,
+                            # Parity with the official denoiser, which replicates the
+                            # WHOLE LatentState (keyframes_mask included) across every
+                            # guidance pass in its batched forward.
+                            keyframes_mask=keyframes_mask,
                             video_position_offset_sec=video_position_offset_sec,
                             **extra_transformer_kwargs,
                         )
@@ -1185,14 +1247,14 @@ class LTX2DenoisingStage(PipelineStage):
                             noise=_ancestral_noise(audio_latents) if draw else None,
                         ).to(audio_latents.dtype)
                 else:  # euler_ancestral_cfg_pp
-                    if uncond_denoised is None:
+                    if uncond_denoised is None and step_need_uncond:
                         raise RuntimeError("euler_ancestral_cfg_pp step reached without an unconditional "
                                            "prediction; this is a bug in the pass gating.")
                     draw = (sampler_eta > 0 and sampler_s_noise > 0 and sigma_next_f > 0)
                     latents = euler_ancestral_cfg_pp_step(
                         latents.float(),
                         pos_denoised.float(),
-                        uncond_denoised.float(),
+                        uncond_denoised.float() if uncond_denoised is not None else None,
                         sigma_f,
                         sigma_next_f,
                         eta=sampler_eta,

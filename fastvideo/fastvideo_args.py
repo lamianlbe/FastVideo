@@ -201,6 +201,7 @@ class FastVideoArgs:
     refine_upsampler_path: str | None = None
     refine_transformer_path: str | None = None
     refine_lora_path: str | None = None
+    refine_lora_strength: float | None = None
     refine_num_inference_steps: int | None = None
     refine_guidance_scale: float | None = None
     refine_add_noise: bool | None = None
@@ -215,6 +216,14 @@ class FastVideoArgs:
     ltx2_refine_upsampler_path: str | None = None
     ltx2_refine_transformer_path: str | None = None
     ltx2_refine_lora_path: str | None = None
+    # Merge strength for the refine LoRA during the stage-2 denoise (the LTX-2.5
+    # two-stage distilled recipe runs the distilled LoRA at ~0.5 there).
+    ltx2_refine_lora_strength: float = 1.0
+    # When set, the refine LoRA is ALSO merged for the stage-1 denoise at this
+    # strength and re-asserted at the start of every run (the recipe uses ~0.7).
+    # None keeps the legacy behavior: stage 1 runs without the refine LoRA and
+    # the stage-2 merge is applied once per process.
+    ltx2_stage1_lora_strength: float | None = None
     ltx2_refine_num_inference_steps: int = 3
     ltx2_refine_guidance_scale: float = 1.0
     ltx2_refine_add_noise: bool = True
@@ -227,13 +236,15 @@ class FastVideoArgs:
     # decreasing and end at 0.0 (e.g. [1.0, 0.955, ..., 0.121, 0.0]).
     ltx2_stage1_sigmas: list[float] | None = None
     ltx2_stage2_sigmas: list[float] | None = None
-    # Per-stage sampler. Stage 1 accepts "euler" | "euler_ancestral";
-    # stage 2 (refine) additionally accepts "euler_ancestral_cfg_pp".
+    # Per-stage sampler. Both stages accept "euler" | "euler_ancestral" |
+    # "euler_ancestral_cfg_pp".
     # The ancestral formulas follow ComfyUI's rectified-flow variants
     # (sample_euler_ancestral_RF / sample_euler_ancestral_cfg_pp) since
     # LTX-2 is a CONST/RF model there. Note: euler_ancestral_cfg_pp runs
     # an extra unconditional forward every step even at guidance_scale=1
-    # (matching ComfyUI's disable_cfg1_optimization behaviour).
+    # (matching ComfyUI's disable_cfg1_optimization behaviour), except at
+    # sigma >= 1.0 where ComfyUI's own math discards the uncond output and
+    # the forward is skipped.
     ltx2_sampler: str = "euler"
     ltx2_refine_sampler: str = "euler"
     ltx2_sampler_eta: float = 1.0
@@ -402,12 +413,18 @@ class FastVideoArgs:
         if self.ltx2_text_amp_scale <= 0.0:
             raise ValueError(f"ltx2_text_amp_scale must be > 0, got {self.ltx2_text_amp_scale}")
 
-        stage1_choices = ("euler", "euler_ancestral")
+        # euler_ancestral_cfg_pp is valid in BOTH stages: the step function handles
+        # the sigma == 1.0 first step of stage-1 schedules via ComfyUI's exact
+        # degenerate-limit semantics (see euler_ancestral_cfg_pp_step).
+        stage1_choices = ("euler", "euler_ancestral", "euler_ancestral_cfg_pp")
         stage2_choices = ("euler", "euler_ancestral", "euler_ancestral_cfg_pp")
         if self.ltx2_sampler not in stage1_choices:
             raise ValueError(f"ltx2_sampler must be one of {stage1_choices}, got {self.ltx2_sampler!r}")
         if self.ltx2_refine_sampler not in stage2_choices:
             raise ValueError(f"ltx2_refine_sampler must be one of {stage2_choices}, got {self.ltx2_refine_sampler!r}")
+        if self.ltx2_stage1_lora_strength is not None and not self.ltx2_refine_enabled:
+            raise ValueError("ltx2_stage1_lora_strength requires ltx2_refine_enabled (it re-merges the "
+                             "refine LoRA for the stage-1 denoise of the two-stage flow).")
         if self.ltx2_reference_position_mode not in ("reference", "prefix_continuous"):
             raise ValueError("ltx2_reference_position_mode must be 'reference' or 'prefix_continuous', "
                              f"got {self.ltx2_reference_position_mode!r}")
@@ -422,6 +439,8 @@ class FastVideoArgs:
             self.ltx2_refine_transformer_path = self.refine_transformer_path
         if self.refine_lora_path is not None:
             self.ltx2_refine_lora_path = self.refine_lora_path
+        if self.refine_lora_strength is not None:
+            self.ltx2_refine_lora_strength = self.refine_lora_strength
         if self.refine_num_inference_steps is not None:
             self.ltx2_refine_num_inference_steps = self.refine_num_inference_steps
         if self.refine_guidance_scale is not None:

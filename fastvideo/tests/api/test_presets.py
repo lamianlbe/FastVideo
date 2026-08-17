@@ -346,6 +346,7 @@ class TestLtx2Presets:
             "ltx2_5_dev",
             "ltx2_5_distilled",
             "ltx2_5_distilled_two_stage",
+            "ltx2_5_distilled_two_stage_i2v",
         }
 
     def test_ltx2_base_lookup(self) -> None:

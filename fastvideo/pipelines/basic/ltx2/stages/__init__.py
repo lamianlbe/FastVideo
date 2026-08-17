@@ -5,7 +5,9 @@ from fastvideo.pipelines.basic.ltx2.stages.ltx2_audio_decoding import (
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_decoding import (
     LTX2DecodingStage, )
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_denoising import (
-    LTX2DenoisingStage, )
+    LTX2DenoisingStage,
+    compute_ltxv_scheduler_sigmas,
+)
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_latent_preparation import (
     LTX2LatentPreparationStage, )
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_refine import (
@@ -27,4 +29,5 @@ __all__ = [
     "LTX2TextEncodingStage",
     "LTX2UpsampleStage",
     "STAGE_2_DISTILLED_SIGMA_VALUES",
+    "compute_ltxv_scheduler_sigmas",
 ]
