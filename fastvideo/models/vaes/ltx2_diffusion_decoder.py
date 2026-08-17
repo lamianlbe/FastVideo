@@ -11,10 +11,12 @@ scale/shift (ungated residuals; the checkpoint's static gates are folded into Li
 conversion script). Critically, stages 1-4 run once per decode — only stage 5 re-runs per diffusion step.
 
 The neighborhood-attention backend is chosen by exactly one helper (:func:`neighborhood_attention_3d`):
-``natten`` when importable on CUDA (NATTEN auto-picks its fastest kernel, e.g. the CUTLASS Blackwell
-sm100 FNA backend on B200/B300), then a Triton port, then an eager tiled-SDPA fallback that also runs
-on CPU. The Triton and eager fallbacks are ports of the official ``transformer/fallback_na`` package
-(vendored there from comfy-kitchen, Apache-2.0).
+on CUDA it is ``natten`` — a required dependency there (NATTEN auto-picks its fastest kernel, e.g. the
+CUTLASS Blackwell sm100 FNA backend on B200/B300) — and a missing natten raises ImportError instead of
+silently degrading. Non-CUDA devices use an eager tiled-SDPA fallback (which is how CPU tests run), and
+``FASTVIDEO_LTX2_NA_BACKEND=triton|eager`` remains as an explicit opt-in escape hatch on CUDA. The
+Triton and eager fallbacks are ports of the official ``transformer/fallback_na`` package (vendored
+there from comfy-kitchen, Apache-2.0).
 
 This module is deliberately self-contained at import time (torch + ``fastvideo.logger`` only) so the
 decoder can be unit-tested without the full package; the conv-VAE encoder used by the
@@ -341,14 +343,15 @@ def _triton_na3d(
 
 
 _TRITON_NA3D_KERNEL: Any = None
-_NA_BACKEND_WARNED: set[str] = set()
 
 
 def _resolve_na3d_backend(device_type: str) -> str:
-    """Resolve the NA backend name for a device: natten -> triton -> eager, with env override.
+    """Resolve the NA backend name for a device, with env override.
 
     ``FASTVIDEO_LTX2_NA_BACKEND`` in {"natten", "triton", "eager"} forces a backend (validated).
-    natten/Triton require CUDA tensors; every other device gets the eager tiled-SDPA fallback.
+    Without an override, CUDA REQUIRES natten (a required dependency on Linux; there is no
+    silent CUDA fallback) and every other device gets the eager tiled-SDPA fallback, which is
+    what keeps this module runnable on CPU (tests, macOS).
     """
     override = os.getenv("FASTVIDEO_LTX2_NA_BACKEND", "").lower()
     if override:
@@ -362,14 +365,15 @@ def _resolve_na3d_backend(device_type: str) -> str:
     if device_type == "cuda":
         if _NATTEN_AVAILABLE:
             return "natten"
-        backend = "triton" if _triton_na_available() else "eager"
-        if backend not in _NA_BACKEND_WARNED:
-            _NA_BACKEND_WARNED.add(backend)
-            logger.warning(
-                "LTX-2 diffusion decoder: natten is NOT installed; falling back to the slower %s "
-                "neighborhood-attention backend. Install natten for production HQ decode "
-                "(it ships a CUTLASS Blackwell sm100 FNA backend for B200/B300).", backend)
-        return backend
+        raise ImportError(
+            "LTX-2 diffusion decoder: natten is required for the HQ neighborhood-attention "
+            "decode on CUDA (it auto-selects the fastest kernel per GPU, including the CUTLASS "
+            "Blackwell sm100 FNA backend in CUDA >= 12.8 builds). Install the libnatten wheel "
+            "matching your torch/CUDA build, e.g. "
+            "`pip install natten==0.21.7+torch2120cu130 -f https://whl.natten.org` "
+            "(see https://natten.org/install), or reinstall fastvideo's Linux extras. To "
+            "explicitly opt into a slower fallback instead, set "
+            "FASTVIDEO_LTX2_NA_BACKEND=triton (CUDA) or FASTVIDEO_LTX2_NA_BACKEND=eager.")
     return "eager"
 
 

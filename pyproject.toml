@@ -39,6 +39,16 @@ dependencies = [
     # out to nvcc unconditionally. Gate on sys_platform so installs on macOS
     # (MPS) and other non-Linux platforms don't try to build it from source.
     "flashinfer-python; sys_platform == 'linux'",
+    # Neighborhood attention for the LTX-2.5 HQ diffusion video decoder.
+    # Required on CUDA (the decoder refuses to silently fall back there).
+    # PyPI only ships an sdist; prefer the prebuilt libnatten wheel matching
+    # the torch/CUDA build, e.g. for torch 2.12.0 + cu130:
+    #   pip install natten==0.21.7+torch2120cu130 -f https://whl.natten.org
+    # 0.21.x ships the CUTLASS Blackwell (sm100) FNA kernels in CUDA >= 12.8
+    # builds (cu130/cu132; the cu126 wheel has no Blackwell kernels). Gate on
+    # Linux so macOS (MPS) installs skip it — CPU paths use the eager
+    # fallback in fastvideo/models/vaes/ltx2_diffusion_decoder.py.
+    "natten>=0.21.7; sys_platform == 'linux'",
 
     # Acceleration & Optimization
     "accelerate==1.0.1",
