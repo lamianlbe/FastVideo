@@ -2,6 +2,8 @@
 """LTX-2 family pipeline stages."""
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_audio_decoding import (
     LTX2AudioDecodingStage, )
+from fastvideo.pipelines.basic.ltx2.stages.ltx2_decoding import (
+    LTX2DecodingStage, )
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_denoising import (
     LTX2DenoisingStage, )
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_latent_preparation import (
@@ -17,6 +19,7 @@ from fastvideo.pipelines.basic.ltx2.stages.ltx2_text_encoding import (
 
 __all__ = [
     "LTX2AudioDecodingStage",
+    "LTX2DecodingStage",
     "LTX2DenoisingStage",
     "LTX2LatentPreparationStage",
     "LTX2RefineInitStage",

@@ -5,7 +5,7 @@ from fastvideo.configs.models.vaes.gen3cvae import Gen3CVAEConfig
 from fastvideo.configs.models.vaes.glm_image import GlmImageVAEConfig
 from fastvideo.configs.models.vaes.hunyuanvae import HunyuanVAEConfig
 from fastvideo.configs.models.vaes.hunyuan15vae import Hunyuan15VAEConfig
-from fastvideo.configs.models.vaes.ltx2vae import LTX2VAEConfig
+from fastvideo.configs.models.vaes.ltx2vae import LTX2DiffusionVAEConfig, LTX2VAEConfig
 from fastvideo.configs.models.vaes.minimax_h3_audio import MiniMaxH3AudioVAEArchConfig, MiniMaxH3AudioVAEConfig
 from fastvideo.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
@@ -23,6 +23,7 @@ __all__ = [
     "Cosmos25VAEConfig",
     "Gen3CVAEConfig",
     "Hunyuan15VAEConfig",
+    "LTX2DiffusionVAEConfig",
     "LTX2VAEConfig",
     "MiniMaxH3AudioVAEArchConfig",
     "MiniMaxH3AudioVAEConfig",

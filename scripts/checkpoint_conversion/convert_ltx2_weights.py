@@ -26,6 +26,14 @@ LTX-2.5 uses separate official component files. Convert that layout with:
         --distilled-lora-source loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
         --variant dev \
         --output converted_weights/ltx2-5-dev
+
+--vae-source accepts either LTX-2.5 video VAE file; the decoder flavor is detected from the
+checkpoint's safetensors metadata (``config.vae._class_name``):
+
+- ``vae/ltx-2.5-video-vae-conv-bf16.safetensors``  -> convolutional decoder (CausalVideoAutoencoder)
+- ``vae/ltx-2.5-video-vae-bf16.safetensors``       -> diffusion/HQ decoder (CausalDiffusionVAE)
+
+Which decoder runs at inference follows the converted vae/ directory the pipeline loads.
 """
 
 from __future__ import annotations
@@ -89,6 +97,113 @@ TEXT_CONNECTOR_PREFIXES: dict[str, str] = {
     "video_embeddings_connector.": "embeddings_connector.",
     "audio_embeddings_connector.": "audio_embeddings_connector.",
 }
+
+_CONV_VAE_CLASS_NAME = "CausalVideoAutoencoder"
+_DIFFUSION_VAE_CLASS_NAME = "CausalDiffusionVAE"
+
+# LTX-2.5 diffusion decoder remapping (mirrors the official
+# ltx_core.model.video_vae.model_configurator SDOps / _strip_diffusion_decoder_prefix chain).
+DIFFUSION_DECODER_RENAMES: dict[str, str] = {
+    # The official t_embedder *is* PixArtAlphaCombinedTimestepSizeEmbeddings saved under
+    # shorter names; only its two Linears need renaming.
+    "t_embedder.mlp.0.": "t_embedder.timestep_embedder.linear_1.",
+    "t_embedder.mlp.2.": "t_embedder.timestep_embedder.linear_2.",
+}
+
+_DIFFUSION_GATE_SUFFIXES = (".gate_msa", ".gate_mlp", ".gate_ctx")
+
+# Static AdaLN gates carried by distilled checkpoints are folded into the Linear they gate
+# (W <- g * W, b <- g * b) and dropped: the decoder's residuals are ungated. Post-rename leaf
+# suffix -> sibling gate key suffix (official _GATE_FOLD_TARGETS).
+DIFFUSION_GATE_FOLD_TARGETS: tuple[tuple[str, str], ...] = (
+    (".attn.proj.weight", ".gate_msa"),
+    (".attn.proj.bias", ".gate_msa"),
+    (".mlp.w_down.weight", ".gate_mlp"),
+    (".mlp.w_down.bias", ".gate_mlp"),
+    (".context_proj.weight", ".gate_ctx"),
+    (".context_proj.bias", ".gate_ctx"),
+)
+
+
+def _fold_gate(value: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Fold a static gate into a Linear weight (rank 2) or bias (rank 1) in fp32."""
+    gate_f = gate.to(torch.float32)
+    value_f = value.to(torch.float32)
+    if value.ndim == 2:
+        folded = gate_f.unsqueeze(1) * value_f
+    elif value.ndim == 1:
+        folded = gate_f * value_f
+    else:
+        raise ValueError(f"Unsupported param rank {value.ndim} for gate fold")
+    return folded.to(value.dtype)
+
+
+def convert_diffusion_vae_weights(weights: dict[str, torch.Tensor]) -> OrderedDict:
+    """Remap an official LTX-2.5 diffusion-VAE state dict onto FastVideo's native surface.
+
+    Input keys have any ``vae.`` prefix already stripped: ``encoder.*`` (conv encoder,
+    passthrough), ``decoder.*`` (diffusion decoder), and ``per_channel_statistics.*`` (shared
+    latent stats, mirrored under both halves). Per the official loader chain this
+    - drops bundled preview heads (``coarse_*``),
+    - folds static AdaLN gates into the Linear they gate and drops the gates,
+    - renames ``t_embedder.mlp.{0,2}`` to the timestep-embedder Linears,
+    - splits fused ``qkv.{weight,bias}`` into ``qkv.to_q`` / ``qkv.to_k`` / ``qkv.to_v``.
+    """
+    gates = {
+        key: value
+        for key, value in weights.items()
+        if key.startswith("decoder.") and key.endswith(_DIFFUSION_GATE_SUFFIXES)
+    }
+
+    converted: OrderedDict[str, torch.Tensor] = OrderedDict()
+    for key, value in weights.items():
+        if key.startswith("encoder."):
+            converted[key] = value
+            continue
+        if key.startswith("per_channel_statistics."):
+            suffix = key[len("per_channel_statistics."):]
+            converted[f"encoder.per_channel_statistics.{suffix}"] = value
+            # Clone: safetensors refuses to serialize aliased tensors.
+            converted[f"decoder.per_channel_statistics.{suffix}"] = value.detach().clone()
+            continue
+        if not key.startswith("decoder."):
+            print(f"Skipping unexpected diffusion-VAE key: {key}")
+            continue
+        if key in gates:
+            continue
+        stripped = key[len("decoder."):]
+        if stripped.startswith("coarse_") or ".coarse_" in stripped:
+            continue
+
+        new_key = stripped
+        for old, new in DIFFUSION_DECODER_RENAMES.items():
+            new_key = new_key.replace(old, new)
+
+        for leaf, gate_suffix in DIFFUSION_GATE_FOLD_TARGETS:
+            if new_key.endswith(leaf):
+                # Gates are siblings of the Linear they gate; renames never touch gated paths.
+                gate = gates.get("decoder." + new_key[:-len(leaf)] + gate_suffix)
+                if gate is not None:
+                    value = _fold_gate(value, gate)
+                break
+
+        if new_key.endswith((".qkv.weight", ".qkv.bias")):
+            leaf = "weight" if new_key.endswith(".weight") else "bias"
+            prefix = new_key[:-len(leaf)]  # "...qkv."
+            if value.shape[0] % 3 != 0:
+                raise ValueError(f"Fused QKV param {key!r} leading dim {value.shape[0]} is not divisible by 3")
+            chunk = value.shape[0] // 3
+            converted[f"decoder.{prefix}to_q.{leaf}"] = value[:chunk].detach().clone()
+            converted[f"decoder.{prefix}to_k.{leaf}"] = value[chunk:2 * chunk].detach().clone()
+            converted[f"decoder.{prefix}to_v.{leaf}"] = value[2 * chunk:].detach().clone()
+            continue
+
+        converted[f"decoder.{new_key}"] = value
+
+    if not any(key.startswith("decoder.diff_blocks.") for key in converted):
+        raise ValueError("Diffusion VAE source contained no decoder.diff_blocks.* weights; "
+                         "is this really the LTX-2.5 diffusion video VAE?")
+    return converted
 
 
 def _find_shards(model_path: Path) -> list[Path]:
@@ -512,10 +627,11 @@ def _build_split_model_index(
     diffusers_version: str,
     variant: str,
     distilled_lora: bool,
+    vae_class_name: str = _CONV_VAE_CLASS_NAME,
 ) -> dict:
     model_index = _build_model_index(
         transformer_class_name=transformer_class_name,
-        vae_class_name="CausalVideoAutoencoder",
+        vae_class_name=vae_class_name,
         pipeline_class_name=pipeline_class_name,
         diffusers_version=diffusers_version,
     )
@@ -678,12 +794,19 @@ def convert_split_components(
 
     vae_metadata = _source_metadata_config(vae_source)
     vae_config = _metadata_config_for_component(vae_metadata, "vae")
-    vae_class_name = vae_config.get("_class_name", "CausalVideoAutoencoder")
-    if vae_class_name != "CausalVideoAutoencoder":
-        raise ValueError(
-            "--vae-source must be the LTX-2.5 convolutional VAE; "
-            f"metadata declares {vae_class_name!r}.")
-    vae_weights = _component_weights(vae_source, ("vae.", "model.vae."))
+    # Metadata-driven decoder selection (mirrors the official is_diffusion_video_vae): the conv
+    # VAE declares CausalVideoAutoencoder; anything else is the LTX-2.5 diffusion (HQ) decoder
+    # VAE (ltx-2.5-video-vae-bf16.safetensors), normalized to CausalDiffusionVAE for dispatch.
+    metadata_vae_class = vae_config.get("_class_name", _CONV_VAE_CLASS_NAME)
+    if metadata_vae_class == _CONV_VAE_CLASS_NAME:
+        vae_class_name = _CONV_VAE_CLASS_NAME
+        vae_weights = _component_weights(vae_source, ("vae.", "model.vae."))
+    else:
+        if metadata_vae_class != _DIFFUSION_VAE_CLASS_NAME:
+            print(f"VAE metadata declares {metadata_vae_class!r}; converting it as the "
+                  f"diffusion video VAE ({_DIFFUSION_VAE_CLASS_NAME}).")
+        vae_class_name = _DIFFUSION_VAE_CLASS_NAME
+        vae_weights = convert_diffusion_vae_weights(_component_weights(vae_source, ("vae.", "model.vae.")))
 
     audio_metadata = _source_metadata_config(audio_vae_source)
     audio_weights, vocoder_weights = _split_audio_vae_source(
@@ -709,7 +832,7 @@ def convert_split_components(
         output_dir,
         "vae",
         vae_weights,
-        _wrap_component_config("vae", vae_config, class_name="CausalVideoAutoencoder"),
+        _wrap_component_config("vae", vae_config, class_name=vae_class_name),
     )
     _write_component(
         output_dir,
@@ -737,6 +860,7 @@ def convert_split_components(
             diffusers_version=diffusers_version,
             variant=variant,
             distilled_lora=has_distilled_lora,
+            vae_class_name=vae_class_name,
         )
         _write_model_index(output_dir, model_index)
 
@@ -852,7 +976,9 @@ def main() -> None:
     parser.add_argument(
         "--vae-source",
         type=str,
-        help="LTX-2.5 convolutional video VAE safetensors file or sharded directory.",
+        help=("LTX-2.5 video VAE safetensors file or sharded directory. Accepts the convolutional "
+              "VAE (ltx-2.5-video-vae-conv-bf16) or the diffusion/HQ decoder VAE "
+              "(ltx-2.5-video-vae-bf16); the flavor is detected from checkpoint metadata."),
     )
     parser.add_argument(
         "--audio-vae-source",

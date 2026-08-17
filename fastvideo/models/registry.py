@@ -119,6 +119,8 @@ _VAE_MODELS = {
     "AutoencoderKLGen3CTokenizer": ("vaes", "gen3c_tokenizer_vae", "AutoencoderKLGen3CTokenizer"),
     "AutoencoderKLStepvideo": ("vaes", "stepvideovae", "AutoencoderKLStepvideo"),
     "CausalVideoAutoencoder": ("vaes", "ltx2vae", "LTX2CausalVideoAutoencoder"),
+    # LTX-2.5 diffusion (NATTEN) video decoder VAE — selected by checkpoint metadata.
+    "CausalDiffusionVAE": ("vaes", "ltx2_diffusion_decoder", "LTX2CausalDiffusionVAE"),
     "AutoencoderKLFlux2": ("vaes", "flux2vae", "AutoencoderKLFlux2"),
     # `stable-audio-open-1.0/vae/config.json` ships `_class_name="AutoencoderOobleck"`
     # (Diffusers' name); FastVideo's class is `OobleckVAE`.

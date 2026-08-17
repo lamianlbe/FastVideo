@@ -824,8 +824,11 @@ class VAELoader(ComponentLoader):
                 ).to(target_device)
                 return vae.eval()
 
-            # LTX-2 uses CausalVideoAutoencoder with nested "vae" config
-            if class_name == "CausalVideoAutoencoder" and "vae" in config:
+            # LTX-2 uses CausalVideoAutoencoder (conv decoder) or CausalDiffusionVAE (LTX-2.5
+            # diffusion/HQ decoder) with a nested "vae" config. Which decoder runs follows the
+            # checkpoint the vae path points at — metadata-driven, like the official
+            # is_diffusion_video_vae detection.
+            if class_name in ("CausalVideoAutoencoder", "CausalDiffusionVAE") and "vae" in config:
                 vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
                 vae = vae_cls(config).to(target_device)
                 if hasattr(vae, "set_tiling_config"):
@@ -836,6 +839,22 @@ class VAELoader(ComponentLoader):
                         temporal_tile_size_in_frames=getattr(vae_config, "ltx2_temporal_tile_size_in_frames", 64),
                         temporal_tile_overlap_in_frames=getattr(vae_config, "ltx2_temporal_tile_overlap_in_frames", 24),
                     )
+                if class_name == "CausalDiffusionVAE" and hasattr(vae, "decoder"):
+                    # Diffusion-decoder tiled-decode geometry (pixel/frame units); actual tiling
+                    # still gates on the pipeline's vae_tiling flag via enable_tiling().
+                    vae_config = fastvideo_args.pipeline_config.vae_config
+                    decoder = vae.decoder
+                    for attr in (
+                            "tile_sample_min_height",
+                            "tile_sample_min_width",
+                            "tile_sample_min_num_frames",
+                            "tile_sample_stride_height",
+                            "tile_sample_stride_width",
+                            "tile_sample_stride_num_frames",
+                    ):
+                        value = getattr(vae_config, f"ltx2_diffusion_{attr}", None)
+                        if value is not None:
+                            setattr(decoder, attr, int(value))
             else:
                 config.pop("_class_name", None)
                 vae_config = fastvideo_args.pipeline_config.vae_config
@@ -853,8 +872,8 @@ class VAELoader(ComponentLoader):
         for sf_file in safetensors_list:
             loaded.update(safetensors_load_file(sf_file))
 
-        # LTX-2 CausalVideoAutoencoder needs per_channel_statistics remapping
-        if class_name == "CausalVideoAutoencoder" and "vae" in config:
+        # LTX-2 CausalVideoAutoencoder / CausalDiffusionVAE need per_channel_statistics remapping
+        if class_name in ("CausalVideoAutoencoder", "CausalDiffusionVAE") and "vae" in config:
             per_channel_prefixes = (
                 "per_channel_statistics.",
                 "vae.per_channel_statistics.",

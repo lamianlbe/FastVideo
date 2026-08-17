@@ -12,9 +12,10 @@ from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.logger import init_logger
 from fastvideo.models.loader.component_loader import PipelineComponentLoader
 from fastvideo.pipelines.lora_pipeline import LoRAPipeline
-from fastvideo.pipelines.stages import (DecodingStage, InputValidationStage, LTX2AudioDecodingStage, LTX2DenoisingStage,
-                                        LTX2LatentPreparationStage, LTX2RefineInitStage, LTX2RefineLoRAStage,
-                                        LTX2TextEncodingStage, LTX2UpsampleStage, STAGE_2_DISTILLED_SIGMA_VALUES)
+from fastvideo.pipelines.stages import (InputValidationStage, LTX2AudioDecodingStage, LTX2DecodingStage,
+                                        LTX2DenoisingStage, LTX2LatentPreparationStage, LTX2RefineInitStage,
+                                        LTX2RefineLoRAStage, LTX2TextEncodingStage, LTX2UpsampleStage,
+                                        STAGE_2_DISTILLED_SIGMA_VALUES)
 
 logger = init_logger(__name__)
 
@@ -190,7 +191,9 @@ class LTX2Pipeline(LoRAPipeline):
 
         self.add_stage(
             stage_name="decoding_stage",
-            stage=DecodingStage(vae=self.get_module("vae")),
+            # LTX2DecodingStage == generic DecodingStage for the conv VAE; for the LTX-2.5
+            # diffusion (HQ) decoder it additionally threads batch.seed into the decode RNG.
+            stage=LTX2DecodingStage(vae=self.get_module("vae")),
         )
 
     def initialize_pipeline(self, fastvideo_args: FastVideoArgs):
