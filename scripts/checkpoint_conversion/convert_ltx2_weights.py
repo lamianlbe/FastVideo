@@ -43,6 +43,25 @@ rest. Examples:
         --variant distilled \
         --output converted_weights/ltx2-5-dev
 
+``--transformer-lora PATH[:STRENGTH]`` (repeatable, requires ``--transformer-source``)
+offline-merges each LoRA into the converted transformer with the ComfyUI/official
+semantics ``W += strength * (alpha/rank) * (B @ A)`` (alpha defaults to rank when the
+file stores none, i.e. factor 1.0), accumulated in fp32 and written back in the
+source dtype (bf16 for the official files). The production two-stage distilled
+recipe merges the official distilled LoRA once so ONE transformer serves both
+stages with zero runtime LoRA cost:
+
+    python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+        --transformer-source diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+        --transformer-lora loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors:0.7 \
+        --variant dev \
+        --output converted_weights/ltx2-5-dev-merged
+
+Merged conversions record ``fastvideo_transformer_merged_loras`` in model_index.json,
+imply ``fastvideo_refine_enabled``, and never emit ``fastvideo_refine_lora_path`` —
+so the runtime does not re-apply an adapter on top of pre-merged weights. Pass
+``--device cuda`` to run the merge GEMMs on GPU.
+
 Cross-component notes:
 
 - The transformer file also carries the video/audio embeddings connectors, which belong to
@@ -71,11 +90,13 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import re
 import shutil
 import struct
 from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -644,6 +665,227 @@ def _split_transformer_and_connectors(
     return transformer, text_encoder
 
 
+# ---------------------------------------------------------------------------
+# Offline transformer LoRA merging (LTX-2.5 split conversion).
+#
+# Key dialect (verified against the official ltx-core loader
+# ``sd_ops.LTXV_LORA_COMFY_TARGET_MAP`` / ``fuse_loras.py`` and ComfyUI's
+# generic ``model_lora_keys_unet`` + ``weight_adapter/lora.py``): LTX LoRAs
+# name their factors ``diffusion_model.<module>.lora_A.weight`` /
+# ``.lora_B.weight`` where ``<module>`` equals the transformer state-dict key
+# minus ``.weight``. Merge semantics are
+#
+#     W += strength * (alpha / rank) * (B @ A)
+#
+# with ``alpha`` read from a per-module ``.alpha`` (ComfyUI) or ``.lora_alpha``
+# (FastVideo-trained) companion key and defaulting to ``rank`` (factor 1.0)
+# when absent — the official ltx-2.5-22b-distilled-lora-450 file stores no
+# per-module alpha (rank == alpha == 450), so its factor is exactly
+# ``strength``, matching the official fuse (strength-only) and ComfyUI
+# (alpha-defaults-to-rank) alike. The class below is the Wan2.2 stack
+# converter's ``LoraFile`` (convert_wan22_stack.py) re-targeted at the LTX
+# key surface: it additionally accepts ``lora_down/lora_up`` naming, kohya
+# ``lora_unet_*`` flattened names, and ComfyUI ``.diff`` / ``.diff_b``
+# full-tensor deltas.
+# ---------------------------------------------------------------------------
+
+# Prefixes stripped from both LoRA-file keys and transformer-source keys so
+# LoRA modules resolve regardless of which carrier prefix either side uses
+# (the official split source stores ``model.diffusion_model.*``; official
+# LoRA files store ``diffusion_model.*``).
+_LORA_KEY_PREFIXES = ("model.diffusion_model.", "diffusion_model.")
+
+
+def parse_lora_spec(spec: str) -> tuple[Path, float]:
+    """Parse a ``--transformer-lora`` value: ``PATH`` or ``PATH:STRENGTH``.
+
+    The strength defaults to 1.0 when omitted. A trailing ``:<something>``
+    that does not parse as a finite float is treated as part of the path (so
+    exotic file names keep working); a strength with an empty path is an
+    error.
+    """
+    path_str, sep, tail = spec.rpartition(":")
+    if sep:
+        try:
+            strength = float(tail)
+        except ValueError:
+            return Path(spec), 1.0
+        if not math.isfinite(strength):
+            raise ValueError(f"--transformer-lora {spec!r}: strength must be a finite float")
+        if not path_str:
+            raise ValueError(f"--transformer-lora {spec!r} has a strength but no path")
+        return Path(path_str), strength
+    return Path(spec), 1.0
+
+
+class LoraFile:
+    """One transformer LoRA safetensors, resolved against the source key set.
+
+    ``entries`` maps a base checkpoint key (e.g.
+    ``model.diffusion_model.transformer_blocks.0.attn1.to_q.weight``) to the
+    LoRA payload touching it:
+
+        {"lora": (down_key, up_key, alpha_key_or_None), "diff": key, "diff_b": key}
+
+    Modules that resolve to no base key land in ``skipped`` (reported, not
+    fatal — matching ComfyUI, which ignores LoRA keys absent from the model).
+    A file where *nothing* resolves is rejected as a wrong-dialect LoRA.
+    """
+
+    def __init__(self, path: Path, strength: float, base_keys: set[str]):
+        self.path = Path(path)
+        self.strength = float(strength)
+        self.handle = safe_open(str(self.path), framework="pt", device="cpu")
+        keys = list(self.handle.keys())
+        self._keyset = set(keys)
+        self.entries: dict[str, dict] = {}
+        self.skipped: set[str] = set()
+
+        # module path (base key minus prefix and leaf) -> base key, per leaf.
+        self._weight_targets: dict[str, str] = {}
+        self._bias_targets: dict[str, str] = {}
+        for base_key in base_keys:
+            module = _strip_first_matching_prefix(base_key, _LORA_KEY_PREFIXES)
+            if base_key.endswith(".weight"):
+                self._weight_targets[module[:-len(".weight")]] = base_key
+            elif base_key.endswith(".bias"):
+                self._bias_targets[module[:-len(".bias")]] = base_key
+
+        if any(k.startswith("lora_unet_") for k in keys):
+            self._parse_kohya(keys)
+        else:
+            self._parse_native(keys)
+
+        if not self.entries:
+            sample = sorted(self.skipped)[:5] or sorted(keys)[:5]
+            raise ValueError(
+                f"--transformer-lora {self.path}: no LoRA module resolved against the transformer "
+                f"source (unsupported key dialect or wrong model; sample: {sample}). Expected "
+                "diffusion_model.<module>.lora_A/lora_B.weight-style keys targeting transformer keys.")
+
+    # -- native dialect: [model.]diffusion_model.<mod>.{lora_A,lora_B}.weight
+    #    (or lora_down/lora_up) + optional .alpha/.lora_alpha/.diff/.diff_b
+    def _parse_native(self, keys: list[str]) -> None:
+        for k in keys:
+            name = _strip_first_matching_prefix(k, _LORA_KEY_PREFIXES)
+            if name.endswith((".lora_A.weight", ".lora_down.weight")):
+                down_suffix = ".lora_A.weight" if name.endswith(".lora_A.weight") else ".lora_down.weight"
+                up_suffix = ".lora_B.weight" if down_suffix == ".lora_A.weight" else ".lora_up.weight"
+                module = name[:-len(down_suffix)]
+                stem = k[:-len(down_suffix)]
+                up = stem + up_suffix
+                if up not in self._keyset:
+                    self.skipped.add(f"{module} (missing up-projection {up})")
+                    continue
+                alpha_key = next((c for c in (f"{stem}.alpha", f"{stem}.lora_alpha") if c in self._keyset), None)
+                self._add(module, "lora", (k, up, alpha_key), self._weight_targets)
+            elif name.endswith(".diff_b"):
+                self._add(name[:-len(".diff_b")], "diff_b", k, self._bias_targets)
+            elif name.endswith(".diff"):
+                self._add(name[:-len(".diff")], "diff", k, self._weight_targets)
+
+    # -- kohya dialect: lora_unet_<mod with _>.{lora_down,lora_up,alpha}
+    def _parse_kohya(self, keys: list[str]) -> None:
+        # Module paths contain underscores themselves, so resolve flattened
+        # names by exact lookup against the base key set (never substitution).
+        table = {module.replace(".", "_"): module for module in self._weight_targets}
+        for k in keys:
+            if not k.endswith(".lora_down.weight"):
+                continue
+            stem = k[:-len(".lora_down.weight")]
+            module = table.get(stem[len("lora_unet_"):].lstrip("_"))
+            if module is None:
+                self.skipped.add(stem)
+                continue
+            up = f"{stem}.lora_up.weight"
+            if up not in self._keyset:
+                self.skipped.add(f"{module} (missing up-projection {up})")
+                continue
+            alpha = f"{stem}.alpha"
+            self._add(module, "lora", (k, up, alpha if alpha in self._keyset else None), self._weight_targets)
+
+    def _add(self, module: str, kind: str, payload: Any, targets: dict[str, str]) -> None:
+        base_key = targets.get(module)
+        if base_key is None:
+            self.skipped.add(module)
+            return
+        self.entries.setdefault(base_key, {})[kind] = payload
+
+    # -- application --------------------------------------------------------
+    def delta_for(self, base_key: str, device: str = "cpu") -> torch.Tensor | None:
+        """fp32 delta this LoRA contributes to ``base_key``, or None."""
+        entry = self.entries.get(base_key)
+        if entry is None:
+            return None
+        total: torch.Tensor | None = None
+        if "lora" in entry:
+            down_k, up_k, alpha_k = entry["lora"]
+            down = self.handle.get_tensor(down_k).to(device=device, dtype=torch.float32)
+            up = self.handle.get_tensor(up_k).to(device=device, dtype=torch.float32)
+            rank = down.shape[0]
+            scale = self.strength
+            if alpha_k is not None:
+                scale *= float(self.handle.get_tensor(alpha_k)) / rank
+            total = scale * (up @ down)
+        for kind in ("diff", "diff_b"):
+            if kind in entry:
+                d = self.handle.get_tensor(entry[kind]).to(device=device, dtype=torch.float32) * self.strength
+                total = d if total is None else total + d
+        return total
+
+
+def _merge_transformer_loras(
+    weights: dict[str, torch.Tensor],
+    lora_specs: Sequence[tuple[Path, float]],
+    device: str = "cpu",
+) -> list[dict[str, Any]]:
+    """Merge LoRAs into the raw transformer-source weights in place (chain order).
+
+    Runs BEFORE the transformer/connector split, so LoRA modules that target the
+    embeddings connectors (routed into text_encoder/) merge exactly like core
+    transformer modules. Accumulation is fp32 on ``device``; each merged tensor
+    is written back in its original dtype (bf16 for the official sources).
+    Returns the provenance list recorded in model_index.json.
+    """
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("--device cuda requested for the LoRA merge but no CUDA device is available")
+
+    base_keys = set(weights.keys())
+    loras = [LoraFile(path, strength, base_keys) for path, strength in lora_specs]
+
+    merged_tensors = 0
+    for key in weights:
+        total: torch.Tensor | None = None
+        for lora in loras:
+            delta = lora.delta_for(key, device=device)
+            if delta is None:
+                continue
+            if delta.shape != weights[key].shape:
+                raise ValueError(f"--transformer-lora {lora.path.name}: delta shape {tuple(delta.shape)} "
+                                 f"!= base {tuple(weights[key].shape)} for {key}")
+            total = delta if total is None else total + delta
+        if total is None:
+            continue
+        original = weights[key]
+        fused = original.to(device=device, dtype=torch.float32) + total
+        weights[key] = fused.to(dtype=original.dtype).cpu()
+        merged_tensors += 1
+
+    provenance: list[dict[str, Any]] = []
+    for lora in loras:
+        print(f"Merged transformer LoRA {lora.path.name}: strength={lora.strength} "
+              f"targets applied={len(lora.entries)} skipped={len(lora.skipped)}")
+        if lora.skipped:
+            print(f"  skipped sample (keys absent from this transformer): {sorted(lora.skipped)[:5]}")
+        provenance.append({
+            "file": lora.path.name,
+            "strength": lora.strength,
+            "applied": len(lora.entries),
+        })
+    print(f"LoRA merge touched {merged_tensors} transformer tensors (fp32 accumulation).")
+    return provenance
+
+
 def _split_audio_vae_source(weights: dict[str, torch.Tensor]) -> tuple[OrderedDict, OrderedDict]:
     audio_vae: OrderedDict[str, torch.Tensor] = OrderedDict()
     vocoder: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -718,6 +960,7 @@ def _build_split_model_index(
     variant: str,
     distilled_lora: bool,
     vae_class_name: str = _CONV_VAE_CLASS_NAME,
+    merged_loras: list[dict[str, Any]] | None = None,
 ) -> dict:
     model_index = _build_model_index(
         transformer_class_name=transformer_class_name,
@@ -728,14 +971,25 @@ def _build_split_model_index(
     model_index.update({
         "spatial_upsampler": ["diffusers", "LTX2LatentUpsampler"],
         "fastvideo_ltx2_variant": f"ltx2.5-{variant}",
-        "fastvideo_refine_enabled": variant == "distilled" or distilled_lora,
+        # A transformer with the distilled LoRA merged offline behaves like the
+        # distilled recipe, so merged LoRAs imply refine like bundling the LoRA
+        # does (override with refine_enabled=False at runtime if undesired).
+        "fastvideo_refine_enabled": variant == "distilled" or distilled_lora or bool(merged_loras),
         "fastvideo_refine_upsampler_path": "spatial_upsampler",
         "fastvideo_refine_num_inference_steps": 3,
         "fastvideo_refine_guidance_scale": 1.0,
         "fastvideo_refine_add_noise": True,
     })
+    if merged_loras:
+        model_index["fastvideo_transformer_merged_loras"] = merged_loras
     if distilled_lora:
-        model_index["fastvideo_refine_lora_path"] = "distilled_lora/model.safetensors"
+        if merged_loras:
+            # A pre-merged transformer must not get a runtime adapter stacked on
+            # top by default — that would double-apply the LoRA.
+            print("Transformer has offline-merged LoRAs; omitting fastvideo_refine_lora_path even though "
+                  "distilled_lora/ exists. Pass refine_lora_path explicitly at runtime to experiment.")
+        else:
+            model_index["fastvideo_refine_lora_path"] = "distilled_lora/model.safetensors"
     return model_index
 
 
@@ -891,12 +1145,16 @@ def _convert_split_transformer(
     source: Path,
     output_dir: Path,
     transformer_class_name: str,
-) -> dict:
-    """Convert one official transformer file; returns its full metadata config.
+    loras: Sequence[tuple[Path, float]] = (),
+    device: str = "cpu",
+) -> tuple[dict, list[dict[str, Any]]]:
+    """Convert one official transformer file; returns (full metadata config, merged-LoRA provenance).
 
     Also refreshes the connector half of ``text_encoder/model.safetensors`` — the
     connectors ship inside the transformer file but belong to the text encoder
-    component, so a transformer swap must carry them along.
+    component, so a transformer swap must carry them along. ``loras`` are merged
+    into the raw source weights before the split (see
+    :func:`_merge_transformer_loras`).
     """
     transformer_metadata = _source_metadata_config(source)
     full_transformer_config = _metadata_config_for_component(transformer_metadata, "transformer")
@@ -905,7 +1163,11 @@ def _convert_split_transformer(
         raise ValueError("Transformer source is missing config.transformer metadata.")
     transformer_config["_class_name"] = transformer_class_name
 
-    transformer_weights, connector_weights = _split_transformer_and_connectors(_load_weights(_find_shards(source)))
+    raw_weights = _load_weights(_find_shards(source))
+    merged_loras: list[dict[str, Any]] = []
+    if loras:
+        merged_loras = _merge_transformer_loras(raw_weights, loras, device=device)
+    transformer_weights, connector_weights = _split_transformer_and_connectors(raw_weights)
     if not transformer_weights:
         raise ValueError("Transformer source did not contain transformer weights.")
 
@@ -915,7 +1177,7 @@ def _convert_split_transformer(
         if not (output_dir / "text_encoder" / "config.json").exists():
             print("text_encoder/ holds only the transformer's connectors so far; also run "
                   "--text-encoder-source to add the Gemma weights, projections, tokenizer, and config.")
-    return full_transformer_config
+    return full_transformer_config, merged_loras
 
 
 def _convert_split_text_encoder(
@@ -1043,13 +1305,19 @@ def _refresh_split_model_index(
     pipeline_class_name: str,
     diffusers_version: str,
     variant: str | None,
+    merged_loras: list[dict[str, Any]] | None = None,
 ) -> None:
     """(Re)write model_index.json from the output directory's current contents.
 
     Runs after every split conversion, so swapping a single component keeps the
     index consistent (e.g. the vae class after a conv <-> HQ swap). Fields not
-    derivable from the directory (variant) fall back to the existing index, so
-    partial re-runs don't silently reset refine defaults.
+    derivable from the directory (variant, merged-LoRA provenance) fall back to
+    the existing index, so partial re-runs don't silently reset refine defaults.
+
+    ``merged_loras`` is authoritative when the transformer was converted this
+    run (a list — possibly empty, which clears any stale marker because the
+    transformer weights were replaced); ``None`` means "not converted this run",
+    preserving the existing index's record.
     """
     missing = [
         name for name in _SPLIT_INDEX_REQUIRED_DIRS if not (output_dir / name / "config.json").exists()
@@ -1068,6 +1336,10 @@ def _refresh_split_model_index(
         recorded = str(existing.get("fastvideo_ltx2_variant", ""))
         variant = recorded.removeprefix("ltx2.5-") if recorded.startswith("ltx2.5-") else "dev"
 
+    if merged_loras is None:
+        recorded_loras = existing.get("fastvideo_transformer_merged_loras")
+        merged_loras = recorded_loras if isinstance(recorded_loras, list) else []
+
     with (output_dir / "vae" / "config.json").open("r", encoding="utf-8") as f:
         vae_class_name = json.load(f).get("_class_name", _CONV_VAE_CLASS_NAME)
 
@@ -1078,6 +1350,7 @@ def _refresh_split_model_index(
         variant=variant,
         distilled_lora=(output_dir / "distilled_lora" / "model.safetensors").exists(),
         vae_class_name=vae_class_name,
+        merged_loras=merged_loras,
     )
     _write_model_index(output_dir, model_index)
 
@@ -1091,11 +1364,13 @@ def convert_split_components(
     audio_vae_source: Path | None = None,
     spatial_upscaler_source: Path | None = None,
     distilled_lora_source: Path | None = None,
+    transformer_loras: Sequence[tuple[Path, float]] | None = None,
     transformer_class_name: str = "LTX2Transformer3DModel",
     variant: str | None = None,
     emit_diffusers_repo: bool = True,
     pipeline_class_name: str = "LTX2Pipeline",
     diffusers_version: str = "0.33.0.dev0",
+    device: str = "cpu",
 ) -> None:
     """Convert the official LTX-2.5 separate-component (comfy-style) checkpoint layout.
 
@@ -1104,6 +1379,13 @@ def convert_split_components(
     distilled transformer) without re-converting the rest. All routing is explicit
     so key drift fails visibly rather than being dropped. Quantized official
     variants are rejected — bf16 files only.
+
+    ``transformer_loras`` (``--transformer-lora``, list of ``(path, strength)``)
+    offline-merges each LoRA into the transformer during its conversion:
+    ``W += strength * (alpha/rank) * (B @ A)`` with fp32 accumulation on
+    ``device`` and source-dtype (bf16) output. The provenance is recorded as
+    ``fastvideo_transformer_merged_loras`` in model_index.json, and the runtime
+    refine-LoRA auto-wiring is disabled for pre-merged transformers.
     """
     sources = {
         "--transformer-source": transformer_source,
@@ -1115,15 +1397,27 @@ def convert_split_components(
     }
     if not any(source is not None for source in sources.values()):
         raise ValueError("LTX-2.5 split conversion needs at least one --*-source argument.")
+    if transformer_loras and transformer_source is None:
+        raise ValueError("--transformer-lora requires --transformer-source in the same run "
+                         "(the merge happens during transformer conversion).")
     for flag, source in sources.items():
         if source is not None:
             _reject_quantized_source(source, flag)
+    for lora_path, _ in transformer_loras or ():
+        _reject_quantized_source(lora_path, "--transformer-lora")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     transformer_metadata: dict | None = None
+    merged_loras: list[dict[str, Any]] | None = None
     if transformer_source is not None:
-        transformer_metadata = _convert_split_transformer(transformer_source, output_dir, transformer_class_name)
+        transformer_metadata, merged_loras = _convert_split_transformer(
+            transformer_source,
+            output_dir,
+            transformer_class_name,
+            loras=transformer_loras or (),
+            device=device,
+        )
     if text_encoder_source is not None:
         _convert_split_text_encoder(text_encoder_source, output_dir, transformer_metadata)
     if vae_source is not None:
@@ -1142,6 +1436,7 @@ def convert_split_components(
             pipeline_class_name=pipeline_class_name,
             diffusers_version=diffusers_version,
             variant=variant,
+            merged_loras=merged_loras,
         )
 
 
@@ -1276,6 +1571,24 @@ def main() -> None:
         help="LTX-2.5 distilled LoRA safetensors (two-stage refine / distilled-recipe adapter).",
     )
     parser.add_argument(
+        "--transformer-lora",
+        action="append",
+        default=[],
+        metavar="PATH[:STRENGTH]",
+        help=("Offline-merge this LoRA into the converted transformer (repeatable, chain order; "
+              "strength defaults to 1.0): W += strength * (alpha/rank) * (B @ A), fp32 accumulation, "
+              "source-dtype (bf16) output. Requires --transformer-source. The production two-stage "
+              "recipe merges the official distilled LoRA once (e.g. ':0.7') so one transformer serves "
+              "both stages with no runtime LoRA; the converted model_index.json then records "
+              "fastvideo_transformer_merged_loras and skips the runtime refine-LoRA auto-wiring."),
+    )
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help="Device for the --transformer-lora merge math (cuda accelerates the B@A GEMMs).",
+    )
+    parser.add_argument(
         "--variant",
         choices=("dev", "distilled"),
         default=None,
@@ -1315,13 +1628,19 @@ def main() -> None:
             audio_vae_source=(Path(args.audio_vae_source) if args.audio_vae_source else None),
             spatial_upscaler_source=(Path(args.spatial_upscaler_source) if args.spatial_upscaler_source else None),
             distilled_lora_source=(Path(args.distilled_lora_source) if args.distilled_lora_source else None),
+            transformer_loras=[parse_lora_spec(spec) for spec in args.transformer_lora],
             transformer_class_name=args.class_name,
             variant=args.variant,
             emit_diffusers_repo=args.diffusers_repo,
             pipeline_class_name=args.pipeline_class_name,
             diffusers_version=args.diffusers_version,
+            device=args.device,
         )
         return
+
+    if args.transformer_lora:
+        raise ValueError("--transformer-lora is only supported for the LTX-2.5 split layout "
+                         "(pass it together with --transformer-source).")
 
     if args.download:
         if args.source:

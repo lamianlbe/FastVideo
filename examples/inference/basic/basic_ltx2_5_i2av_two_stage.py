@@ -14,7 +14,8 @@ Stage 1 (half resolution, joint AV):
     degenerate sigma=1.0 first step, whose uncond output ComfyUI itself discards),
   - sigmas from LTXVScheduler(steps=8, max_shift=4.0, base_shift=1.5, stretch=True,
     terminal=0.1) with the scheduler's no-latent token anchor (4096),
-  - distilled LoRA merged at strength 0.7.
+  - distilled LoRA merged at strength 0.7 (runtime-LoRA mode; see the deployment
+    modes below — pre-merged directories run with no runtime LoRA at all).
 
 Stage 2 (x2 latent upsample + refine):
   - stage-1 latents through LTX-2.5's OWN x2 spatial latent upsampler
@@ -29,7 +30,10 @@ Stage 2 (x2 latent upsample + refine):
 Decode: video VAE (conv or HQ diffusion decoder, whichever the converted ``vae/``
 directory carries) + audio VAE/vocoder, muxed jointly.
 
-Model directory: convert with every 2.5 source including the distilled LoRA, e.g.
+Model directory — two deployment modes:
+
+Experimental (runtime per-stage LoRA, the reference workflow's 0.7 / 0.5): convert
+with every 2.5 source including the distilled LoRA, e.g.
 
     python scripts/checkpoint_conversion/convert_ltx2_weights.py \
       --variant dev \
@@ -42,6 +46,24 @@ Model directory: convert with every 2.5 source including the distilled LoRA, e.g
       --output /models/LTX-2.5-Dev-Diffusers
 
 The upsampler and distilled LoRA auto-resolve from the converted model_index.json.
+
+Production (pre-merged, zero runtime LoRA cost): merge the distilled LoRA into the
+transformer at conversion time instead of bundling it —
+
+    python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+      --variant dev \
+      --transformer-source .../ltx-2.5-22b-dev-transformer-bf16.safetensors \
+      --transformer-lora .../ltx-2.5-22b-distilled-lora-450-bf16.safetensors:0.7 \
+      ... remaining --*-source flags ... \
+      --output /models/LTX-2.5-Dev-Merged-Diffusers
+
+ONE merged transformer then serves BOTH stages (a deliberate deviation from the
+reference workflow's per-stage 0.7/0.5 strengths, accepted for deployment
+simplicity; the single merge strength is a tuning choice — A/B 0.6 vs 0.7). This
+script detects the pre-merged directory from model_index.json
+(fastvideo_transformer_merged_loras present / no fastvideo_refine_lora_path) and
+runs with NO runtime LoRA so nothing is double-applied; --pre-merged forces that
+behavior explicitly.
 
 Notes / assumptions pending GPU verification:
   - The recipe's numerical parity against the ComfyUI reference has not yet been
@@ -56,14 +78,16 @@ Notes / assumptions pending GPU verification:
     frame inplace (2.3-style) for recipe parity — see docs/inference/ltx2_5.md.
   - Per-stage LoRA strengths re-merge the adapter twice per run (exact
     unmerge-to-pristine + re-merge; no drift, but it costs one weight sweep per
-    stage switch). Extra user LoRAs at a fixed strength should be offline-merged
-    into the transformer with scripts/checkpoint_conversion/merge_ltx2_lora_stack.py
-    so the runtime slot stays reserved for the per-stage distilled adapter.
+    stage switch). Any LoRA wanted at a fixed strength — the distilled adapter in
+    production, extra user LoRAs always — should be offline-merged at conversion
+    time with convert_ltx2_weights.py --transformer-lora PATH[:STRENGTH] so the
+    runtime slot stays free (or reserved for per-stage experiments).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from PIL import Image
@@ -137,6 +161,10 @@ def parse_args() -> argparse.Namespace:
                         help="Override the x2 spatial upsampler directory (default: model_index auto-resolve).")
     parser.add_argument("--distilled-lora", default=None,
                         help="Override the distilled LoRA path (default: model_index auto-resolve).")
+    parser.add_argument("--pre-merged", action="store_true",
+                        help="The transformer already has the distilled LoRA merged offline "
+                             "(--transformer-lora at conversion): run BOTH stages on it with no runtime "
+                             "LoRA. Auto-detected from model_index.json; pass this to force it.")
     parser.add_argument("--sigmas-follow-latent", action="store_true",
                         help="Shift the stage-1 schedule by the actual stage-1 latent token count "
                              "(ComfyUI LTXVScheduler with its latent input attached) instead of the "
@@ -185,11 +213,39 @@ def main() -> None:
     model_root = maybe_download_model(args.model_path)
     pipeline_config = PipelineConfig.from_pretrained(model_root)
 
+    # Runtime-LoRA vs pre-merged detection. A directory converted with
+    # --transformer-lora records fastvideo_transformer_merged_loras and omits
+    # fastvideo_refine_lora_path, so both stages run the merged transformer
+    # with no runtime adapter (nothing gets double-applied).
+    if args.pre_merged and args.distilled_lora:
+        raise SystemExit("--pre-merged and --distilled-lora contradict each other: a pre-merged "
+                         "transformer must not get a runtime LoRA stacked on top.")
+    model_index_path = Path(model_root) / "model_index.json"
+    model_index = json.loads(model_index_path.read_text()) if model_index_path.is_file() else {}
+    merged_loras = model_index.get("fastvideo_transformer_merged_loras")
+    runtime_lora_available = bool(args.distilled_lora or model_index.get("fastvideo_refine_lora_path"))
+    use_runtime_lora = runtime_lora_available and not args.pre_merged
+    if not use_runtime_lora:
+        detail = f"offline-merged LoRAs: {merged_loras}" if merged_loras else "no distilled LoRA is wired"
+        print(f"Running BOTH stages on the transformer as-is ({detail}); "
+              "per-stage runtime LoRA strengths are disabled.")
+
     engine_kwargs: dict = {}
     if args.upsampler_path:
         engine_kwargs["ltx2_refine_upsampler_path"] = args.upsampler_path
     if args.distilled_lora:
         engine_kwargs["ltx2_refine_lora_path"] = args.distilled_lora
+    elif args.pre_merged:
+        # Explicit empty path: blocks the model_index fastvideo_refine_lora_path
+        # auto-resolve when --pre-merged is forced on a directory that still
+        # bundles a runtime distilled LoRA.
+        engine_kwargs["ltx2_refine_lora_path"] = ""
+    if use_runtime_lora:
+        # Per-stage distilled-LoRA strengths (0.7 base denoise, 0.5 refine).
+        # Left unset in pre-merged mode: with no refine-LoRA path resolved the
+        # pipeline builds no LoRA stages at all.
+        engine_kwargs["ltx2_stage1_lora_strength"] = float(args.stage1_lora_strength)
+        engine_kwargs["ltx2_refine_lora_strength"] = float(args.refine_lora_strength)
     if args.torch_compile:
         engine_kwargs.update(
             enable_torch_compile=True,
@@ -206,9 +262,6 @@ def main() -> None:
         ltx2_refine_enabled=True,
         ltx2_refine_guidance_scale=1.0,
         ltx2_refine_add_noise=True,
-        # Per-stage distilled-LoRA strengths (0.7 base denoise, 0.5 refine).
-        ltx2_stage1_lora_strength=float(args.stage1_lora_strength),
-        ltx2_refine_lora_strength=float(args.refine_lora_strength),
         # ComfyUI-style CFG++ ancestral sampler in BOTH stages.
         ltx2_sampler="euler_ancestral_cfg_pp",
         ltx2_refine_sampler="euler_ancestral_cfg_pp",

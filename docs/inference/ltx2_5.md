@@ -30,7 +30,9 @@ configuration. The convolutional video VAE is the default decode path.
 
 Add `--distilled-lora-source loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors`
 to bundle the distilled LoRA (used by the dev-transformer two-stage distilled
-recipe below) as `distilled_lora/` inside the output directory.
+recipe below) as `distilled_lora/` inside the output directory — or merge it
+into the transformer offline with `--transformer-lora` (see the deployment
+modes under the two-stage recipe below).
 
 ### Swapping individual components
 
@@ -155,6 +157,53 @@ python examples/inference/basic/basic_ltx2_5_i2av_two_stage.py \
   --first-frame /images/first.png \
   --prompt "The camera pushes in as the scene comes alive with sound"
 ```
+
+### Deployment modes for the distilled LoRA
+
+The distilled LoRA can be applied two ways; both use the same converter and
+example script.
+
+**Production — offline merge (`--transformer-lora`).** Merge the LoRA into the
+transformer once at conversion time; ONE merged transformer then serves BOTH
+stages with zero runtime LoRA cost (no per-run unmerge/re-merge weight sweeps,
+no adapter bookkeeping):
+
+```bash
+python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+  --variant dev \
+  --transformer-source /weights/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+  --transformer-lora /weights/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors:0.7 \
+  --text-encoder-source /weights/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+  --vae-source /weights/ltx-2.5-video-vae-conv-bf16.safetensors \
+  --audio-vae-source /weights/ltx-2.5-audio-vae-bf16.safetensors \
+  --spatial-upscaler-source /weights/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+  --output /models/LTX-2.5-Dev-Merged-Diffusers
+```
+
+`--transformer-lora PATH[:STRENGTH]` is repeatable (chain order, strength
+defaults to 1.0) and merges with the ComfyUI/official semantics
+`W += strength * (alpha/rank) * (B @ A)` — fp32 accumulation, bf16 output;
+`--device cuda` accelerates the merge GEMMs. The converted `model_index.json`
+records the merge as `fastvideo_transformer_merged_loras`, implies
+`fastvideo_refine_enabled`, and never emits `fastvideo_refine_lora_path`, so
+the runtime cannot double-apply an adapter on top of pre-merged weights. The
+example script auto-detects such directories and runs both stages with no
+runtime LoRA (force with `--pre-merged`).
+
+Note this deviates from the reference workflow's per-stage strengths (0.7 for
+stage 1, 0.5 for stage 2): a single shared strength is a deliberate
+simplification for deployment. The merge strength is a quality-tuning choice —
+A/B test around it (e.g. 0.6 vs 0.7) rather than treating 0.7 as canonical.
+
+**Experimental — runtime per-stage strengths.** Keep the LoRA separate
+(`--distilled-lora-source`, or `--distilled-lora` at run time) and let the
+pipeline re-merge it per stage: `ltx2_stage1_lora_strength` (~0.7) and
+`ltx2_refine_lora_strength` (~0.5), exposed by the example as
+`--stage1-lora-strength` / `--refine-lora-strength`. Each strength switch is an
+exact unmerge-to-pristine + re-merge (no drift), costing one weight sweep per
+stage per run — the right tool for strength sweeps and recipe experiments, not
+for serving. Both strength parameters default to no-ops when unset: with no
+refine LoRA wired, the pipeline builds no LoRA stages at all.
 
 Pass `--last-frame /images/last.png` for first+last-frame conditioning
 (flf2v): the last image is pinned inplace at the final latent frame
