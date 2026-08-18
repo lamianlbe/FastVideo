@@ -125,6 +125,13 @@ modes:
 #    timestep) is reproduced.
 # stage1_conditioning: guide_only
 # stage1_guide_strength: 0.8
+#    Comfy additionally biases content<->guide self-attention by
+#    log(stage1_guide_strength) in both directions (guide<->guide and
+#    content<->content untouched), i.e. those attention weights are scaled
+#    ~0.8x before renormalization. It is opt-in because it forces stage-1
+#    attn1 onto the masked SDPA path — no FA4, and an O(seq^2) bias tensor
+#    (~0.3 GB at 834x480x241). Comfy itself skips the bias at strength 1.0.
+# guide_attention_bias: true
 #
 # 2. Per-step CFG. STGGuiderAdvanced maps sigma -> cfg by lookup (smallest
 #    listed sigma still >= the current one), NOT by step index, and its list

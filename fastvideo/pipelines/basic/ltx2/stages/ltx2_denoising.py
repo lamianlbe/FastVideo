@@ -721,6 +721,11 @@ class LTX2DenoisingStage(PipelineStage):
                                         device=latents.device,
                                         dtype=torch.float32)
                 extra_transformer_kwargs["ref_timestep_scale"] = ref_noise_mask
+                # Comfy additionally biases content<->guide self-attention by
+                # log(strength) (LTXVModel._build_self_attention_mask). Opt-in:
+                # it forces attn1 onto the masked SDPA path (no FA4).
+                if fastvideo_args.ltx2_guide_attention_bias:
+                    extra_transformer_kwargs["ref_guide_attn_bias_strength"] = float(guide_strength)
             logger.info("[LTX2] Reference token conditioning active (%s, mode=%s, %s)", ref_key,
                         fastvideo_args.ltx2_reference_position_mode,
                         f"guide strength={guide_strength}" if guide_strength is not None else "clean prefix")

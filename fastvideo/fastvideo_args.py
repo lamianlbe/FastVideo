@@ -285,6 +285,13 @@ class FastVideoArgs:
     ltx2_reference_strength: float = 1.0
     ltx2_reference_position_mode: str = "reference"
     ltx2_reference_zero_timesteps: bool = False
+    # Comfy's LTXVModel._build_self_attention_mask: bias content<->guide
+    # self-attention by log(ltx2_reference_strength) in both directions
+    # (guide<->guide and content<->content untouched), which scales those
+    # attention weights by the strength before renormalization. Comfy skips
+    # it entirely at strength >= 1.0, and so do we. Costs the FA4 fast path
+    # for attn1 (routes through the masked SDPA path, O(seq^2) bias tensor).
+    ltx2_guide_attention_bias: bool = False
     # Stage-1 "guide" semantics for the reference prefix (port of comfy core
     # LTXVAddGuide.append_keyframe, which the workflow's LTXPlusBatchAddGuide
     # calls). None = today's behaviour: a clean prefix scaled by

@@ -199,6 +199,11 @@ class Ltx23ServerConfig:
     #     in-place keyframe at 1.0 either way (= LTXVImgToVideoInplace).
     stage1_conditioning: str = "inplace_and_reference"
     stage1_guide_strength: float = 0.8  # node 926:939 strength
+    # Comfy also biases content<->guide self-attention by log(strength)
+    # (LTXVModel._build_self_attention_mask), scaling those attention weights
+    # by ~0.8x. Opt-in: it forces attn1 onto the masked SDPA path, giving up
+    # FA4 for stage 1. Only meaningful with stage1_conditioning: guide_only.
+    guide_attention_bias: bool = False
     # Per-step CFG. Give the RAW sigma list + cfg values exactly as they
     # appear in the STGGuiderAdvanced node; the engine derives the per-step
     # list for the ACTUAL stage1_sigmas with comfy's sigma lookup and logs
@@ -559,6 +564,7 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
         ltx2_stage1_cfg_values=stage1_cfg_values,
         ltx2_reference_strength=1.0,
         ltx2_reference_position_mode="reference",
+        ltx2_guide_attention_bias=cfg.guide_attention_bias,
         ltx2_reference_zero_timesteps=False,
         # None keeps the clean strength-scaled prefix; a float switches
         # stage 1 to comfy's append_keyframe guide semantics.

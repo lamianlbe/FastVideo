@@ -31,6 +31,41 @@ from fastvideo.layers.quantization.base_config import QuantizationConfig
 from fastvideo.logger import init_logger
 from fastvideo.models.dits.base import BaseDiT
 from fastvideo.models.dits.ltx2_anchor import apply_latent_anchor
+
+
+def build_guide_attention_bias(
+    *,
+    total_tokens: int,
+    n_ref_tokens: int,
+    strength: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Additive log-space bias attenuating content<->guide self-attention.
+
+    Port of ComfyUI ``LTXVModel._build_self_attention_mask``: attention
+    between guide (reference) tokens and content tokens is biased by
+    ``log(strength)`` in BOTH directions, while guide<->guide and
+    content<->content stay untouched. After softmax that scales the
+    cross-block attention weights by ``strength`` before renormalization.
+
+    Comfy appends its guides at the END of the sequence; our reference
+    tokens are a PREFIX (``cat([ref_tokens, latents])``), so the two biased
+    blocks are transposed relative to the reference implementation.
+
+    Returns None when no attenuation is needed — comfy likewise skips the
+    mask entirely once every guide strength reaches 1.0, so strength 1.0
+    stays bit-identical to the unbiased path.
+    """
+    if n_ref_tokens <= 0 or strength >= 1.0:
+        return None
+    if strength <= 0.0:
+        raise ValueError(f"guide attention bias needs strength in (0, 1), got {strength}")
+    log_w = math.log(strength)
+    bias = torch.zeros((1, 1, total_tokens, total_tokens), device=device, dtype=dtype)
+    bias[:, :, n_ref_tokens:, :n_ref_tokens] = log_w  # content rows -> guide cols
+    bias[:, :, :n_ref_tokens, n_ref_tokens:] = log_w  # guide rows -> content cols
+    return bias
 from fastvideo.platforms import AttentionBackendEnum
 
 logger = init_logger(__name__)
@@ -2028,6 +2063,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         skip_audio_self_attn: bool | torch.Tensor = False,
         text_amp: torch.Tensor | None = None,
         latent_anchor: Any | None = None,
+        guide_attn_bias: torch.Tensor | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward pass for transformer block.
 
@@ -2094,13 +2130,20 @@ class BasicAVTransformerBlock(torch.nn.Module):
             norm_vx = _rms_norm_dispatch(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
             video_self_attn_mask = _build_attn_keep_mask(vx, skip_video_self_attn)
             if self.use_distributed_attention:
+                if guide_attn_bias is not None:
+                    raise NotImplementedError(
+                        "LTX-2 guide attention bias is not supported under sequence parallelism: "
+                        "the bias indexes GLOBAL token positions while each rank holds a shard.")
                 vx_attn1_out = self.attn1(
                     norm_vx,
                     pe=video.positional_embeddings,
                     original_seq_len=video_original_seq_len,
                 )
             else:
-                vx_attn1_out = self.attn1(norm_vx, pe=video.positional_embeddings)
+                # A float mask is additive in SDPA, which is exactly comfy's
+                # log-space bias; passing it routes attn1 through attn_masked
+                # (TORCH_SDPA) instead of the FA4 fast path.
+                vx_attn1_out = self.attn1(norm_vx, pe=video.positional_embeddings, mask=guide_attn_bias)
             if latent_anchor is not None:
                 # LTXLatentAnchorAware port: pre-gate additive pull toward the
                 # anchor frame's matched tokens (eager-only, see ltx2_anchor).
@@ -2633,6 +2676,7 @@ class LTXModel(torch.nn.Module):
         text_amp_weight: torch.Tensor | None = None,
         text_amp_blocks: list[int] | None = None,
         latent_anchor: Any | None = None,
+        guide_attn_bias: torch.Tensor | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         # Convert once so per-block membership checks stay O(1).
         skip_video_self_attn_block_set = set(skip_video_self_attn_blocks or [])
@@ -2655,6 +2699,7 @@ class LTXModel(torch.nn.Module):
                 skip_audio_self_attn=skip_a_sa,
                 text_amp=(text_amp_weight if idx in text_amp_block_set else None),
                 latent_anchor=(latent_anchor if idx in anchor_block_set else None),
+                guide_attn_bias=guide_attn_bias,
             )
         return video, audio
 
@@ -2686,6 +2731,7 @@ class LTXModel(torch.nn.Module):
         text_amp_weight: torch.Tensor | None = None,
         text_amp_blocks: list[int] | None = None,
         latent_anchor: Any | None = None,
+        guide_attn_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX model.
 
@@ -2728,6 +2774,7 @@ class LTXModel(torch.nn.Module):
             text_amp_weight=text_amp_weight,
             text_amp_blocks=text_amp_blocks,
             latent_anchor=latent_anchor,
+            guide_attn_bias=guide_attn_bias,
         )
 
         vx = (self._process_output(self.scale_shift_table, self.norm_out, self.proj_out, video_out.x,
@@ -2908,9 +2955,11 @@ class LTX2Transformer3DModel(BaseDiT):
         ref_zero_timesteps: bool = False,
         ref_position_mode: str = "reference",
         ref_timestep_scale: float | None = None,
+        ref_guide_attn_bias_strength: float | None = None,
         text_amp_weight: torch.Tensor | None = None,
         text_amp_blocks: list[int] | None = None,
         latent_anchor: Any | None = None,
+        guide_attn_bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # Reference token conditioning (attention-level identity reference,
@@ -2988,6 +3037,21 @@ class LTX2Transformer3DModel(BaseDiT):
                 ref_sigma = video_sigma.reshape([-1] + [1] * (ref_timestep.dim() - 1))
                 ref_timestep = (ref_sigma * float(ref_timestep_scale)).expand_as(ref_timestep).to(ref_timestep.dtype)
             timestep = torch.cat([ref_timestep, timestep], dim=1)
+
+        # Guide attention bias (comfy parity): built here because only this
+        # scope knows the final token count and the reference prefix width.
+        if ref_guide_attn_bias_strength is not None and guide_attn_bias is None:
+            if sp_world_size > 1:
+                raise NotImplementedError(
+                    "LTX-2 guide attention bias is not supported with sequence parallelism: "
+                    "the bias indexes GLOBAL token positions while each rank holds a shard.")
+            guide_attn_bias = build_guide_attention_bias(
+                total_tokens=latents.shape[1],
+                n_ref_tokens=n_ref_tokens,
+                strength=float(ref_guide_attn_bias_strength),
+                device=latents.device,
+                dtype=latents.dtype,
+            )
 
         if latent_anchor is not None:
             if sp_world_size > 1:
@@ -3145,6 +3209,7 @@ class LTX2Transformer3DModel(BaseDiT):
             text_amp_weight=text_amp_weight,
             text_amp_blocks=text_amp_blocks,
             latent_anchor=latent_anchor,
+            guide_attn_bias=guide_attn_bias,
         )
 
         # Denoised prediction
