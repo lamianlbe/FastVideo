@@ -155,6 +155,18 @@ for deb_pkg in $DEB_PIP_CONFLICTS; do
     fi
 done
 
+echo "== [3.5/6] natten (prebuilt libnatten wheel; Blackwell sm100 FNA kernels) =="
+# pyproject requires natten>=0.21.7 (LTX-2.5 HQ diffusion decoder). PyPI ships
+# only an sdist, so install the prebuilt wheel matching this torch/CUDA pair
+# BEFORE the fastvideo step — otherwise pip compiles natten from source (slow,
+# and built without the Blackwell kernels). Tag: torch2120cu130 etc.
+_torch_tag="torch$(echo "$TORCH_VERSION" | tr -d '.')${TORCH_BACKEND}"
+if "$PYTHON" -c "import natten" 2>/dev/null; then
+    echo "   natten already installed; keeping it"
+else
+    pip_install "natten==0.21.7+${_torch_tag}" -f https://whl.natten.org
+fi
+
 echo "== [4/6] fastvideo (pulls flashinfer-python, fastapi, uvicorn, ...) =="
 pip_install .
 
@@ -175,7 +187,7 @@ expected = os.environ["EXPECTED_CUDA"]
 assert torch.version.cuda == expected, \
     f"torch CUDA {torch.version.cuda!r} != expected {expected!r} — replaced during install!"
 
-for mod in ("fastvideo", "flashinfer", "fastapi", "yaml", "uvicorn"):
+for mod in ("fastvideo", "flashinfer", "fastapi", "yaml", "uvicorn", "natten"):
     importlib.import_module(mod)
     print(f"  {mod}: ok")
 # python-multipart's import name changed across versions.
