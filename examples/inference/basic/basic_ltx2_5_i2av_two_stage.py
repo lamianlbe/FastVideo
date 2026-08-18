@@ -62,7 +62,7 @@ ONE merged transformer then serves BOTH stages (a deliberate deviation from the
 reference workflow's per-stage 0.7/0.5 strengths, accepted for deployment
 simplicity; the single merge strength is a tuning choice — A/B 0.6 vs 0.7). This
 script detects the pre-merged directory from model_index.json
-(fastvideo_transformer_merged_loras present / no fastvideo_refine_lora_path) and
+(_fastvideo_transformer_merged_loras present / no fastvideo_refine_lora_path) and
 runs with NO runtime LoRA so nothing is double-applied; --pre-merged forces that
 behavior explicitly.
 
@@ -126,7 +126,7 @@ def _snap(value: float, multiple: int = 64) -> int:
 
 
 def _derive_final_dims(image_path: Path) -> tuple[int, int]:
-    """Final (H, W) from the conditioning image's aspect ratio, long side 2048."""
+    """Final (H, W) from the conditioning image's aspect ratio, long side 1024."""
     with Image.open(image_path) as img:
         src_w, src_h = img.size
     if src_w >= src_h:
@@ -220,7 +220,7 @@ def main() -> None:
     pipeline_config = PipelineConfig.from_pretrained(model_root)
 
     # Runtime-LoRA vs pre-merged detection. A directory converted with
-    # --transformer-lora records fastvideo_transformer_merged_loras and omits
+    # --transformer-lora records _fastvideo_transformer_merged_loras and omits
     # fastvideo_refine_lora_path, so both stages run the merged transformer
     # with no runtime adapter (nothing gets double-applied).
     if args.pre_merged and args.distilled_lora:
@@ -228,7 +228,10 @@ def main() -> None:
                          "transformer must not get a runtime LoRA stacked on top.")
     model_index_path = Path(model_root) / "model_index.json"
     model_index = json.loads(model_index_path.read_text()) if model_index_path.is_file() else {}
-    merged_loras = model_index.get("fastvideo_transformer_merged_loras")
+    # The unprefixed spelling is what conversions before the metadata-key rename
+    # wrote; those directories are otherwise identical, so keep reading it.
+    merged_loras = (model_index.get("_fastvideo_transformer_merged_loras")
+                    or model_index.get("fastvideo_transformer_merged_loras"))
     runtime_lora_available = bool(args.distilled_lora or model_index.get("fastvideo_refine_lora_path"))
     use_runtime_lora = runtime_lora_available and not args.pre_merged
     if not use_runtime_lora:

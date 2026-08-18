@@ -679,6 +679,12 @@ def verify_model_config_and_directory(
                 continue
             if not isinstance(value, list) or len(value) < 1 or value[0] is None:
                 continue
+            # A component entry is ["library", "Class"]; a list of anything
+            # else is metadata that happens to be a list (e.g. a converter's
+            # record of the LoRAs merged into the transformer), not a
+            # subfolder to look for.
+            if not isinstance(value[0], str):
+                continue
             subdir = os.path.join(model_path, key)
             if not os.path.exists(subdir):
                 raise ValueError(f"Model directory {model_path} declares `{key}` in "

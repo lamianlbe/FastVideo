@@ -57,7 +57,7 @@ stages with zero runtime LoRA cost:
         --variant dev \
         --output converted_weights/ltx2-5-dev-merged
 
-Merged conversions record ``fastvideo_transformer_merged_loras`` in model_index.json,
+Merged conversions record ``_fastvideo_transformer_merged_loras`` in model_index.json,
 imply ``fastvideo_refine_enabled``, and never emit ``fastvideo_refine_lora_path`` —
 so the runtime does not re-apply an adapter on top of pre-merged weights. Pass
 ``--device cuda`` to run the merge GEMMs on GPU.
@@ -1240,7 +1240,7 @@ def _build_split_model_index(
         "fastvideo_refine_add_noise": True,
     })
     if merged_loras:
-        model_index["fastvideo_transformer_merged_loras"] = merged_loras
+        model_index["_fastvideo_transformer_merged_loras"] = merged_loras
     if distilled_lora:
         if merged_loras:
             # A pre-merged transformer must not get a runtime adapter stacked on
@@ -1597,7 +1597,7 @@ def _refresh_split_model_index(
         variant = recorded.removeprefix("ltx2.5-") if recorded.startswith("ltx2.5-") else "dev"
 
     if merged_loras is None:
-        recorded_loras = existing.get("fastvideo_transformer_merged_loras")
+        recorded_loras = existing.get("_fastvideo_transformer_merged_loras")
         merged_loras = recorded_loras if isinstance(recorded_loras, list) else []
 
     with (output_dir / "vae" / "config.json").open("r", encoding="utf-8") as f:
@@ -1645,7 +1645,7 @@ def convert_split_components(
     offline-merges each LoRA into the transformer during its conversion:
     ``W += strength * (alpha/rank) * (B @ A)`` with fp32 accumulation on
     ``device`` and source-dtype (bf16) output. The provenance is recorded as
-    ``fastvideo_transformer_merged_loras`` in model_index.json, and the runtime
+    ``_fastvideo_transformer_merged_loras`` in model_index.json, and the runtime
     refine-LoRA auto-wiring is disabled for pre-merged transformers.
     """
     sources = {
@@ -1851,7 +1851,7 @@ def main() -> None:
               "source-dtype (bf16) output. Requires --transformer-source. The production two-stage "
               "recipe merges the official distilled LoRA once (e.g. ':0.7') so one transformer serves "
               "both stages with no runtime LoRA; the converted model_index.json then records "
-              "fastvideo_transformer_merged_loras and skips the runtime refine-LoRA auto-wiring."),
+              "_fastvideo_transformer_merged_loras and skips the runtime refine-LoRA auto-wiring."),
     )
     parser.add_argument(
         "--device",

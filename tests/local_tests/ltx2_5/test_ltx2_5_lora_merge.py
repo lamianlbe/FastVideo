@@ -11,7 +11,7 @@ Synthetic-only coverage (no downloads, CPU-only) for
 * chained multi-LoRA application (PEFT ``lora_A/lora_B`` and comfy
   ``lora_down/lora_up`` dialects, alpha present and absent);
 * ``PATH[:STRENGTH]`` flag parsing edge cases (strength omitted -> 1.0);
-* model_index.json provenance: ``fastvideo_transformer_merged_loras`` recorded,
+* model_index.json provenance: ``_fastvideo_transformer_merged_loras`` recorded,
   refine implied, runtime ``fastvideo_refine_lora_path`` auto-wiring suppressed
   so a pre-merged transformer never gets an adapter double-applied.
 
@@ -262,7 +262,7 @@ def test_merged_lora_model_index_disables_runtime_wiring(tmp_path: Path) -> None
     )
 
     model_index = json.loads((output / "model_index.json").read_text())
-    assert model_index["fastvideo_transformer_merged_loras"] == [
+    assert model_index["_fastvideo_transformer_merged_loras"] == [
         {"file": "merge.safetensors", "strength": 0.7, "applied": 2},
     ]
     # A merged transformer behaves like the distilled recipe: refine implied ...
@@ -273,14 +273,14 @@ def test_merged_lora_model_index_disables_runtime_wiring(tmp_path: Path) -> None
     # A partial re-run (component swap) preserves the merged-LoRA record.
     converter.convert_split_components(vae_source=sources["vae"], output_dir=output)
     model_index = json.loads((output / "model_index.json").read_text())
-    assert model_index["fastvideo_transformer_merged_loras"][0]["file"] == "merge.safetensors"
+    assert model_index["_fastvideo_transformer_merged_loras"][0]["file"] == "merge.safetensors"
     assert "fastvideo_refine_lora_path" not in model_index
 
     # Re-converting the transformer WITHOUT LoRAs replaces the weights, clears the
     # marker, and restores the bundled distilled_lora runtime wiring.
     converter.convert_split_components(transformer_source=sources["transformer"], output_dir=output)
     model_index = json.loads((output / "model_index.json").read_text())
-    assert "fastvideo_transformer_merged_loras" not in model_index
+    assert "_fastvideo_transformer_merged_loras" not in model_index
     assert model_index["fastvideo_refine_lora_path"] == "distilled_lora/model.safetensors"
 
 
