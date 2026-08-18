@@ -121,6 +121,187 @@ COMPONENT_PREFIXES: dict[str, tuple[str, ...]] = {
     "text_embedding_projection": ("text_embedding_projection.", "model.text_embedding_projection."),
 }
 
+# Verbatim ``gemma_config`` header metadata from the official LTX-2.5 text
+# encoder (Lightricks/LTX-2.5 text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16,
+# architecture "Gemma4UnifiedForConditionalGeneration", gemma_version "gemma4-12b-ltx-v1").
+# Community finetunes of that encoder (e.g. the Heretic uncensored Gemma 4)
+# ship the identical key layout and weight shapes but omit the metadata, so
+# this serves as the fallback config for them — see _resolve_gemma_config.
+OFFICIAL_GEMMA4_CONFIG_JSON = """\
+{
+  "architectures": [
+    "Gemma4UnifiedForConditionalGeneration"
+  ],
+  "audio_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "audio_embed_dim": 640,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "model_type": "gemma4_unified_audio",
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "problem_type": null,
+    "return_dict": true,
+    "rms_norm_eps": 1e-06
+  },
+  "audio_token_id": 258881,
+  "boa_token_id": 256000,
+  "boi_token_id": 255999,
+  "dtype": "bfloat16",
+  "eoa_token_index": 258883,
+  "eoi_token_id": 258882,
+  "eos_token_id": [
+    1,
+    106
+  ],
+  "gemma_version": "gemma4-12b-ltx-v1",
+  "image_token_id": 258880,
+  "initializer_range": 0.02,
+  "model_type": "gemma4_unified",
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "attention_k_eq_v": true,
+    "bos_token_id": 2,
+    "dtype": "bfloat16",
+    "enable_moe_block": false,
+    "eos_token_id": 1,
+    "final_logit_softcapping": 30.0,
+    "global_head_dim": 512,
+    "head_dim": 256,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "hidden_size": 3840,
+    "hidden_size_per_layer_input": 0,
+    "initializer_range": 0.02,
+    "intermediate_size": 15360,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 262144,
+    "model_type": "gemma4_unified_text",
+    "moe_intermediate_size": null,
+    "num_attention_heads": 16,
+    "num_experts": null,
+    "num_global_key_value_heads": 1,
+    "num_hidden_layers": 48,
+    "num_key_value_heads": 8,
+    "num_kv_shared_layers": 0,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional"
+      },
+      "sliding_attention": {
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "sliding_window": 1024,
+    "tie_word_embeddings": true,
+    "top_k_experts": null,
+    "use_bidirectional_attention": "vision",
+    "use_cache": true,
+    "use_double_wide_mlp": false,
+    "vocab_size": 262144,
+    "vocab_size_per_layer_input": 262144
+  },
+  "tie_word_embeddings": true,
+  "transformers_version": "5.10.1",
+  "video_token_id": 258884,
+  "vision_config": {
+    "_name_or_path": "",
+    "architectures": null,
+    "chunk_size_feed_forward": 0,
+    "dtype": "bfloat16",
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "mm_embed_dim": 3840,
+    "mm_posemb_size": 1120,
+    "model_type": "gemma4_unified_vision",
+    "num_soft_tokens": 280,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "output_proj_dims": 3840,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "problem_type": null,
+    "return_dict": true,
+    "rms_norm_eps": 1e-06
+  }
+}
+"""
+
+OFFICIAL_GEMMA4_CONFIG = json.loads(OFFICIAL_GEMMA4_CONFIG_JSON)
+
 PACKED_GEMMA_CONFIG_METADATA_KEY = "gemma_config"
 PACKED_GEMMA_TOKENIZER_KEY = "tokenizer_json"
 PACKED_GEMMA_ASSET_PREFIX = "hf_asset__"
@@ -557,20 +738,98 @@ def _write_bytes(path: Path, value: bytes) -> None:
     path.write_bytes(value)
 
 
+def _load_gemma_config_override(config_source: Path) -> dict:
+    """Read a ``gemma_config`` from a JSON file or another safetensors header.
+
+    Passing the official text encoder as ``--text-encoder-config`` borrows its
+    metadata verbatim, which is the exact-fidelity option when it is on hand.
+    """
+    if not config_source.exists():
+        raise ValueError(f"--text-encoder-config path does not exist: {config_source}")
+    if config_source.suffix == ".safetensors":
+        metadata = _read_safetensors_metadata(config_source)
+        raw = metadata.get(PACKED_GEMMA_CONFIG_METADATA_KEY)
+        if raw is None:
+            raise ValueError(f"--text-encoder-config {config_source} carries no "
+                             f"{PACKED_GEMMA_CONFIG_METADATA_KEY!r} metadata to borrow.")
+        return json.loads(raw)
+    with config_source.open(encoding="utf-8") as f:
+        config = json.load(f)
+    # Accept either a bare gemma_config or a wrapper holding it under its key.
+    inner = config.get(PACKED_GEMMA_CONFIG_METADATA_KEY)
+    return inner if isinstance(inner, dict) else config
+
+
+def _gemma_layout_mismatches(header_keys: dict[str, tuple]) -> list[str]:
+    """Structural differences from the official packed Gemma 4 layout.
+
+    Only the weight tensors are compared: the ``hf_asset__*`` blobs and
+    ``tokenizer_json`` are byte payloads whose lengths legitimately differ
+    between finetunes.
+    """
+    text_config = OFFICIAL_GEMMA4_CONFIG["text_config"]
+    expected_layers = int(text_config["num_hidden_layers"])
+    expected_hidden = int(text_config["hidden_size"])
+    expected_vocab = int(text_config["vocab_size"])
+
+    problems: list[str] = []
+    layer_indices = {
+        int(key.split(".")[2])
+        for key in header_keys
+        if key.startswith("model.layers.") and key.split(".")[2].isdigit()
+    }
+    if len(layer_indices) != expected_layers:
+        problems.append(f"expected {expected_layers} transformer layers, found {len(layer_indices)}")
+    embed = header_keys.get("model.embed_tokens.weight")
+    if embed is None:
+        problems.append("missing model.embed_tokens.weight")
+    elif tuple(embed) != (expected_vocab, expected_hidden):
+        problems.append(f"model.embed_tokens.weight is {tuple(embed)}, expected {(expected_vocab, expected_hidden)}")
+    for required in ("model.norm.weight", PACKED_GEMMA_TOKENIZER_KEY):
+        if required not in header_keys:
+            problems.append(f"missing {required}")
+    if not any(key.startswith("text_embedding_projection.") for key in header_keys):
+        problems.append("no text_embedding_projection.* weights")
+    return problems
+
+
+def _resolve_gemma_config(source_file: Path, config_override: Path | None) -> dict:
+    """Pick the Gemma config: explicit override, embedded metadata, then the
+    built-in official config for community finetunes that ship none."""
+    if config_override is not None:
+        print(f"Using --text-encoder-config {config_override} for the Gemma architecture config")
+        return _load_gemma_config_override(config_override)
+
+    metadata = _read_safetensors_metadata(source_file)
+    raw_gemma_config = metadata.get(PACKED_GEMMA_CONFIG_METADATA_KEY)
+    if raw_gemma_config is not None:
+        return json.loads(raw_gemma_config)
+
+    header_index = _read_safetensors_header_index(source_file)
+    header_keys = {name: tuple(entry.get("shape", ())) for name, entry in header_index.items()}
+    mismatches = _gemma_layout_mismatches(header_keys)
+    if mismatches:
+        raise ValueError(f"Packed text encoder {source_file} is missing {PACKED_GEMMA_CONFIG_METADATA_KEY!r} "
+                         "metadata and does not match the official Gemma 4 layout, so the built-in config "
+                         "cannot be assumed:\n  - " + "\n  - ".join(mismatches) +
+                         "\nPass --text-encoder-config <config.json | official-text-encoder.safetensors>.")
+    print(f"WARNING: {source_file} carries no {PACKED_GEMMA_CONFIG_METADATA_KEY!r} metadata. Its weight layout "
+          f"matches the official LTX-2.5 Gemma 4 encoder, so the built-in official config is being used "
+          f"(gemma_version {OFFICIAL_GEMMA4_CONFIG.get('gemma_version')!r}). Pass --text-encoder-config to "
+          f"override if this finetune changed the architecture.")
+    return json.loads(json.dumps(OFFICIAL_GEMMA4_CONFIG))
+
+
 def _unpack_packed_gemma(
     source_path: Path,
     output_dir: Path,
+    config_override: Path | None = None,
 ) -> tuple[OrderedDict, dict]:
     shards = _find_shards(source_path)
     if len(shards) != 1:
         raise ValueError("Packed LTX-2.5 text encoder must resolve to exactly one safetensors file.")
     source_file = shards[0]
-    metadata = _read_safetensors_metadata(source_file)
-    raw_gemma_config = metadata.get(PACKED_GEMMA_CONFIG_METADATA_KEY)
-    if raw_gemma_config is None:
-        raise ValueError(
-            f"Packed text encoder {source_file} is missing {PACKED_GEMMA_CONFIG_METADATA_KEY!r} metadata.")
-    gemma_config = json.loads(raw_gemma_config)
+    gemma_config = _resolve_gemma_config(source_file, config_override)
 
     gemma_weights: OrderedDict[str, torch.Tensor] = OrderedDict()
     projection_weights: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -1184,6 +1443,7 @@ def _convert_split_text_encoder(
     source: Path,
     output_dir: Path,
     transformer_metadata: dict | None,
+    config_override: Path | None = None,
 ) -> None:
     """Convert the packed Gemma 4 text encoder file.
 
@@ -1199,7 +1459,7 @@ def _convert_split_text_encoder(
             "--transformer-source in the same run, or convert the transformer into this "
             "--output first (text_encoder/config.json derives from transformer/config.json).")
 
-    projection_weights, gemma_config = _unpack_packed_gemma(source, output_dir)
+    projection_weights, gemma_config = _unpack_packed_gemma(source, output_dir, config_override)
     if not projection_weights:
         raise ValueError("Text encoder source did not contain LTX text projections.")
     text_encoder_config = _build_split_text_encoder_config(transformer_metadata, gemma_config)
@@ -1360,6 +1620,7 @@ def convert_split_components(
     output_dir: Path,
     transformer_source: Path | None = None,
     text_encoder_source: Path | None = None,
+    text_encoder_config: Path | None = None,
     vae_source: Path | None = None,
     audio_vae_source: Path | None = None,
     spatial_upscaler_source: Path | None = None,
@@ -1419,7 +1680,7 @@ def convert_split_components(
             device=device,
         )
     if text_encoder_source is not None:
-        _convert_split_text_encoder(text_encoder_source, output_dir, transformer_metadata)
+        _convert_split_text_encoder(text_encoder_source, output_dir, transformer_metadata, text_encoder_config)
     if vae_source is not None:
         _convert_split_vae(vae_source, output_dir)
     if audio_vae_source is not None:
@@ -1549,6 +1810,16 @@ def main() -> None:
         help="LTX-2.5 packed Gemma 4 text-encoder safetensors file.",
     )
     parser.add_argument(
+        "--text-encoder-config",
+        type=str,
+        help=("Gemma architecture config for text encoders that ship no 'gemma_config' header "
+              "metadata (community finetunes such as the Heretic uncensored Gemma 4). Accepts a "
+              "config.json or another safetensors file to borrow the metadata from (e.g. the "
+              "official gemma4-12b-with-proj-ltx-2.5 encoder). Without this flag a metadata-less "
+              "encoder falls back to the built-in official config, but only after its weight "
+              "layout is verified to match."),
+    )
+    parser.add_argument(
         "--vae-source",
         type=str,
         help=("LTX-2.5 video VAE safetensors file or sharded directory. Accepts the convolutional "
@@ -1624,6 +1895,7 @@ def main() -> None:
             output_dir=Path(args.output),
             transformer_source=(Path(args.transformer_source) if args.transformer_source else None),
             text_encoder_source=(Path(args.text_encoder_source) if args.text_encoder_source else None),
+            text_encoder_config=(Path(args.text_encoder_config) if args.text_encoder_config else None),
             vae_source=(Path(args.vae_source) if args.vae_source else None),
             audio_vae_source=(Path(args.audio_vae_source) if args.audio_vae_source else None),
             spatial_upscaler_source=(Path(args.spatial_upscaler_source) if args.spatial_upscaler_source else None),

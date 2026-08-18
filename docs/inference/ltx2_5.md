@@ -67,6 +67,34 @@ Only the official `-bf16` files are supported. The quantized variants
 supported" error — quantized deployment happens after conversion, not through
 it.
 
+### Community text encoders without `gemma_config`
+
+The converter reads the Gemma architecture from the `gemma_config` header
+metadata of the packed text encoder. Community finetunes of the official
+encoder — for example the Heretic uncensored Gemma 4 builds — ship the
+identical key layout and weight shapes but drop that metadata, which by
+itself would fail the conversion.
+
+Point `--text-encoder-config` at any config source when that happens. It
+accepts a bare `config.json` or another safetensors file to borrow the
+metadata from, which makes the official encoder itself the exact-fidelity
+answer if it is already on disk:
+
+```bash
+python scripts/checkpoint_conversion/convert_ltx2_weights.py \
+  --text-encoder-source /weights/Gemma-4-12B-it-uncensored-heretic-LTX-2.5-ComfyUI-bf16.safetensors \
+  --text-encoder-config /weights/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+  --output /models/LTX-2.5-Merged
+```
+
+Without the flag, a metadata-less encoder falls back to the official config
+that ships with the converter, but only after its weight layout is verified
+against the official one (layer count, embedding shape, the projection and
+tokenizer payloads). A match logs a warning naming the assumed
+`gemma_version` and proceeds; a mismatch aborts with the specific
+differences and points back at `--text-encoder-config`, so a genuinely
+different architecture is never converted against the wrong config.
+
 ## High-quality diffusion video decoder (DiffVAE)
 
 LTX-2.5 also ships a diffusion-based video decoder
