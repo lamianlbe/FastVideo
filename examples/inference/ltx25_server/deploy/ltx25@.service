@@ -1,0 +1,48 @@
+# systemd template unit for the LTX-2.5 server — one instance per GPU.
+# The instance name IS the GPU id: ltx25@0 -> GPU 0, ltx25@1 -> GPU 1.
+#
+# Install (adjust the paths in this file to your VM first):
+#   sudo cp ltx25@.service /etc/systemd/system/
+#   sudo mkdir -p /etc/ltx25
+#   sudo cp ltx25.env.example /etc/ltx25/0.env   # edit PORT / LOG_DIR
+#   sudo cp ltx25.env.example /etc/ltx25/1.env   # PORT=8081, gpu1 log dir
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ltx25@0 ltx25@1
+#
+# Manage:
+#   systemctl status ltx25@0
+#   journalctl -u ltx25@0 -f            # warmup + [request] stdout lines
+#   sudo systemctl restart ltx25@1
+#   sudo systemctl stop ltx25@0 ltx25@1
+
+[Unit]
+Description=LTX-2.5 video server (GPU %i)
+After=network-online.target
+Wants=network-online.target
+# If it fails 5 times within 10 min, stop retrying (something is broken —
+# a wedged GPU that never recovers, a bad config) rather than loop forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# PORT + LOG_DIR per instance; GPU comes from the instance name (%i).
+EnvironmentFile=/etc/ltx25/%i.env
+# Equivalent of `env -u LD_LIBRARY_PATH`: keep pip/torch's bundled CUDA
+# libs ahead of any system cuBLAS. systemd starts clean, but a global
+# LD_LIBRARY_PATH in /etc/environment would otherwise leak in.
+UnsetEnvironment=LD_LIBRARY_PATH
+# --- adjust these three paths to your VM ---
+WorkingDirectory=/workspace/FastVideo/examples/inference/ltx25_server
+ExecStart=/workspace/.venv/bin/python server.py --config /workspace/ltx25/config.yaml --gpu %i --port ${PORT} --log-dir ${LOG_DIR}
+# Crashes AND the server's own exit(1) on max_consecutive_failures (a
+# wedged GPU) both count as failure -> systemd restarts a fresh process.
+Restart=on-failure
+RestartSec=5
+# Warmup runs before the port binds; don't gate on it (Type=simple ignores
+# start timeout anyway). Give in-flight requests time to finish on stop.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

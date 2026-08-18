@@ -1,0 +1,142 @@
+# LTX-2.5 server configuration (two-stage distilled i2v / flf2v recipe).
+#
+# Copy to config.yaml, adjust paths/modes, then:
+#   1. env -u LD_LIBRARY_PATH python build_compile_cache.py --config config.yaml
+#   2. env -u LD_LIBRARY_PATH python server.py --config config.yaml
+
+# Converted LTX-2.5 dev directory (scripts/checkpoint_conversion/convert_ltx2_weights.py).
+# Production: convert with --transformer-lora <distilled lora>:0.7 so the
+# distilled LoRA is PRE-MERGED and neither stage pays a runtime merge.
+model_path: /workspace/LTX-2.5-Dev-Merged-Diffusers
+# "" = auto-detect <model_path>/spatial_upsampler (what the 2.5 converter
+# writes) or spatial_upscaler. MUST be LTX-2.5's OWN x2 latent upsampler —
+# the LTX-2.3 upscaler does not match the 2.5 latent distribution.
+upsampler_path: ""
+# Runtime distilled LoRA. "" = use whatever model_index.json wires, which is
+# NOTHING for a pre-merged transformer (auto-detected). Set this only for the
+# experimental runtime-LoRA mode; it re-merges the adapter once per stage per
+# request, so it is a strength-sweep tool, not a serving configuration.
+distilled_lora_path: ""
+# Force pre-merged mode (both stages on the transformer as-is, no runtime
+# LoRA). Auto-detected from model_index.json; set true only to override a
+# directory that still bundles distilled_lora/.
+pre_merged: false
+
+# Linear quant tier: none (bf16, DEFAULT for 2.5 — quantized 2.5 deployment
+# is explicitly follow-up work, see docs/inference/ltx2_5.md "Current scope")
+# | nvfp4 | fp8 | fp8_channel. Changing this changes the compiled graphs ->
+# re-run build_compile_cache.py.
+quant: none
+num_gpus: 1
+# Which physical GPU this instance uses. "" = all visible / shell default.
+# On a multi-GPU box, run ONE server per GPU: give each its own
+# cuda_visible_devices + port + log_dir (see README). Overridable per
+# launch with --gpu. The count must match num_gpus.
+cuda_visible_devices: ""  # e.g. "0" on instance A, "1" on instance B
+attention_backend: FLASH_ATTN
+fa4: true                 # FA4 (flash_attn.cute) — needs the pinned install
+# FP8 (e4m3) attention per stage: ~2x tensor-core rate on both attention
+# GEMMs vs bf16, per-head descale. false = current bf16 path. Changing
+# these changes the compiled graph -> re-run build_compile_cache.py.
+fa4_fp8_stage1: false
+fa4_fp8_stage2: false
+
+# Video decoder: NOT configured here — whichever VAE the converted vae/
+# directory carries decides (conv vs the HQ diffusion decoder). The startup
+# log prints which one loaded. Knobs that only matter for the HQ decoder:
+na_backend: ""            # "" = auto (natten, REQUIRED on CUDA); triton|eager = slow debug
+vae_tiling: false         # recommended true at 720p+ with the HQ decoder
+
+# Persistent torch.compile artifact cache — REQUIRED for sane startup times.
+# Shareable across machines with an identical GPU/driver/torch/fastvideo stack.
+# NOTE each mode compiles TWO transformer shapes (half-res stage 1 + full-res
+# stage 2), so budget roughly double the 2.3 per-mode compile time.
+inductor_cache_dir: /workspace/inductor_cache
+compile: true
+warmup_on_start: true     # trace every mode before serving traffic
+
+host: 0.0.0.0
+port: 8000
+# "" = system temp. Per-request scratch dirs (uploads + output) live here
+# and are deleted after the response is sent.
+output_dir: ""
+# Request log directory: requests.jsonl (rotating JSON lines, one per
+# request) + failed/<request_id>/ (inputs of failed generations, for
+# repro). "" = stdout only. Point at the network volume in production.
+log_dir: /workspace/ltx25/logs
+# Exit(1) after this many consecutive generation failures so the
+# supervisor (docker --restart / run_server.sh) restarts a wedged GPU
+# worker. 0 disables.
+max_consecutive_failures: 3
+# Allowed API keys. Non-empty: every /v1/* request must send one via
+# "X-API-Key: <key>" or "Authorization: Bearer <key>" (else 401);
+# /healthz stays open for the docker HEALTHCHECK. Empty list = no auth.
+api_keys:
+  - CHANGE-ME-master-key
+  # - CHANGE-ME-secondary-key
+
+# H.264 encode (B200 has no NVENC): RGB->YUV420 on the GPU, then piped to
+# an ffmpeg/libx264 subprocess (main profile, VBR). GPU color conversion
+# bypasses libav's single-threaded swscale (the serial bottleneck).
+# Encoding runs outside the GPU lock, overlapping the next request's
+# generation; the response returns once encoding finishes.
+video_bitrate_kbps: 3000  # average bitrate; per-request override available
+x264_preset: veryfast     # HQ preset; ultrafast ~2x faster at same bitrate
+encode_threads: 0         # x264 -threads; 0 = auto
+max_concurrent_encodes: 2 # cap simultaneous encodes (HQ+LQ pair = 1 unit)
+video_codec: libx264      # e.g. libx265 (needs an ffmpeg with that encoder)
+# Extra ffmpeg video-encoder args (applied to HQ + LQ), e.g. to enable
+# x265 AVX-512 or tag HEVC for QuickTime:
+# extra_video_args: "-x265-params asm=avx512 -tag:v hvc1"
+extra_video_args: ""
+
+# /v1/generate_s3 low-quality variant: half width/height + GPU gaussian
+# blur, constrained baseline @ lq_bitrate_kbps (preset fast), AAC-LC mono
+# 64 kbps. blur radius = gaussian sigma in pixels at the LQ resolution.
+lq_blur_radius: 2.0
+lq_bitrate_kbps: 1000
+lq_x264_preset: ultrafast  # LQ is a throwaway proxy — fastest preset
+
+# S3 destination — required only for /v1/generate_s3 (uploads hq.mp4 +
+# lq.mp4, returns their s3://bucket/key URIs as JSON; downstream signs).
+# s3:
+#   region: us-east-1
+#   bucket: CHANGE-ME
+#   access_key: CHANGE-ME
+#   secret_key: CHANGE-ME
+#   endpoint_url: ""            # set for R2/MinIO-compatible stores
+#   prefix: ""                  # directory; "" = bucket root. Each output is
+#                               # <prefix>/<uuid4>.mp4, e.g. sg/xxxx-...-xxxx.mp4
+
+# Every supported combination. width/height are the FINAL (stage-2) size:
+# STAGE 1 RENDERS AT HALF OF IT and the x2 latent upsampler brings it back
+# up, so 2048x1152 below denoises stage 1 at 1024x576. Requests that don't
+# exactly match a mode are served with the closest-resolution one.
+# Constraints: width/height divisible by 64 (half must still divide by 32),
+# num_frames = 8*k + 1.
+modes:
+  - {width: 2048, height: 1152, num_frames: 121, fps: 24}
+  - {width: 1152, height: 2048, num_frames: 121, fps: 24}
+  # - {width: 1600, height: 896, num_frames: 121, fps: 24}
+  # - {width: 2048, height: 1152, num_frames: 241, fps: 24}
+
+# --- Optional recipe overrides (defaults = the validated two-stage recipe,
+# --- kept in sync with examples/inference/basic/basic_ltx2_5_i2av_two_stage.py) ---
+# Stage-1 sigmas are COMPUTED per mode from the LTXVScheduler formula below,
+# shifted by that mode's stage-1 latent token count (what the reference
+# workflow does by wiring the stage-1 latent into the scheduler node).
+# stage1_steps: 8
+# stage1_max_shift: 4.0
+# stage1_base_shift: 1.5
+# stage1_stretch: true
+# stage1_terminal: 0.1
+# sigmas_token_anchor: false   # true = the node's detached tokens=4096 anchor
+# stage2_sigmas: [0.85, 0.7250, 0.4219, 0.0]
+# image_crf: 38.0              # LTXVPreprocess img_compression; BOTH stages
+# first_frame_strength_stage1: 0.8
+# first_frame_strength_stage2: 1.0
+# last_frame_strength: 0.8     # flf2v tail anchor (stage 1; stage 2 opt-in)
+# negative_prompt: ""          # CFG++ needs uncond embeddings; empty is fine
+# Runtime-LoRA mode only (ignored when the transformer is pre-merged):
+# stage1_lora_strength: 0.7
+# refine_lora_strength: 0.5
