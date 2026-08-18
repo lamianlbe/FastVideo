@@ -98,6 +98,7 @@ surfaces:
       ltx2_reference_strength: "LTX-2 reference-token latent strength; no typed equivalent yet."
       ltx2_reference_position_mode: "LTX-2 reference-token RoPE position mode; no typed equivalent yet."
       ltx2_reference_zero_timesteps: "LTX-2 reference-token timestep zeroing knob; no typed equivalent yet."
+      ltx2_reference_guide_strength: "LTX-2 stage-1 append-keyframe guide strength for the reference prefix; no typed equivalent yet."
       ltx2_text_amp_scale: "LTX-2 text attention amplifier scale; no typed equivalent yet."
       ltx2_text_amp_blocks: "LTX-2 text attention amplifier block filter; no typed equivalent yet."
       ltx2_text_amp_spatial_focus: "LTX-2 text attention amplifier spatial focus; no typed equivalent yet."
@@ -109,6 +110,7 @@ surfaces:
       ltx2_anchor_decay_with_distance: "LTX-2 latent anchor temporal falloff; no typed equivalent yet."
       ltx2_anchor_energy_threshold: "LTX-2 latent anchor energy gate; no typed equivalent yet."
       ltx2_anchor_frame: "LTX-2 latent anchor source frame; no typed equivalent yet."
+      ltx2_anchor_reference_image_path: "LTX-2 latent anchor energy-map image; no typed equivalent yet."
     private_only:
       ray_placement_group: "Ray deployment-only field."
       ray_runtime_env: "Ray deployment-only field."
@@ -542,6 +544,7 @@ surfaces:
       ltx2_image_crf_stage2: request.stage_overrides.refine.image_crf_stage2
       ltx2_image_crf: request.stage_overrides.refine.image_crf
       ltx2_reference_image_path: request.extensions.ltx2.reference_image_path
+      ltx2_anchor_reference_image_path: request.extensions.ltx2.anchor_reference_image_path
       ltx2_conditioning_latent_stage1: request.extensions.ltx2.conditioning_latent_stage1
       ltx2_conditioning_latent_stage2: request.extensions.ltx2.conditioning_latent_stage2
       ltx2_video_conditions: request.extensions.ltx2.video_conditions

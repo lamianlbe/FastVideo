@@ -18,7 +18,7 @@ from fastvideo.pipelines.stages.base import PipelineStage
 from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
     LTX2_REFERENCE_LATENT_STAGE1_KEY, LTX2_VIDEO_CLEAN_LATENT_KEY, LTX2_VIDEO_DENOISE_MASK_KEY,
     apply_ltx2_gaussian_noiser, build_ltx2_image_conditioning, build_ltx2_reference_latent,
-    resolve_ltx2_reference_image_path)
+    resolve_ltx2_anchor_reference_image_path, resolve_ltx2_reference_image_path)
 from fastvideo.pipelines.stages.validators import StageValidators as V
 from fastvideo.pipelines.stages.validators import VerificationResult
 
@@ -224,7 +224,10 @@ class LTX2LatentPreparationStage(PipelineStage):
         reference_image_path = resolve_ltx2_reference_image_path(batch, fastvideo_args)
 
         if fastvideo_args.ltx2_anchor_strength > 0.0 and fastvideo_args.ltx2_anchor_energy_threshold > 0.0:
-            anchor_image = reference_image_path
+            # The ComfyUI workflow resizes the anchor's reference image
+            # independently of the guide (cover-crop to the output WxH), so a
+            # dedicated path wins over the reference-token image here.
+            anchor_image = resolve_ltx2_anchor_reference_image_path(batch, fastvideo_args) or reference_image_path
             if not anchor_image and batch.ltx2_images:
                 anchor_image = batch.ltx2_images[0][0]
             if not anchor_image and batch.image_path:
@@ -249,21 +252,27 @@ class LTX2LatentPreparationStage(PipelineStage):
                                "conditioning image found; falling back to uniform mask.")
 
         if reference_image_path:
+            # Guide mode carries strength through the per-step noise level and
+            # the prefix timestep (comfy append_keyframe), so the latent itself
+            # stays unscaled; "scale" mode keeps the legacy strength multiply.
+            guide_strength = fastvideo_args.ltx2_reference_guide_strength
             batch.extra[LTX2_REFERENCE_LATENT_STAGE1_KEY] = build_ltx2_reference_latent(
                 vae=self.vae,
                 image_path=reference_image_path,
                 height=height,
                 width=width,
-                strength=fastvideo_args.ltx2_reference_strength,
+                strength=(1.0 if guide_strength is not None else fastvideo_args.ltx2_reference_strength),
                 image_crf=float(getattr(batch, "ltx2_image_crf", 0.0) or 0.0),
                 out_device=latents.device,
                 out_dtype=latents.dtype,
             )
             logger.info(
-                "[LTX2] Encoded stage-1 reference latent from %s at %dx%d.",
+                "[LTX2] Encoded stage-1 reference latent from %s at %dx%d (%s).",
                 reference_image_path,
                 width,
                 height,
+                f"guide strength={guide_strength}" if guide_strength is not None else
+                f"scale={fastvideo_args.ltx2_reference_strength}",
             )
 
         batch.latents = latents

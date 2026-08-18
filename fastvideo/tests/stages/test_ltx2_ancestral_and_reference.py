@@ -341,6 +341,108 @@ def test_reference_prefix_zero_timesteps_changes_output(tiny_ltx2_model):
     assert not torch.allclose(inherited, zeroed)
 
 
+def test_reference_prefix_timestep_scale(tiny_ltx2_model):
+    """Guide semantics give the prefix its own ``scale * sigma`` timestep
+    (comfy's noise_mask = 1 - strength through LTXAV.process_timestep)
+    instead of copying the target's token-0 timestep."""
+    ref_latent = torch.randn(1, 4, 1, 2, 2, dtype=torch.float32)
+    inherited = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent)
+    # _forward_tiny drives a uniform timestep, so scale 1.0 reproduces the
+    # inherited value exactly — the knob is a pure superset.
+    scaled_one = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, ref_timestep_scale=1.0)
+    torch.testing.assert_close(scaled_one, inherited)
+    # strength 0.8 -> the prefix sits at 0.2 * sigma.
+    scaled = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, ref_timestep_scale=0.2)
+    assert not torch.allclose(scaled, inherited)
+    # ref_zero_timesteps still wins (it is the stronger override).
+    zeroed = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, ref_zero_timesteps=True, ref_timestep_scale=0.2)
+    torch.testing.assert_close(zeroed, _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent,
+                                                     ref_zero_timesteps=True))
+
+
+def test_latent_anchor_with_reference_prefix(tiny_ltx2_model):
+    """The ComfyUI parity recipe runs the anchor AND the guide prefix at the
+    same time, so the anchor's token_offset must skip the prefix (the DiT
+    rejects a mismatch instead of silently misaligning the grid)."""
+    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext
+
+    ref_latent = torch.randn(1, 4, 1, 2, 2, dtype=torch.float32)
+    n_ref_tokens = 1 * 2 * 2
+    ctx = LatentAnchorContext(strength=0.5, blocks=[0, 1], frames=2, height_tokens=2, width_tokens=2,
+                              energy_threshold=0.0, token_offset=n_ref_tokens)
+    with_both = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, latent_anchor=ctx)
+    ref_only = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent)
+    assert with_both.shape == ref_only.shape
+    assert not torch.allclose(with_both, ref_only)
+    # A stale offset (the pre-prefix default) is a hard error, not a silent
+    # off-by-N over the token grid.
+    stale = LatentAnchorContext(strength=0.5, blocks=[0, 1], frames=2, height_tokens=2, width_tokens=2,
+                                energy_threshold=0.0)
+    with pytest.raises(ValueError):
+        _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, latent_anchor=stale)
+
+
+def test_reference_guide_strength_validation():
+    args = _make_args(ltx2_reference_guide_strength=0.8)
+    assert args.ltx2_reference_guide_strength == 0.8
+    assert _make_args().ltx2_reference_guide_strength is None  # off by default
+    with pytest.raises(ValueError):
+        _make_args(ltx2_reference_guide_strength=0.0)
+    with pytest.raises(ValueError):
+        _make_args(ltx2_reference_guide_strength=1.5)
+
+
+def test_guide_prefix_noise_level_matches_comfy_at_sigma_one():
+    """ComfyUI keeps the appended guide frames inside the sampler state and
+    re-blends them every model call (KSamplerX0Inpaint with
+    LTXV.scale_latent_inpaint -> the clean latent):
+    ``x = x * m + clean * (1 - m)``. The denoising stage instead recomputes
+    the prefix in closed form as ``noise * m*sigma + clean * (1 - m*sigma)``;
+    at sigma 1 (where comfy's x is still pure noise) the two agree exactly."""
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+        apply_ltx2_gaussian_noiser, )
+
+    torch.manual_seed(SEED + 30)
+    clean = torch.randn(1, 4, 1, 2, 2)
+    noise = torch.randn_like(clean)
+    mask = 1.0 - 0.8  # noise_mask = 1 - strength
+
+    comfy_first_call = noise * mask + clean * (1.0 - mask)
+    ours = noise * (mask * 1.0) + clean * (1.0 - mask * 1.0)
+    torch.testing.assert_close(ours, comfy_first_call)
+    # Same convention the in-place conditioning path already uses.
+    torch.testing.assert_close(
+        ours,
+        apply_ltx2_gaussian_noiser(noise=noise,
+                                   clean_latent=clean,
+                                   denoise_mask=torch.full_like(clean[:, :1], mask),
+                                   noise_scale=1.0),
+    )
+    # As sigma falls the prefix converges on the clean guide latent.
+    late = noise * (mask * 0.05) + clean * (1.0 - mask * 0.05)
+    assert (late - clean).abs().max() < (ours - clean).abs().max()
+
+
+def test_anchor_reference_image_path_precedence():
+    """The anchor's energy image is resolved separately from the guide so the
+    ComfyUI workflow's two different resizes can both be honoured."""
+    from types import SimpleNamespace
+
+    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
+        resolve_ltx2_anchor_reference_image_path, )
+    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
+
+    args = SimpleNamespace(ltx2_anchor_reference_image_path="engine_anchor.png")
+    batch = ForwardBatch(data_type="dummy")
+    assert resolve_ltx2_anchor_reference_image_path(batch, args) == "engine_anchor.png"
+    batch.ltx2_anchor_reference_image_path = "request_anchor.png"
+    assert resolve_ltx2_anchor_reference_image_path(batch, args) == "request_anchor.png"
+    # Unset everywhere -> "" so the caller falls back to the reference image.
+    batch.ltx2_anchor_reference_image_path = None
+    args.ltx2_anchor_reference_image_path = ""
+    assert resolve_ltx2_anchor_reference_image_path(batch, args) == ""
+
+
 # --- Refine init stage: scale-aware stage-1 resolution -------------------------
 
 

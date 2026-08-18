@@ -256,9 +256,14 @@ class FastVideoArgs:
     ltx2_text_amp_stage: str = "refine"  # base | refine | both
     # Latent anchor identity stabilizer (port of the ComfyUI 10s-nodes
     # LTXLatentAnchorAware; see fastvideo/models/dits/ltx2_anchor.py).
-    # Applied in stage 1 only; eager-only (rejected with torch.compile).
+    # Applied in stage 1 only; torch.compile-compatible (the snapshot cache
+    # is a preallocated buffer driven by torch.where flags).
     # cache_at_step is the sampling-step index at which the per-block anchor
-    # snapshot locks (the ComfyUI workflow's call-counting locks at step 2).
+    # snapshot locks. The ComfyUI node counts MODEL CALLS per block, not
+    # steps: with cache_at_step=6/forwards_per_step=1 its counter reaches 6
+    # on the 7th forward, and the workflow's guider issues 3 forwards per
+    # cfg>1 step (positive + negative + STG-perturbed), so the lock lands on
+    # the first forward of sampler step 2.
     ltx2_anchor_strength: float = 0.0  # 0 = disabled
     ltx2_anchor_blocks: str = "10-30"
     ltx2_anchor_cache_at_step: int = 2
@@ -266,6 +271,12 @@ class FastVideoArgs:
     ltx2_anchor_decay_with_distance: float = 0.15
     ltx2_anchor_energy_threshold: float = 0.3
     ltx2_anchor_frame: int = 0
+    # Energy-map source for the anchor. The ComfyUI workflow feeds the anchor
+    # its OWN resize of the input image (cover-crop to the output WxH),
+    # distinct from the guide image, so keep it separate from
+    # ltx2_reference_image_path. Empty = fall back to the reference image,
+    # then to the first conditioning image.
+    ltx2_anchor_reference_image_path: str = ""
     # Reference token conditioning (port of the ComfyUI 10s-nodes
     # LTXReferenceEnable/Conditioning mechanism): the reference image is
     # VAE-encoded and prepended to the video token sequence as a clean
@@ -274,6 +285,20 @@ class FastVideoArgs:
     ltx2_reference_strength: float = 1.0
     ltx2_reference_position_mode: str = "reference"
     ltx2_reference_zero_timesteps: bool = False
+    # Stage-1 "guide" semantics for the reference prefix (port of comfy core
+    # LTXVAddGuide.append_keyframe, which the workflow's LTXPlusBatchAddGuide
+    # calls). None = today's behaviour: a clean prefix scaled by
+    # ltx2_reference_strength, inheriting the target's token-0 timestep. Set
+    # to a strength s in (0, 1] to instead treat the prefix as an
+    # append_keyframe guide: the latent stays unscaled but is noised to
+    # ``(1 - s) * sigma`` each step and the prefix tokens carry their own
+    # ``(1 - s) * sigma`` timestep (comfy's noise_mask = 1 - strength fed
+    # through LTXAV.process_timestep). Stage 2 is unaffected.
+    # NOT ported: comfy additionally applies a log(s) additive self-attention
+    # bias between guide and non-guide tokens (LTXVModel
+    # _build_guide_self_attention_mask); an O(seq^2) bias mask is
+    # incompatible with the FlashAttention path used here.
+    ltx2_reference_guide_strength: float | None = None
 
     # model paths for correct deallocation
     model_paths: dict[str, str] = field(default_factory=dict)
@@ -411,6 +436,12 @@ class FastVideoArgs:
         if self.ltx2_reference_position_mode not in ("reference", "prefix_continuous"):
             raise ValueError("ltx2_reference_position_mode must be 'reference' or 'prefix_continuous', "
                              f"got {self.ltx2_reference_position_mode!r}")
+        if self.ltx2_reference_guide_strength is not None:
+            guide_strength = float(self.ltx2_reference_guide_strength)
+            if not 0.0 < guide_strength <= 1.0:
+                raise ValueError("ltx2_reference_guide_strength must be in (0, 1] when set, "
+                                 f"got {guide_strength}")
+            self.ltx2_reference_guide_strength = guide_strength
 
     def _resolve_refine_args(self) -> None:
         """Map generic refine_* args to LTX-2-specific refine fields."""

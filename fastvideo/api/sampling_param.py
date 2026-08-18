@@ -158,6 +158,11 @@ class SamplingParam:
     # (a recompile under torch.compile) — keep it consistently set or
     # consistently empty across requests against a compiled engine.
     ltx2_reference_image_path: str | None = None
+    # Per-request latent-anchor energy-map image (ComfyUI feeds the anchor its
+    # own resize of the input, separate from the guide). None falls back to
+    # ``fastvideo_args.ltx2_anchor_reference_image_path``, then to the
+    # reference / first conditioning image. Ignored when the anchor is off.
+    ltx2_anchor_reference_image_path: str | None = None
     ltx2_conditioning_latent_stage1: Any | None = None
     ltx2_conditioning_latent_stage2: Any | None = None
     ltx2_video_conditions: list[tuple[list[str], int, float]] | None = None

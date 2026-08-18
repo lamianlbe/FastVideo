@@ -105,3 +105,69 @@ modes:
 # image_crf_stage2: 0.0    # stage-2 re-anchor CRF (0 = sharp final first frame)
 # last_frame_strength: 0.8
 # negative_prompt: "..."
+
+# --- ComfyUI-parity block -------------------------------------------------
+# Everything below defaults to the server's current behaviour; uncomment the
+# whole block to run the ltx2.3_all_in_one_v2 workflow's actual recipe. Each
+# knob is independent, so they can also be A/B'd one at a time. The sigma
+# schedules and CRFs are NOT part of this block — set those yourself (the
+# workflow has no LTXVPreprocess node at all, i.e. image_crf: 0).
+#
+# 1. First-frame conditioning. The workflow's LTXPlusBatchAddGuide only
+#    APPENDS a guide keyframe (comfy LTXVAddGuide.append_keyframe: extra
+#    tokens at the target's frame-0 RoPE positions, noise_mask = 1 - 0.8);
+#    it never pins latent frame 0. The default here does pin it AND adds a
+#    clean reference prefix, which is the main quality delta.
+#    Not ported: comfy also biases self-attention between guide and non-guide
+#    tokens by log(strength) (~-0.22 here) — an O(seq^2) additive mask that
+#    the FlashAttention path cannot take. Everything else (unscaled guide
+#    latent, per-step noise level (1-strength)*sigma, matching per-token
+#    timestep) is reproduced.
+# stage1_conditioning: guide_only
+# stage1_guide_strength: 0.8
+#
+# 2. Per-step CFG. STGGuiderAdvanced maps sigma -> cfg by lookup (smallest
+#    listed sigma still >= the current one), NOT by step index, and its list
+#    is the RAW ManualSigmas while the sampler runs the eased schedule. Paste
+#    the node's two strings; the engine derives the per-step list for
+#    whatever stage1_sigmas is in force and logs it at startup. For the
+#    shipped 10-step schedule it derives [2, 2, 2, 1.5, 1, 1, 1, 1, 1, 1].
+#    (STG itself stays off: the workflow's stg_layers_indices are all [9999],
+#    so its perturbed pass is a no-op.)
+# stage1_cfg_sigma_list: [1.0, 0.99375, 0.9875, 0.98125, 0.9550, 0.8925, 0.8120,
+#                         0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0]
+# stage1_cfg_values_by_sigma: [2, 1.5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+#
+# 3. Latent anchor (stage 1) + text amplifier (stage 2).
+#    anchor_cache_at_step is a SAMPLER STEP index here, while the ComfyUI
+#    node counts model calls per block: cache_at_step 6 x forwards_per_step 1
+#    means "freeze on the 7th forward", and the workflow's guider issues
+#    three forwards per cfg>1 step (positive + negative + STG-perturbed), so
+#    the freeze lands on the first forward of step 2 — hence 2 below. Our
+#    port has no perturbed pass, so copying 6 across would freeze far later.
+#    The node's other advanced knobs need no equivalent: cache_mode=schedule
+#    and forwards_per_step=1 are exactly this step-index mapping,
+#    cache_warmup=432 is dead (it only applies when no sigmas are wired),
+#    and depth_curve=flat is the identity per-block multiplier we already
+#    use. Also note the anchor takes the workflow's own cover-crop of the
+#    upload as its energy reference, kept separate from the guide image.
+# anchor_strength: 0.11
+# anchor_blocks: "10-30"
+# anchor_cache_at_step: 2
+# anchor_similarity_threshold: 0.5
+# anchor_decay_with_distance: 0.15
+# anchor_energy_threshold: 0.3
+# anchor_frame: 0
+# text_amp_scale: 1.3
+# text_amp_blocks: "36-48"
+# text_amp_spatial_focus: 0.15
+# text_amp_stage: refine
+#
+# 4. Guide-image geometry. The workflow lanczos-resizes the upload so its
+#    LONGER edge is 1536 (aspect kept, nothing cropped) and then lets
+#    LTXVAddGuide.encode stretch it to the mode resolution with a plain
+#    bilinear resize — so a mismatched aspect is squashed, not cropped. The
+#    default cover-crops instead. Only affects the guide/reference (and the
+#    stage-2 in-place keyframe); the anchor keeps its own cover crop.
+# guide_resize: comfy_lanczos_stretch
+# guide_longer_size: 1536

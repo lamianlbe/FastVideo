@@ -109,6 +109,15 @@ def resolve_ltx2_reference_image_path(batch: ForwardBatch, fastvideo_args) -> st
     return batch.ltx2_reference_image_path or fastvideo_args.ltx2_reference_image_path or ""
 
 
+def resolve_ltx2_anchor_reference_image_path(batch: ForwardBatch, fastvideo_args) -> str:
+    """Latent-anchor energy-map image source (same precedence as the
+    reference-token image). Kept separate because the ComfyUI workflow feeds
+    the anchor its own resize of the input, not the guide image. Returns ""
+    so callers can fall back to the reference / conditioning image."""
+    return (getattr(batch, "ltx2_anchor_reference_image_path", None)
+            or getattr(fastvideo_args, "ltx2_anchor_reference_image_path", "") or "")
+
+
 def _resize_and_center_crop(
     tensor: torch.Tensor,
     height: int,
@@ -556,5 +565,6 @@ __all__ = [
     "load_ltx2_conditioning_image",
     "load_ltx2_conditioning_video_clip",
     "post_process_ltx2_denoised",
+    "resolve_ltx2_anchor_reference_image_path",
     "resolve_ltx2_images",
 ]

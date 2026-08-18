@@ -44,6 +44,20 @@ DEFAULT_IMAGE_CRF = 35.0
 # final first frame stays sharp while stage 1 keeps the motion CRF.
 DEFAULT_IMAGE_CRF_STAGE2 = 0.0
 DEFAULT_LAST_FRAME_STRENGTH = 0.8
+# ComfyUI STGGuiderAdvanced picks cfg by SIGMA LOOKUP, not by step index:
+# for the current sigma it takes the smallest entry of its own sigma list
+# that is still >= that sigma and reads the cfg at that entry's index. The
+# node's list is the workflow's RAW ManualSigmas, while the sampler runs the
+# eased schedule, so the effective per-step list has to be derived — see
+# derive_stage1_cfg_values(). These are the workflow's raw values (node
+# 926:944), shipped for reference; the config knobs default to empty (off).
+WORKFLOW_CFG_SIGMA_LIST = [
+    1.0, 0.99375, 0.9875, 0.98125, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0
+]
+WORKFLOW_CFG_VALUES = [2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+# Guide-image longer edge of the workflow's ResizeImageMaskNode (node
+# 926:956, "scale longer dimension" + lanczos).
+DEFAULT_GUIDE_LONGER_SIZE = 1536
 WARMUP_PROMPT = ("A person slowly turns their head toward the camera and smiles, "
                  "soft warm light, gentle camera drift.")
 
@@ -174,6 +188,48 @@ class Ltx23ServerConfig:
     image_crf_stage2: float = DEFAULT_IMAGE_CRF_STAGE2
     last_frame_strength: float = DEFAULT_LAST_FRAME_STRENGTH
 
+    # --- ComfyUI-parity knobs (all default to today's server behaviour) ---
+    # Stage-1 first-frame conditioning:
+    #   inplace_and_reference — hard-pin latent frame 0 to the encoded image
+    #     (strength 1.0) AND prepend a clean reference-token prefix.
+    #   guide_only — the ComfyUI workflow's actual conditioning: no in-place
+    #     write at all, only the appended guide/reference tokens at
+    #     stage1_guide_strength (LTXPlusBatchAddGuide -> LTXVAddGuide
+    #     .append_keyframe, noise_mask = 1 - strength). Stage 2 keeps the
+    #     in-place keyframe at 1.0 either way (= LTXVImgToVideoInplace).
+    stage1_conditioning: str = "inplace_and_reference"
+    stage1_guide_strength: float = 0.8  # node 926:939 strength
+    # Per-step CFG. Give the RAW sigma list + cfg values exactly as they
+    # appear in the STGGuiderAdvanced node; the engine derives the per-step
+    # list for the ACTUAL stage1_sigmas with comfy's sigma lookup and logs
+    # it at startup. Both empty (default) = flat cfg, i.e. today's behaviour.
+    stage1_cfg_sigma_list: list[float] = field(default_factory=list)
+    stage1_cfg_values_by_sigma: list[float] = field(default_factory=list)
+    # Guide-image geometry:
+    #   cover_crop — aspect-preserving resize + center crop to the mode
+    #     resolution (today's behaviour, applied inside the pipeline): an
+    #     upload whose aspect differs from the mode loses its edges.
+    #   comfy_lanczos_stretch — the workflow's path: lanczos resize so the
+    #     LONGER edge is guide_longer_size (aspect preserved, no crop), then
+    #     LTXVAddGuide.encode's plain bilinear resize to the mode resolution
+    #     (comfy.utils.common_upscale with crop="disabled"), i.e. the image
+    #     is squashed rather than cropped when the aspect differs.
+    guide_resize: str = "cover_crop"
+    guide_longer_size: int = DEFAULT_GUIDE_LONGER_SIZE
+    # Latent anchor (LTXLatentAnchorAware, stage 1). 0.0 = off.
+    anchor_strength: float = 0.0
+    anchor_blocks: str = "10-30"
+    anchor_cache_at_step: int = 2
+    anchor_similarity_threshold: float = 0.5
+    anchor_decay_with_distance: float = 0.15
+    anchor_energy_threshold: float = 0.3
+    anchor_frame: int = 0
+    # Text cross-attention amplifier (LTXTextAttentionAmplifier). 1.0 = off.
+    text_amp_scale: float = 1.0
+    text_amp_blocks: str = "36-48"
+    text_amp_spatial_focus: float = 0.15
+    text_amp_stage: str = "refine"  # base | refine | both
+
 
 @dataclass
 class GenerationRequest:
@@ -188,6 +244,47 @@ class GenerationRequest:
     last_in_upscale: bool = True
     image_crf: float = DEFAULT_IMAGE_CRF
     image_crf_stage2: float | None = DEFAULT_IMAGE_CRF_STAGE2
+
+
+def derive_stage1_cfg_values(
+    stage1_sigmas: list[float],
+    cfg_sigma_list: list[float],
+    cfg_values: list[float],
+) -> list[float]:
+    """Per-step CFG for ``stage1_sigmas`` under ComfyUI's sigma lookup.
+
+    Port of ``STGGuiderAdvanced.sigma_to_params_mapping``: for the sigma the
+    sampler is currently at, take the SMALLEST entry of ``cfg_sigma_list``
+    that is still ``>= sigma`` and read ``cfg_values`` at that entry's (first)
+    index; when no entry is >= sigma, comfy falls through to the last cfg
+    value. The lists come from the guider node and are independent of the
+    sampler's schedule, which is why this cannot be a plain zip.
+
+    Returns one value per denoising step (``len(stage1_sigmas) - 1``, the
+    trailing 0.0 is the endpoint, not a step) — the form
+    ``ltx2_stage1_cfg_values`` expects, which FastVideo indexes by step.
+
+    ``cfg_values`` is one shorter than the sigma list in the shipped workflow
+    (13 vs 14); an index that lands past its end is clamped to the last
+    entry (comfy would raise IndexError there — it can only happen at
+    sigma 0, which is never sampled).
+    """
+    if not cfg_sigma_list or not cfg_values:
+        raise ValueError("derive_stage1_cfg_values needs a non-empty sigma list and cfg list")
+    derived: list[float] = []
+    for sigma in stage1_sigmas[:-1]:
+        higher = [s for s in cfg_sigma_list if s >= sigma]
+        idx = cfg_sigma_list.index(min(higher)) if higher else len(cfg_values) - 1
+        derived.append(float(cfg_values[min(idx, len(cfg_values) - 1)]))
+    return derived
+
+
+def resolve_stage1_cfg_values(cfg: Ltx23ServerConfig) -> list[float] | None:
+    """``cfg``'s raw sigma/cfg lists mapped onto its stage-1 schedule, or
+    None when the per-step schedule is off (both lists empty)."""
+    if not cfg.stage1_cfg_sigma_list or not cfg.stage1_cfg_values_by_sigma:
+        return None
+    return derive_stage1_cfg_values(cfg.stage1_sigmas, cfg.stage1_cfg_sigma_list, cfg.stage1_cfg_values_by_sigma)
 
 
 def load_config(path: str | Path) -> Ltx23ServerConfig:
@@ -222,7 +319,47 @@ def load_config(path: str | Path) -> Ltx23ServerConfig:
     cvd = cfg.cuda_visible_devices
     if cvd and not all(p.strip().isdigit() for p in cvd.split(",")):
         raise ValueError(f"{path}: cuda_visible_devices must be comma-separated GPU indices, got {cvd!r}")
+    validate_parity_config(cfg, source=str(path))
     return cfg
+
+
+def validate_parity_config(cfg: Ltx23ServerConfig, source: str = "config") -> None:
+    """Check the ComfyUI-parity knobs (split out so tests can call it on a
+    constructed config without a YAML file)."""
+    if cfg.stage1_conditioning not in ("inplace_and_reference", "guide_only"):
+        raise ValueError(f"{source}: stage1_conditioning must be inplace_and_reference | guide_only, "
+                         f"got {cfg.stage1_conditioning!r}")
+    if not 0.0 < cfg.stage1_guide_strength <= 1.0:
+        raise ValueError(f"{source}: stage1_guide_strength must be in (0, 1], got {cfg.stage1_guide_strength}")
+    if bool(cfg.stage1_cfg_sigma_list) != bool(cfg.stage1_cfg_values_by_sigma):
+        raise ValueError(f"{source}: stage1_cfg_sigma_list and stage1_cfg_values_by_sigma must be set together "
+                         "(both empty disables the per-step CFG schedule)")
+    if cfg.stage1_cfg_sigma_list:
+        sig = cfg.stage1_cfg_sigma_list
+        if any(b > a for a, b in zip(sig, sig[1:], strict=False)):
+            raise ValueError(f"{source}: stage1_cfg_sigma_list must be non-increasing, got {sig}")
+        if any(v < 1.0 for v in cfg.stage1_cfg_values_by_sigma):
+            raise ValueError(f"{source}: stage1_cfg_values_by_sigma entries must be >= 1.0, got "
+                             f"{cfg.stage1_cfg_values_by_sigma}")
+        if len(cfg.stage1_cfg_values_by_sigma) not in (len(sig), len(sig) - 1):
+            raise ValueError(f"{source}: stage1_cfg_values_by_sigma must have len(stage1_cfg_sigma_list) or one "
+                             f"less ({len(sig)} or {len(sig) - 1}), got {len(cfg.stage1_cfg_values_by_sigma)}")
+    if cfg.guide_resize not in ("cover_crop", "comfy_lanczos_stretch"):
+        raise ValueError(f"{source}: guide_resize must be cover_crop | comfy_lanczos_stretch, "
+                         f"got {cfg.guide_resize!r}")
+    if cfg.guide_longer_size < 64:
+        raise ValueError(f"{source}: guide_longer_size must be >= 64, got {cfg.guide_longer_size}")
+    if cfg.anchor_strength < 0.0:
+        raise ValueError(f"{source}: anchor_strength must be >= 0, got {cfg.anchor_strength}")
+    if cfg.anchor_cache_at_step < 0:
+        raise ValueError(f"{source}: anchor_cache_at_step must be >= 0, got {cfg.anchor_cache_at_step}")
+    if cfg.anchor_strength > 0.0 and cfg.anchor_cache_at_step >= len(cfg.stage1_sigmas) - 1:
+        raise ValueError(f"{source}: anchor_cache_at_step={cfg.anchor_cache_at_step} is past the last stage-1 step "
+                         f"({len(cfg.stage1_sigmas) - 2}); the snapshot would never be used")
+    if cfg.text_amp_scale <= 0.0:
+        raise ValueError(f"{source}: text_amp_scale must be > 0, got {cfg.text_amp_scale}")
+    if cfg.text_amp_stage not in ("base", "refine", "both"):
+        raise ValueError(f"{source}: text_amp_stage must be base | refine | both, got {cfg.text_amp_stage!r}")
 
 
 def setup_environment(cfg: Ltx23ServerConfig) -> None:
@@ -240,6 +377,67 @@ def setup_environment(cfg: Ltx23ServerConfig) -> None:
     os.environ.setdefault("FASTVIDEO_FA4_FP8_STAGE1", "1" if cfg.fa4_fp8_stage1 else "0")
     os.environ.setdefault("FASTVIDEO_FA4_FP8_STAGE2", "1" if cfg.fa4_fp8_stage2 else "0")
     os.environ.setdefault("FASTVIDEO_STAGE_LOGGING", "1")
+
+
+def scale_longer_dimension(size: tuple[int, int], longer_size: int) -> tuple[int, int]:
+    """(w, h) scaled so the longer edge is ``longer_size``, aspect preserved.
+    Verbatim rounding of comfy_extras.nodes_post_processing
+    .scale_longer_dimension (used by the workflow's ResizeImageMaskNode)."""
+    width, height = size
+    if height > width:
+        return max(1, round((width / height) * longer_size)), longer_size
+    if width > height:
+        return longer_size, max(1, round((height / width) * longer_size))
+    return longer_size, longer_size
+
+
+def preprocess_guide_image(src: str | Path, dst: str | Path, width: int, height: int, longer_size: int) -> str:
+    """Write the workflow's guide-image pipeline result to ``dst``.
+
+    ComfyUI feeds the guide through ResizeImageMaskNode ("scale longer
+    dimension" ``longer_size``, lanczos — aspect preserved, NO crop) and then
+    LTXVAddGuide.encode resizes to the latent grid with
+    ``common_upscale(..., "bilinear", crop="disabled")``, i.e. a plain
+    non-antialiased stretch. Producing an image that is already exactly
+    ``width x height`` makes the pipeline's own resize + center crop a no-op,
+    so this reproduces both steps without touching fastvideo.
+
+    Deviation from comfy: the intermediate lands in an 8-bit PNG instead of
+    staying a float tensor (comfy's lanczos step also round-trips through
+    uint8, so only the final bilinear result is additionally quantized).
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+
+    image = Image.open(src).convert("RGB")
+    lanczos_size = scale_longer_dimension(image.size, longer_size)
+    # comfy.utils.lanczos == PIL LANCZOS on uint8.
+    image = image.resize(lanczos_size, resample=Image.Resampling.LANCZOS)
+    tensor = torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+    # torch bilinear without antialias — exactly what common_upscale does.
+    tensor = F.interpolate(tensor, size=(height, width), mode="bilinear")
+    array = (tensor[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
+    Image.fromarray(array).save(dst)
+    return str(dst)
+
+
+def preprocess_anchor_image(src: str | Path, dst: str | Path, width: int, height: int) -> str:
+    """Write the latent anchor's own reference resize to ``dst``.
+
+    The workflow gives the anchor a SEPARATE ImageResizeKJv2 (output WxH,
+    upscale_method=area, keep_proportion=crop, crop_position=center,
+    divisible_by 32) — a cover crop, not the guide's stretch. Area resampling
+    is PIL's BOX filter; the mode dims are already the divisible-by-32
+    output size, so no extra rounding is needed here.
+    """
+    from PIL import Image, ImageOps
+
+    image = Image.open(src).convert("RGB")
+    image = ImageOps.fit(image, (width, height), method=Image.Resampling.BOX, centering=(0.5, 0.5))
+    image.save(dst)
+    return str(dst)
 
 
 def match_mode(
@@ -325,6 +523,25 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
             torch_compile_kwargs_vae=torch_compile_kwargs,
         )
 
+    # Per-step CFG derived from the raw guider lists against the ACTUAL
+    # stage-1 schedule (see derive_stage1_cfg_values); logged because the
+    # mapping is a sigma lookup and not obvious from the config.
+    stage1_cfg_values = resolve_stage1_cfg_values(cfg)
+    if stage1_cfg_values is not None:
+        print(f"[engine] stage-1 per-step CFG {stage1_cfg_values} "
+              f"(derived from {len(cfg.stage1_cfg_sigma_list)} guider sigmas over "
+              f"{len(cfg.stage1_sigmas) - 1} steps)")
+    guide_strength = (cfg.stage1_guide_strength if cfg.stage1_conditioning == "guide_only" else None)
+    if guide_strength is not None:
+        print(f"[engine] stage-1 conditioning: guide_only (append-style guide tokens at "
+              f"strength {guide_strength}, no in-place frame-0 pin)")
+    if cfg.anchor_strength > 0.0:
+        print(f"[engine] latent anchor on: strength={cfg.anchor_strength} blocks={cfg.anchor_blocks} "
+              f"cache_at_step={cfg.anchor_cache_at_step}")
+    if cfg.text_amp_scale != 1.0:
+        print(f"[engine] text amplifier on: x{cfg.text_amp_scale} blocks={cfg.text_amp_blocks} "
+              f"stage={cfg.text_amp_stage}")
+
     return VideoGenerator.from_pretrained(
         model_root,
         num_gpus=cfg.num_gpus,
@@ -339,9 +556,24 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
         ltx2_refine_sampler="euler_ancestral_cfg_pp",
         ltx2_stage1_sigmas=cfg.stage1_sigmas,
         ltx2_stage2_sigmas=cfg.stage2_sigmas,
+        ltx2_stage1_cfg_values=stage1_cfg_values,
         ltx2_reference_strength=1.0,
         ltx2_reference_position_mode="reference",
         ltx2_reference_zero_timesteps=False,
+        # None keeps the clean strength-scaled prefix; a float switches
+        # stage 1 to comfy's append_keyframe guide semantics.
+        ltx2_reference_guide_strength=guide_strength,
+        ltx2_anchor_strength=cfg.anchor_strength,
+        ltx2_anchor_blocks=cfg.anchor_blocks,
+        ltx2_anchor_cache_at_step=cfg.anchor_cache_at_step,
+        ltx2_anchor_similarity_threshold=cfg.anchor_similarity_threshold,
+        ltx2_anchor_decay_with_distance=cfg.anchor_decay_with_distance,
+        ltx2_anchor_energy_threshold=cfg.anchor_energy_threshold,
+        ltx2_anchor_frame=cfg.anchor_frame,
+        ltx2_text_amp_scale=cfg.text_amp_scale,
+        ltx2_text_amp_blocks=cfg.text_amp_blocks,
+        ltx2_text_amp_spatial_focus=cfg.text_amp_spatial_focus,
+        ltx2_text_amp_stage=cfg.text_amp_stage,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
         vae_cpu_offload=False,
@@ -363,17 +595,48 @@ def generate_for_mode(
 
     Conditioning images are cover-fit (aspect-preserving resize + center
     crop, no letterboxing) to the mode resolution inside the pipeline, so
-    callers can pass uploads as-is. ``output_path`` is only pipeline path
-    bookkeeping; nothing is written to it."""
+    callers can pass uploads as-is; ``guide_resize: comfy_lanczos_stretch``
+    instead pre-resizes them here the way the ComfyUI workflow does.
+    ``output_path`` is only pipeline path bookkeeping; nothing is written to
+    it — the scratch dir around it does receive the pre-resized inputs."""
     last_latent_idx = (mode.num_frames - 1) // 8
-    images: list[tuple[str, int, float]] = [(request.first_frame_path, 0, 1.0)]
-    if request.last_frame_path:
-        images.append((request.last_frame_path, last_latent_idx, request.last_frame_strength))
-    # None = same keyframes in both stages; a reduced list keeps the tail
-    # anchor out of the stage-2 refine pass.
-    images_stage2 = None
-    if request.last_frame_path and not request.last_in_upscale:
-        images_stage2 = [(request.first_frame_path, 0, 1.0)]
+    workdir = Path(output_path).parent
+    first_path = request.first_frame_path
+    last_path = request.last_frame_path
+    # The anchor's energy map keeps the workflow's own cover-crop of the
+    # ORIGINAL upload even when the guide is stretched (two different resize
+    # nodes feed the two consumers there).
+    anchor_path = ""
+    if cfg.guide_resize == "comfy_lanczos_stretch":
+        first_path = preprocess_guide_image(request.first_frame_path, workdir / "guide_first.png", mode.width,
+                                            mode.height, cfg.guide_longer_size)
+        if last_path:
+            last_path = preprocess_guide_image(last_path, workdir / "guide_last.png", mode.width, mode.height,
+                                               cfg.guide_longer_size)
+        if cfg.anchor_strength > 0.0:
+            anchor_path = preprocess_anchor_image(request.first_frame_path, workdir / "anchor_ref.png", mode.width,
+                                                  mode.height)
+
+    first_keyframe = (first_path, 0, 1.0)
+    tail_keyframe = ((last_path, last_latent_idx, request.last_frame_strength) if last_path else None)
+    if cfg.stage1_conditioning == "guide_only":
+        # Comfy never writes the first frame into the latent: it appends the
+        # guide as extra tokens (handled by the reference prefix below), so
+        # stage 1 only carries the optional FLF tail anchor. Stage 2 still
+        # gets the in-place keyframe = LTXVImgToVideoInplace(strength 1).
+        images: list[tuple[str, int, float]] = [tail_keyframe] if tail_keyframe else []
+        images_stage2: list[tuple[str, int, float]] | None = [first_keyframe]
+        if tail_keyframe and request.last_in_upscale:
+            images_stage2.append(tail_keyframe)
+    else:
+        images = [first_keyframe]
+        if tail_keyframe:
+            images.append(tail_keyframe)
+        # None = same keyframes in both stages; a reduced list keeps the tail
+        # anchor out of the stage-2 refine pass.
+        images_stage2 = None
+        if tail_keyframe and not request.last_in_upscale:
+            images_stage2 = [first_keyframe]
 
     result = generator.generate_video(
         prompt=request.prompt,
@@ -392,8 +655,11 @@ def generate_for_mode(
         ltx2_image_crf_stage2=request.image_crf_stage2,
         # Identity reference tokens always come from the first frame — a
         # constant-on setting so the DiT sequence length (and thus the
-        # compiled graph) never changes between i2v and FLF requests.
-        ltx2_reference_image_path=request.first_frame_path,
+        # compiled graph) never changes between i2v and FLF requests. Under
+        # stage1_conditioning=guide_only this prefix IS the first-frame
+        # conditioning (comfy's appended guide keyframe).
+        ltx2_reference_image_path=first_path,
+        ltx2_anchor_reference_image_path=anchor_path or None,
         ltx2_stg_scale_video=0.0,
         ltx2_stg_scale_audio=0.0,
         ltx2_cfg_scale_video=1.0,

@@ -688,6 +688,14 @@ class LTX2DenoisingStage(PipelineStage):
                    if self.sigmas_override is not None else "ltx2_reference_latent_stage1")
         ref_latent = batch.extra.get(ref_key)
         extra_transformer_kwargs: dict = {}
+        # Stage-1 guide semantics (comfy LTXVAddGuide.append_keyframe): the
+        # prefix is a keyframe at noise level ``ref_noise_mask * sigma``
+        # instead of a clean strength-scaled reference. ``ref_clean`` /
+        # ``ref_noise`` drive the per-step re-noising inside the loop.
+        ref_noise_mask = None
+        ref_clean = None
+        ref_noise = None
+        ref_token_count = 0
         if isinstance(ref_latent, torch.Tensor):
             if wants_vsa_metadata:
                 raise ValueError("LTX-2 reference token conditioning is incompatible with "
@@ -698,8 +706,24 @@ class LTX2DenoisingStage(PipelineStage):
                 "ref_zero_timesteps": fastvideo_args.ltx2_reference_zero_timesteps,
                 "ref_position_mode": fastvideo_args.ltx2_reference_position_mode,
             }
-            logger.info("[LTX2] Reference token conditioning active (%s, mode=%s)", ref_key,
-                        fastvideo_args.ltx2_reference_position_mode)
+            if hasattr(self.transformer, "patchifier"):
+                ref_token_count = self.transformer.patchifier.get_token_count(
+                    VideoLatentShape.from_torch_shape(ref_latent.shape))
+            guide_strength = (fastvideo_args.ltx2_reference_guide_strength if self.sigmas_override is None else None)
+            if guide_strength is not None:
+                ref_noise_mask = 1.0 - float(guide_strength)
+                ref_clean = ref_latent.to(device=latents.device, dtype=torch.float32)
+                guide_generator = None
+                if batch.seed is not None:
+                    guide_generator = torch.Generator(device=latents.device).manual_seed(int(batch.seed) + 4)
+                ref_noise = torch.randn(ref_clean.shape,
+                                        generator=guide_generator,
+                                        device=latents.device,
+                                        dtype=torch.float32)
+                extra_transformer_kwargs["ref_timestep_scale"] = ref_noise_mask
+            logger.info("[LTX2] Reference token conditioning active (%s, mode=%s, %s)", ref_key,
+                        fastvideo_args.ltx2_reference_position_mode,
+                        f"guide strength={guide_strength}" if guide_strength is not None else "clean prefix")
 
         # Text cross-attention amplification (LTXTextAttentionAmplifier port).
         stage_name = "refine" if self.sigmas_override is not None else "base"
@@ -751,6 +775,11 @@ class LTX2DenoisingStage(PipelineStage):
                 energy_threshold=float(fastvideo_args.ltx2_anchor_energy_threshold),
                 anchor_frame=int(fastvideo_args.ltx2_anchor_frame),
                 energy_grid=energy if isinstance(energy, torch.Tensor) else None,
+                # Skip the reference/guide prefix so the anchor grid lines up
+                # with (F, H, W). ComfyUI appends its guide as an extra latent
+                # FRAME, so there the anchor also pulls the guide tokens; here
+                # the prefix is left untouched.
+                token_offset=ref_token_count,
             )
             # Preallocate the snapshot buffers here (outside the compiled
             # forward) so per-step captures are functionalized in-place
@@ -834,13 +863,25 @@ class LTX2DenoisingStage(PipelineStage):
             step_do_cfg_text = (neg_prompt_embeds is not None and (step_cfg_video != 1.0 or step_cfg_audio != 1.0)
                                 if stage1_cfg_values is not None else do_cfg_text)
             step_do_guidance = step_do_cfg_text or do_mod or do_stg
+            anchor_capture_step = False
             if anchor_ctx is not None:
                 # Capture the anchor snapshot at the cache step; use the
                 # frozen buffer on later steps. 0-d bool tensors so the
                 # block forward selects with torch.where (compile-safe).
                 cache_step = int(fastvideo_args.ltx2_anchor_cache_at_step)
-                anchor_ctx.capture = torch.tensor(step_index == cache_step, dtype=torch.bool, device=latents.device)
+                anchor_capture_step = step_index == cache_step
+                anchor_ctx.capture = torch.tensor(anchor_capture_step, dtype=torch.bool, device=latents.device)
                 anchor_ctx.use_cache = torch.tensor(step_index > cache_step, dtype=torch.bool, device=latents.device)
+            if ref_noise_mask is not None:
+                # Guide prefix at this step's noise level. ComfyUI keeps the
+                # guide frames inside the sampler state and re-blends them
+                # with the clean latent every call
+                # (x = x*m + clean*(1-m), LTXV.scale_latent_inpaint returns
+                # the clean latent); the closed form below is that blend's
+                # stationary point and matches it exactly at sigma = 1.
+                ref_level = sigma * ref_noise_mask  # 0-d tensor: no host sync
+                extra_transformer_kwargs["ref_latent"] = (ref_noise * ref_level + ref_clean *
+                                                          (1.0 - ref_level)).to(target_dtype)
             # Per-sample sigma for LTX-2.3 cross-attention AdaLN prompt
             # timestep. Ignored by LTX-2.0 (prompt_adaln is None).
             sigma_batch = sigma.reshape(1).expand(latents.shape[0])
@@ -886,6 +927,13 @@ class LTX2DenoisingStage(PipelineStage):
                 else:
                     pos_denoised = pos_outputs
                     pos_audio = None
+                if anchor_capture_step and anchor_ctx is not None:
+                    # ComfyUI populates the per-block cache on ONE model call
+                    # and every later call in the same step reads it back, so
+                    # the remaining passes of the capture step (negative /
+                    # modality / STG) must not re-freeze a different anchor.
+                    anchor_ctx.capture = torch.tensor(False, dtype=torch.bool, device=latents.device)
+                    anchor_ctx.use_cache = torch.tensor(True, dtype=torch.bool, device=latents.device)
 
                 # Pass 2: unconditional (negative prompt) forward. Needed for
                 # text CFG and, independently, for CFG++'s direction term

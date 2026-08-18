@@ -2907,6 +2907,7 @@ class LTX2Transformer3DModel(BaseDiT):
         ref_latent: torch.Tensor | None = None,
         ref_zero_timesteps: bool = False,
         ref_position_mode: str = "reference",
+        ref_timestep_scale: float | None = None,
         text_amp_weight: torch.Tensor | None = None,
         text_amp_blocks: list[int] | None = None,
         latent_anchor: Any | None = None,
@@ -2923,7 +2924,10 @@ class LTX2Transformer3DModel(BaseDiT):
         # target on the time axis (i2v-prior semantics).
         # ``ref_zero_timesteps=False`` (default) makes the prefix inherit the
         # target's token-0 per-token timestep, matching the ComfyUI patch's
-        # row-0 modulation replication.
+        # row-0 modulation replication; ``ref_timestep_scale`` instead gives
+        # the prefix its own ``scale * sigma`` timestep, which is what comfy's
+        # LTXVAddGuide guide frames get (their noise_mask 1-strength runs
+        # through LTXAV.process_timestep) — see ltx2_reference_guide_strength.
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
         # Get SP parameters
@@ -2977,6 +2981,12 @@ class LTX2Transformer3DModel(BaseDiT):
             ref_timestep = timestep[:, :1].expand(*expand_shape)
             if ref_zero_timesteps:
                 ref_timestep = torch.zeros_like(ref_timestep)
+            elif ref_timestep_scale is not None:
+                # Guide semantics: the prefix carries its own noise level
+                # instead of inheriting token 0 (which is only clean when an
+                # in-place keyframe pins it).
+                ref_sigma = video_sigma.reshape([-1] + [1] * (ref_timestep.dim() - 1))
+                ref_timestep = (ref_sigma * float(ref_timestep_scale)).expand_as(ref_timestep).to(ref_timestep.dtype)
             timestep = torch.cat([ref_timestep, timestep], dim=1)
 
         if latent_anchor is not None:
