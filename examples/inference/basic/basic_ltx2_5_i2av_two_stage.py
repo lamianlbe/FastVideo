@@ -66,6 +66,13 @@ script detects the pre-merged directory from model_index.json
 runs with NO runtime LoRA so nothing is double-applied; --pre-merged forces that
 behavior explicitly.
 
+Benchmarking: ``--warmup`` compiles with the production LTX-2.3 server recipe
+(fullgraph, static shapes — what deployment actually runs, unlike plain
+``--torch-compile`` which leaves torch's defaults), generates once to pay every
+dynamo trace and inductor compile for BOTH stage shapes, then generates again
+and reports that second run as the steady-state time. The warmup output is
+written alongside as ``<output>.warmup.mp4``.
+
 Notes / assumptions pending GPU verification:
   - The recipe's numerical parity against the ComfyUI reference has not yet been
     validated on real weights (the mechanics are the validated 2.3 port; the 2.5
@@ -91,6 +98,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -119,6 +127,16 @@ REFINE_LORA_STRENGTH = 0.5
 # stage dims must divide by 32, so final dims snap to multiples of 64. Override
 # with --height/--width to render larger than the reference recipe.
 FINAL_LONG_SIDE = 1024
+
+# Production LTX-2.3 server compile recipe (examples/inference/ltx23_server):
+# one static graph per shape, no graph breaks. --warmup uses this instead of
+# torch.compile's defaults so the measured steady state matches deployment.
+SERVER_COMPILE_KWARGS = {
+    "backend": "inductor",
+    "fullgraph": True,
+    "mode": "default",
+    "dynamic": False,
+}
 
 
 def _snap(value: float, multiple: int = 64) -> int:
@@ -175,6 +193,11 @@ def parse_args() -> argparse.Namespace:
                              "anchor instead of the actual stage-1 latent token count. The reference "
                              "workflow attaches the latent, so the default (attached) matches it.")
     parser.add_argument("--torch-compile", action="store_true")
+    parser.add_argument("--warmup", action="store_true",
+                        help="Benchmark mode: compile with the production LTX-2.3 server recipe "
+                             "(fullgraph, static shapes), run one throwaway warmup generation to pay "
+                             "the compile cost, then generate again and report the second run's "
+                             "wall time as the steady-state number. Implies --torch-compile.")
     return parser.parse_args()
 
 
@@ -255,11 +278,19 @@ def main() -> None:
         # pipeline builds no LoRA stages at all.
         engine_kwargs["ltx2_stage1_lora_strength"] = float(args.stage1_lora_strength)
         engine_kwargs["ltx2_refine_lora_strength"] = float(args.refine_lora_strength)
-    if args.torch_compile:
+    if args.torch_compile or args.warmup:
         engine_kwargs.update(
             enable_torch_compile=True,
             enable_torch_compile_text_encoder=True,
             enable_torch_compile_vae=True,
+        )
+    if args.warmup:
+        # Match deployment: the server pins every compiled submodule to one
+        # static graph per shape. Plain --torch-compile leaves torch's defaults
+        # (fullgraph=False, dynamic=None), which measures a different thing.
+        engine_kwargs.update(
+            torch_compile_kwargs=dict(SERVER_COMPILE_KWARGS),
+            torch_compile_kwargs_vae=dict(SERVER_COMPILE_KWARGS),
         )
 
     generator = VideoGenerator.from_pretrained(
@@ -278,11 +309,13 @@ def main() -> None:
         ltx2_stage2_sigmas=STAGE2_SIGMAS,
         **engine_kwargs,
     )
-    try:
+    def _generate(target_path: Path) -> float:
+        """One full two-stage generation; returns its wall time in seconds."""
+        started = time.perf_counter()
         generator.generate_video(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
-            output_path=str(output_path),
+            output_path=str(target_path),
             save_video=True,
             seed=args.seed,
             height=height,
@@ -307,7 +340,23 @@ def main() -> None:
             ltx2_stg_scale_video=0.0,
             ltx2_stg_scale_audio=0.0,
         )
+        return time.perf_counter() - started
+
+    try:
+        if args.warmup:
+            # Throwaway pass: pays every dynamo trace / inductor compile for
+            # both stage shapes, then the timed pass measures steady state.
+            warmup_path = output_path.with_name(f"{output_path.stem}.warmup{output_path.suffix}")
+            warmup_seconds = _generate(warmup_path)
+            print(f"[warmup] first (compiling) generation: {warmup_seconds:.1f}s -> {warmup_path}")
+        generation_seconds = _generate(output_path)
         print(f"Two-stage synchronized video+audio written to: {output_path}")
+        if args.warmup:
+            print(f"[warmup] steady-state generation: {generation_seconds:.1f}s "
+                  f"(compile cost paid by the warmup pass: {warmup_seconds - generation_seconds:.1f}s)")
+        else:
+            print(f"Generation wall time: {generation_seconds:.1f}s "
+                  "(includes any compile cost; pass --warmup for a steady-state number)")
     finally:
         generator.shutdown()
 
