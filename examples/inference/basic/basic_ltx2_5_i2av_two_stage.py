@@ -13,7 +13,8 @@ Stage 1 (half resolution, joint AV):
   - sampler euler_ancestral_cfg_pp at cfg=1 (the uncond pass runs every step except the
     degenerate sigma=1.0 first step, whose uncond output ComfyUI itself discards),
   - sigmas from LTXVScheduler(steps=8, max_shift=4.0, base_shift=1.5, stretch=True,
-    terminal=0.1) with the scheduler's no-latent token anchor (4096),
+    terminal=0.1), shifted by the stage-1 latent token count as in the workflow
+    (the node's latent input is attached there),
   - distilled LoRA merged at strength 0.7 (runtime-LoRA mode; see the deployment
     modes below — pre-merged directories run with no runtime LoRA at all).
 
@@ -70,9 +71,11 @@ Notes / assumptions pending GPU verification:
     validated on real weights (the mechanics are the validated 2.3 port; the 2.5
     model family, per-stage LoRA strengths, and the sigma=1.0 CFG++ first step are
     wired per spec and CPU-tested only).
-  - ComfyUI's LTXVScheduler shifts by latent token count when a latent is attached
-    to the node; this script uses the node's detached default (tokens=4096). Pass
-    ``--sigmas-follow-latent`` to shift by the actual stage-1 latent size instead.
+  - The stage-1 token count is derived from the latent grid this script builds,
+    which is the video latent only. The workflow feeds LTXVScheduler the
+    concatenated AV latent, so if that concat widens ``shape[2:]`` the reference
+    shift is marginally larger. Pass ``--sigmas-token-anchor`` for the node's
+    detached tokens=4096 schedule instead.
   - LTX-2.5 additionally supports appended-keyframe conditioning
     (keyframes_mask + use_keyframes_abs_pos_embedding); this script pins the last
     frame inplace (2.3-style) for recipe parity — see docs/inference/ltx2_5.md.
@@ -110,10 +113,12 @@ IMAGE_CRF = 38.0
 STAGE1_LORA_STRENGTH = 0.7
 REFINE_LORA_STRENGTH = 0.5
 
-# Final (stage-2) long side; stage 1 runs at half of this (~1024, the recipe's
-# "input image resized to long side ~1024"). Both stage dims must divide by 32,
-# so final dims snap to multiples of 64.
-FINAL_LONG_SIDE = 2048
+# Final (stage-2) long side, matching the workflow: the conditioning image is
+# resized to long side 1024 and pinned at that size in stage 2, while stage 1
+# denoises the half-resolution latent (~512) that stage 2 upsamples x2. Both
+# stage dims must divide by 32, so final dims snap to multiples of 64. Override
+# with --height/--width to render larger than the reference recipe.
+FINAL_LONG_SIDE = 1024
 
 
 def _snap(value: float, multiple: int = 64) -> int:
@@ -165,10 +170,10 @@ def parse_args() -> argparse.Namespace:
                         help="The transformer already has the distilled LoRA merged offline "
                              "(--transformer-lora at conversion): run BOTH stages on it with no runtime "
                              "LoRA. Auto-detected from model_index.json; pass this to force it.")
-    parser.add_argument("--sigmas-follow-latent", action="store_true",
-                        help="Shift the stage-1 schedule by the actual stage-1 latent token count "
-                             "(ComfyUI LTXVScheduler with its latent input attached) instead of the "
-                             "node's detached tokens=4096 anchor.")
+    parser.add_argument("--sigmas-token-anchor", action="store_true",
+                        help="Shift the stage-1 schedule by LTXVScheduler's detached tokens=4096 "
+                             "anchor instead of the actual stage-1 latent token count. The reference "
+                             "workflow attaches the latent, so the default (attached) matches it.")
     parser.add_argument("--torch-compile", action="store_true")
     return parser.parse_args()
 
@@ -192,8 +197,9 @@ def main() -> None:
         raise SystemExit(f"Final dims must be multiples of 64 (stage 1 runs at half): got {width}x{height}")
 
     stage1_tokens = None
-    if args.sigmas_follow_latent:
+    if not args.sigmas_token_anchor:
         # Stage-1 latent grid: T=(frames-1)//8+1, H/32, W/32 of the HALF resolution.
+        # The workflow feeds this latent to LTXVScheduler, so the shift follows it.
         stage1_tokens = ((args.num_frames - 1) // 8 + 1) * (height // 2 // 32) * (width // 2 // 32)
     stage1_sigmas = compute_ltxv_scheduler_sigmas(
         STAGE1_STEPS, tokens=stage1_tokens, **STAGE1_SCHEDULER_KWARGS).tolist()
