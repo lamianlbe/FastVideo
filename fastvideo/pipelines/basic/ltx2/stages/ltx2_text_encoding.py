@@ -7,6 +7,9 @@ executed on rank 0, and the embeddings are broadcast to all other ranks.
 This avoids I/O contention from all ranks loading the Gemma model simultaneously.
 """
 
+import os
+from typing import Any
+
 import torch
 
 from fastvideo.distributed.parallel_state import get_sp_group
@@ -16,6 +19,32 @@ from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
 from fastvideo.pipelines.stages.text_encoding import TextEncodingStage
 
 logger = init_logger(__name__)
+
+
+def _maybe_dump_prompt_embeds(batch: ForwardBatch) -> None:
+    """Optional parity dump of the encoded conditioning.
+
+    Set FASTVIDEO_LTX2_DUMP_TEXTEMBED=<path> to save the video/audio prompt
+    embeddings this stage produced. Used to diff against the reference
+    ComfyUI encoder (whose conditioning packs both streams into one
+    4096+2048=6144-wide tensor), which is the first bisect point when
+    FastVideo output differs from ComfyUI at identical weights.
+    """
+    path = os.getenv("FASTVIDEO_LTX2_DUMP_TEXTEMBED", "")
+    if not path:
+        return
+    payload: dict[str, Any] = {"prompt": batch.prompt, "negative_prompt": batch.negative_prompt}
+    for name, seq in (("video", batch.prompt_embeds), ("video_neg", batch.negative_prompt_embeds),
+                      ("audio", batch.extra.get("ltx2_audio_prompt_embeds")),
+                      ("audio_neg", batch.extra.get("ltx2_audio_negative_prompt_embeds"))):
+        if not seq:
+            continue
+        for i, tensor in enumerate(seq):
+            if torch.is_tensor(tensor):
+                payload[f"{name}_{i}"] = tensor.detach().float().cpu()
+    torch.save(payload, path)
+    logger.info("[LTX2TextEncodingStage] dumped conditioning to %s (keys=%s)", path,
+                sorted(k for k in payload if not isinstance(payload[k], str)))
 
 
 class LTX2TextEncodingStage(TextEncodingStage):
@@ -55,7 +84,9 @@ class LTX2TextEncodingStage(TextEncodingStage):
 
         # Single GPU or no SP: use parent implementation
         if sp_world_size <= 1:
-            return super().forward(batch, fastvideo_args)
+            batch = super().forward(batch, fastvideo_args)
+            _maybe_dump_prompt_embeds(batch)
+            return batch
 
         # SP enabled: only rank 0 encodes, then broadcasts
         if sp_rank == 0:
