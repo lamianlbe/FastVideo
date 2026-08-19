@@ -6,10 +6,13 @@ audio_vae, vocoder, text_embedding_projection — is untouched by the LoRAs
 (verified: all 1660 LoRA targets live under model.diffusion_model.*), so it
 comes verbatim from the base checkpoint.
 
-Keeps the base's safetensors metadata (the converter reads its `config`
-JSON) and keeps every tensor in its stored dtype, so the converter's
-existing fp8 dequant path handles the merged weights exactly as it would
-the base's.
+Emits bf16: convert_ltx2_weights.py has NO fp8 handling, so any
+F8_E4M3 payload left in the source would be written straight through into
+the converted repo, where FastVideo's DiT loader (which expects bf16 and
+quantizes at load time) cannot use it. Every fp8 weight is therefore
+dequantized here with its `weight_scale` sibling, and the `weight_scale` /
+`comfy_quant` sidecars are dropped. The base's safetensors metadata is kept
+because the converter reads its `config` JSON.
 
 Streaming: peak RAM is one tensor, not the ~29 GB total.
 """
@@ -22,6 +25,7 @@ import torch
 from safetensors import safe_open
 
 DIT_PREFIX = "model.diffusion_model."
+SIDECAR_SUFFIXES = (".weight_scale", ".comfy_quant")
 DTYPE_SIZE = {"F64": 8, "I64": 8, "F32": 4, "I32": 4, "BF16": 2, "F16": 2, "I16": 2,
               "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1}
 
@@ -52,10 +56,13 @@ def main() -> None:
     dit_header, dit_meta = read_header(dit_path)
     base_header, base_meta = read_header(base_path)
 
-    dit_keys = sorted(k for k in dit_header if k.startswith(DIT_PREFIX))
-    stray = sorted(k for k in dit_header if not k.startswith(DIT_PREFIX))
-    rest_keys = sorted(k for k in base_header if not k.startswith(DIT_PREFIX))
-    base_dit = sum(1 for k in base_header if k.startswith(DIT_PREFIX))
+    def payload_keys(header, keep):
+        return sorted(k for k in header if keep(k) and not k.endswith(SIDECAR_SUFFIXES))
+
+    dit_keys = payload_keys(dit_header, lambda k: k.startswith(DIT_PREFIX))
+    stray = payload_keys(dit_header, lambda k: not k.startswith(DIT_PREFIX))
+    rest_keys = payload_keys(base_header, lambda k: not k.startswith(DIT_PREFIX))
+    base_dit = len(payload_keys(base_header, lambda k: k.startswith(DIT_PREFIX)))
 
     print(f"merged DiT export : {len(dit_keys)} tensors" + (f" (+{len(stray)} non-DiT ignored)" if stray else ""))
     print(f"base non-DiT parts: {len(rest_keys)} tensors")
@@ -64,12 +71,20 @@ def main() -> None:
                          "The export must be a complete DiT.")
 
     plan = [(k, dit_header[k], "dit") for k in dit_keys] + [(k, base_header[k], "base") for k in rest_keys]
-    out_header, offset = {}, 0
-    for key, entry, _ in plan:
-        size = nbytes(entry)
-        out_header[key] = {"dtype": entry["dtype"], "shape": entry["shape"],
+    out_header, offset, dequantized = {}, 0, 0
+    for key, entry, src in plan:
+        header = dit_header if src == "dit" else base_header
+        # fp8 payloads become bf16; everything else keeps its stored dtype.
+        if entry["dtype"].startswith("F8_") and f"{key}_scale" in header:
+            dtype = "BF16"
+            dequantized += 1
+        else:
+            dtype = entry["dtype"]
+        size = nbytes({"dtype": dtype, "shape": entry["shape"]})
+        out_header[key] = {"dtype": dtype, "shape": entry["shape"],
                            "data_offsets": [offset, offset + size]}
         offset += size
+    print(f"dequantizing {dequantized} fp8 tensors to bf16")
 
     meta = dict(base_meta)  # carries the `config` JSON the converter parses
     meta["assembled_from"] = json.dumps({"dit": dit_path.name, "base": base_path.name})
@@ -83,7 +98,11 @@ def main() -> None:
         out.write(struct.pack("<Q", len(blob)))
         out.write(blob)
         for i, (key, _, src) in enumerate(plan):
-            tensor = (df if src == "dit" else bf).get_tensor(key)
+            handle = df if src == "dit" else bf
+            tensor = handle.get_tensor(key)
+            if out_header[key]["dtype"] == "BF16" and tensor.dtype != torch.bfloat16:
+                scale = handle.get_tensor(f"{key}_scale").float()
+                tensor = (tensor.float() * scale).to(torch.bfloat16)
             # view(uint8) reinterprets the raw bytes and works for fp8 dtypes,
             # which numpy cannot represent at all.
             out.write(tensor.contiguous().flatten().view(torch.uint8).numpy().tobytes())

@@ -80,6 +80,16 @@ def _shards(component: Path) -> list[Path]:
     return sorted(component.glob("*.safetensors"))
 
 
+def _read_header(path: Path) -> dict[str, dict]:
+    """safetensors JSON header only — no tensor data is read."""
+    import struct
+    with path.open("rb") as f:
+        (length, ) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(length))
+    header.pop("__metadata__", None)
+    return header
+
+
 def check_configs(repo: Path, rep: Report) -> None:
     """Compare architecture configs against the reference 2.3 repo."""
     for name, reference in (("transformer", _ref.TRANSFORMER_REFERENCE),
@@ -108,6 +118,39 @@ def check_configs(repo: Path, rep: Report) -> None:
             f"{len(diffs)} field(s) differ ({len(critical)} architecture-critical)")
         for key, got, expected, is_critical in diffs:
             rep.note(f"{'!! ' if is_critical else '   '}{key}: got {got!r}, reference {expected!r}")
+
+
+def check_storage_format(repo: Path, rep: Report) -> None:
+    """Every component must be plain bf16 with no quantization sidecars.
+
+    convert_ltx2_weights.py has no fp8 handling: an F8_E4M3 payload in its
+    input is written straight through, along with the `weight_scale` /
+    `comfy_quant` siblings. The result loads nowhere useful — FastVideo's DiT
+    loader expects bf16 and quantizes at load time — but nothing errors during
+    conversion, and the only visible symptom is a suspiciously small file
+    (~21 GB instead of ~38 GB for the 22B DiT). Dequantize before converting
+    (see assemble_ltx23_source.py).
+    """
+    for component in sorted(p for p in repo.iterdir() if p.is_dir()):
+        dtypes: dict[str, int] = {}
+        sidecars: list[str] = []
+        for shard in _shards(component):
+            for name, entry in _read_header(shard).items():
+                dtypes[entry["dtype"]] = dtypes.get(entry["dtype"], 0) + 1
+                if name.endswith((".weight_scale", ".weight_scale_2", ".comfy_quant")):
+                    sidecars.append(name)
+        if not dtypes:
+            continue
+        quantized = {d: n for d, n in dtypes.items() if d.startswith(("F8_", "I8", "U8"))}
+        # uint8 legitimately carries packed tokenizer/asset blobs, so only flag
+        # it when quantization sidecars prove it is a quantized payload.
+        if sidecars or (quantized and "U8" not in quantized):
+            rep.fail(f"{component.name} storage format",
+                     f"dtypes={dtypes}, {len(sidecars)} quantization sidecar(s) — not plain bf16")
+            for name in sidecars[:5]:
+                rep.note(name)
+        else:
+            rep.ok(f"{component.name} storage format", f"dtypes={dtypes}")
 
 
 def scan_tensors(repo: Path, rep: Report) -> dict[str, dict[str, float]]:
@@ -267,6 +310,8 @@ def main() -> None:
     rep = Report()
     print(f"Auditing {repo}\n")
     check_configs(repo, rep)
+    print()
+    check_storage_format(repo, rep)
     print()
     stats = scan_tensors(repo, rep)
     print()
