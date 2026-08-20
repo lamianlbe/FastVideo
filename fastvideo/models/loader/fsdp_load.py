@@ -74,6 +74,12 @@ def _maybe_quantize_model(model: nn.Module) -> None:
             convert_model_to_fp4(model)
             return
         if isinstance(qm, FP8QuantizeMethod):
+            if getattr(mod, "_fp8_weight", None) is not None:
+                # Buffers came verbatim from a pre-quantized checkpoint
+                # (attach_prequantized_fp8_layers); nothing to convert. A mix
+                # of pre-quantized and to-be-converted fp8 layers cannot occur
+                # — the attach path rejects construction-time quant methods.
+                return
             logger.info("Converting loaded model weights for FP8 linear layers")
             convert_model_to_fp8(model)
             return
@@ -388,8 +394,56 @@ def load_model_from_full_model_state_dict(
     named_parameters = dict(model.named_parameters())
     named_buffers = dict(model.named_buffers())
     sharded_sd = {}
-    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(full_sd_iterator,
+
+    # Pre-quantized fp8 checkpoints (ComfyUI scaled-fp8 layout): fp8 weight
+    # payloads and their ``.weight_scale`` siblings are diverted out of the
+    # normal load path here — the default flow would silently cast the raw
+    # e4m3 payload into the bf16 parameter WITHOUT its scale. The diverted
+    # pairs are attached verbatim as quantized-runtime buffers below, so the
+    # weights are never dequantized. ``.comfy_quant`` descriptor blobs are
+    # loader hints for ComfyUI itself and are dropped.
+    prequant_payloads: dict[str, torch.Tensor] = {}
+    prequant_scales: dict[str, torch.Tensor] = {}
+
+    def _map_weight_name(source_name: str) -> str:
+        target_name, merge_index, _ = param_names_mapping(source_name)  # type: ignore[misc]
+        if merge_index is not None:
+            raise NotImplementedError(f"pre-quantized fp8 checkpoints cannot feed fused/stacked "
+                                      f"parameters (source key {source_name!r}): each fused shard "
+                                      "carries its own scale")
+        return target_name
+
+    def _divert_prequantized(iterator):
+        for source_name, tensor in iterator:
+            if source_name.endswith(".comfy_quant"):
+                continue
+            if source_name.endswith(".weight_scale"):
+                prequant_scales[_map_weight_name(source_name[:-len("_scale")])] = tensor
+                continue
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                if not source_name.endswith(".weight"):
+                    raise ValueError(f"unexpected fp8 tensor {source_name!r}: only '.weight' payloads "
+                                     "with a '.weight_scale' sibling are supported")
+                prequant_payloads[_map_weight_name(source_name)] = tensor
+                continue
+            yield source_name, tensor
+
+    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(_divert_prequantized(full_sd_iterator),
                                                                            param_names_mapping)  # type: ignore
+
+    prequant_handled: set[str] = set()
+    if prequant_payloads or prequant_scales:
+        if isinstance(model, FSDPModule):
+            raise NotImplementedError("pre-quantized fp8 checkpoints are not supported under FSDP "
+                                      "sharding; load with training/fsdp_inference disabled")
+        from fastvideo.layers.quantization.fp8_config import (
+            attach_prequantized_fp8_layers, )
+        attached = attach_prequantized_fp8_layers(model, prequant_payloads, prequant_scales, device=device)
+        prequant_handled = set(prequant_payloads)
+        logger.info(
+            "Loaded %d pre-quantized fp8 linear layer(s) directly from the "
+            "checkpoint (weights stay fp8; no dequantization).", attached)
+
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
@@ -453,7 +507,7 @@ def load_model_from_full_model_state_dict(
             sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
-    unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
+    unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys()) - prequant_handled
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 

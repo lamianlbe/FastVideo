@@ -961,6 +961,26 @@ class VocoderLoader(ComponentLoader):
         return vocoder.eval()
 
 
+def _checkpoint_has_fp8_payload(safetensors_list: list) -> bool:
+    """Header-only scan: does any shard store F8_E4M3/F8_E5M2 tensors?"""
+    import json as _json
+    import struct as _struct
+    for path in safetensors_list:
+        try:
+            with open(path, "rb") as f:
+                header_len = _struct.unpack("<Q", f.read(8))[0]
+                header = _json.loads(f.read(header_len))
+        except Exception as e:  # noqa: BLE001 - malformed shards fail later with a clearer error
+            logger.warning("Could not scan header of %s: %s", path, e)
+            continue
+        for key, entry in header.items():
+            if key == "__metadata__":
+                continue
+            if str(entry.get("dtype", "")).startswith("F8_"):
+                return True
+    return False
+
+
 def _collect_safetensors_keys(safetensors_list: list) -> set:
     """Collect all weight keys from safetensors files."""
     all_keys: set[str] = set()
@@ -1043,6 +1063,23 @@ class TransformerLoader(ComponentLoader):
             len(safetensors_list),
             safetensors_list,
         )
+
+        # Pre-quantized (ComfyUI scaled-fp8) checkpoints dictate their own
+        # quantization: the fp8 payload + weight_scale pairs are loaded
+        # verbatim into the FP8 runtime (see fsdp_load). Any configured
+        # transformer quant would try to build quantized layers FIRST and
+        # then re-quantize — meaningless on an already-quantized artifact —
+        # so the checkpoint wins and the knob is ignored for this component.
+        if _checkpoint_has_fp8_payload(safetensors_list):
+            if dit_config.quant_config is not None:
+                logger.warning(
+                    "Pre-quantized fp8 checkpoint detected in %s; ignoring the configured "
+                    "transformer quantization (%s) — the checkpoint's fp8 layers load directly.", model_path,
+                    type(dit_config.quant_config).__name__)
+                dit_config.quant_config = None
+            else:
+                logger.info("Pre-quantized fp8 checkpoint detected in %s; fp8 linear layers "
+                            "will run quantized (no dequantization on load).", model_path)
 
         default_dtype = PRECISION_TO_TYPE[fastvideo_args.pipeline_config.dit_precision]
 
