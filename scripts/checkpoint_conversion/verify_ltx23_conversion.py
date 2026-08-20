@@ -90,11 +90,21 @@ def _read_header(path: Path) -> dict[str, dict]:
     return header
 
 
+def _transformer_components(repo: Path) -> list[str]:
+    """"transformer" plus any additional transformer_* directory (e.g. the
+    stage-2 refine DiT written by convert_ltx23_transformer.py)."""
+    names = ["transformer"]
+    names += sorted(p.name for p in repo.iterdir()
+                    if p.is_dir() and p.name.startswith("transformer_") and (p / "config.json").is_file())
+    return names
+
+
 def check_configs(repo: Path, rep: Report) -> None:
     """Compare architecture configs against the reference 2.3 repo."""
-    for name, reference in (("transformer", _ref.TRANSFORMER_REFERENCE),
-                            ("text_encoder", _ref.TEXT_ENCODER_REFERENCE),
-                            ("text_embedding_projection", _ref.TEXT_ENCODER_REFERENCE)):
+    targets = [(name, _ref.TRANSFORMER_REFERENCE) for name in _transformer_components(repo)]
+    targets += [("text_encoder", _ref.TEXT_ENCODER_REFERENCE),
+                ("text_embedding_projection", _ref.TEXT_ENCODER_REFERENCE)]
+    for name, reference in targets:
         path = repo / name / "config.json"
         if not path.is_file():
             rep.fail(f"{name}/config.json", "missing")
@@ -121,34 +131,63 @@ def check_configs(repo: Path, rep: Report) -> None:
 
 
 def check_storage_format(repo: Path, rep: Report) -> None:
-    """Every component must be plain bf16 with no quantization sidecars.
+    """Each component must be plain bf16 — or, for transformer components
+    only, a WELL-FORMED fp8-scaled artifact.
 
-    convert_ltx2_weights.py has no fp8 handling: an F8_E4M3 payload in its
-    input is written straight through, along with the `weight_scale` /
-    `comfy_quant` siblings. The result loads nowhere useful — FastVideo's DiT
-    loader expects bf16 and quantizes at load time — but nothing errors during
-    conversion, and the only visible symptom is a suspiciously small file
-    (~21 GB instead of ~38 GB for the 22B DiT). Dequantize before converting
-    (see assemble_ltx23_source.py).
+    Two failure modes hide here. The historical one: convert_ltx2_weights.py
+    has no fp8 handling, so an F8_E4M3 payload in its input was written
+    straight through along with `weight_scale`/`comfy_quant` siblings into a
+    repo that CLAIMED bf16 (the only visible symptom was a ~21 GB instead of
+    ~38 GB DiT). The new one: fp8-scaled transformers are now a supported
+    deployment format (loaded verbatim into the FP8 runtime), so for
+    transformer* components the check validates the pairing instead of
+    rejecting fp8 — every F8 payload needs exactly one `.weight_scale`
+    sibling, no orphan scales, no leftover `comfy_quant` descriptors, and
+    biases stay bf16 (they are never quantized).
     """
     for component in sorted(p for p in repo.iterdir() if p.is_dir()):
         dtypes: dict[str, int] = {}
-        sidecars: list[str] = []
+        entries: dict[str, dict] = {}
         for shard in _shards(component):
             for name, entry in _read_header(shard).items():
                 dtypes[entry["dtype"]] = dtypes.get(entry["dtype"], 0) + 1
-                if name.endswith((".weight_scale", ".weight_scale_2", ".comfy_quant")):
-                    sidecars.append(name)
+                entries[name] = entry
         if not dtypes:
             continue
-        quantized = {d: n for d, n in dtypes.items() if d.startswith(("F8_", "I8", "U8"))}
-        # uint8 legitimately carries packed tokenizer/asset blobs, so only flag
-        # it when quantization sidecars prove it is a quantized payload.
-        if sidecars or (quantized and "U8" not in quantized):
-            rep.fail(f"{component.name} storage format",
-                     f"dtypes={dtypes}, {len(sidecars)} quantization sidecar(s) — not plain bf16")
-            for name in sidecars[:5]:
-                rep.note(name)
+
+        comfy_quant = [n for n in entries if n.endswith(".comfy_quant")]
+        scales = {n for n in entries if n.endswith((".weight_scale", ".weight_scale_2"))}
+        fp8 = {n for n in entries if entries[n]["dtype"].startswith("F8_")}
+        problems: list[str] = []
+
+        if comfy_quant:
+            problems.append(f"{len(comfy_quant)} comfy_quant descriptor(s) not stripped by conversion")
+        if fp8 and not component.name.startswith("transformer"):
+            problems.append(f"{len(fp8)} fp8 tensor(s) in a non-transformer component")
+        if fp8:
+            unscaled = sorted(n for n in fp8 if f"{n}_scale" not in scales)
+            orphan = sorted(n for n in scales if n.endswith(".weight_scale") and n[:-len("_scale")] not in fp8)
+            if unscaled:
+                problems.append(f"{len(unscaled)} fp8 payload(s) without a weight_scale (e.g. {unscaled[0]})")
+            if orphan:
+                problems.append(f"{len(orphan)} weight_scale(s) without an fp8 payload (e.g. {orphan[0]})")
+            bad_bias = sorted(n for n in entries if n.endswith(".bias") and entries[n]["dtype"] != "BF16")
+            if bad_bias:
+                problems.append(f"{len(bad_bias)} non-bf16 bias(es) (e.g. {bad_bias[0]})")
+        elif scales:
+            problems.append(f"{len(scales)} quantization scale(s) but no fp8 payloads")
+        quantized_other = {d: n for d, n in dtypes.items() if d.startswith("I8")}
+        if quantized_other:
+            problems.append(f"unexpected quantized dtypes {quantized_other}")
+
+        if problems:
+            rep.fail(f"{component.name} storage format", f"dtypes={dtypes}")
+            for line in problems[:6]:
+                rep.note(line)
+        elif fp8:
+            weights = sum(1 for n in entries if n.endswith(".weight"))
+            rep.ok(f"{component.name} storage format",
+                   f"fp8-scaled: {len(fp8)}/{weights} weights quantized (per-tensor scales), rest bf16")
         else:
             rep.ok(f"{component.name} storage format", f"dtypes={dtypes}")
 
@@ -165,8 +204,18 @@ def scan_tensors(repo: Path, rep: Report) -> dict[str, dict[str, float]]:
     for component in sorted(p for p in repo.iterdir() if p.is_dir()):
         for shard in _shards(component):
             with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
                 for key in handle.keys():
+                    if key.endswith((".weight_scale", ".weight_scale_2", ".comfy_quant")):
+                        continue  # sidecars: folded into their payloads below
                     tensor = handle.get_tensor(key).float()
+                    scale_key = f"{key}_scale"
+                    if scale_key in keys:
+                        # fp8-scaled payload: all magnitude checks (zeros, the
+                        # per-block depth profile) must see REAL values, not
+                        # the quantized units.
+                        scale = handle.get_tensor(scale_key).float()
+                        tensor = tensor * (scale if scale.numel() == 1 else scale.reshape(-1, 1))
                     if not torch.isfinite(tensor).all():
                         nonfinite.append(f"{component.name}/{key}")
                         continue
@@ -242,7 +291,12 @@ def check_depth_profile(stats: dict[str, dict[str, float]], rep: Report, sigmas:
 
 
 def check_model_keys(repo: Path, rep: Report) -> None:
-    """Reconcile the transformer checkpoint against the model it will build."""
+    for name in _transformer_components(repo):
+        _check_component_model_keys(repo, name, rep)
+
+
+def _check_component_model_keys(repo: Path, component: str, rep: Report) -> None:
+    """Reconcile one transformer checkpoint against the model it will build."""
     try:
         from fastvideo.configs.models.dits.ltx2 import LTX2VideoConfig
         from fastvideo.models.dits.ltx2 import LTX2Transformer3DModel
@@ -250,7 +304,7 @@ def check_model_keys(repo: Path, rep: Report) -> None:
         rep.note(f"(skipping key reconciliation: fastvideo import failed — {type(err).__name__})")
         return
 
-    config_path = repo / "transformer" / "config.json"
+    config_path = repo / component / "config.json"
     if not config_path.is_file():
         return
     raw = json.loads(config_path.read_text())
@@ -269,9 +323,11 @@ def check_model_keys(repo: Path, rep: Report) -> None:
 
     expected = {k: tuple(v.shape) for k, v in model.state_dict().items()}
     got: dict[str, tuple] = {}
-    for shard in _shards(repo / "transformer"):
+    for shard in _shards(repo / component):
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             for key in handle.keys():
+                if key.endswith((".weight_scale", ".weight_scale_2", ".comfy_quant")):
+                    continue  # runtime sidecars, not model parameters
                 got[key] = tuple(handle.get_slice(key).get_shape())
 
     mapped = {f"model.{k}" if not k.startswith("model.") else k: v for k, v in got.items()}
@@ -281,7 +337,7 @@ def check_model_keys(repo: Path, rep: Report) -> None:
 
     silent = [k for k in missing if any(p in k for p in SILENT_ZERO_FILL_PATTERNS)]
     if missing or mismatch:
-        rep.fail("transformer key reconciliation",
+        rep.fail(f"{component} key reconciliation",
                  f"missing={len(missing)} unexpected={len(unexpected)} shape_mismatch={len(mismatch)}")
         if silent:
             rep.note(f"!! {len(silent)} missing key(s) would be SILENTLY ZERO-FILLED at load:")
@@ -292,7 +348,7 @@ def check_model_keys(repo: Path, rep: Report) -> None:
         for key in mismatch[:8]:
             rep.note(f"shape: {key} model={expected[key]} file={mapped[key]}")
     else:
-        rep.ok("transformer key reconciliation",
+        rep.ok(f"{component} key reconciliation",
                f"{len(expected)} parameters all present with matching shapes")
 
 

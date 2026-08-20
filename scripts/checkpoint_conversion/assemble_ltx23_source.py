@@ -8,10 +8,12 @@ comes verbatim from the base checkpoint.
 
 Emits bf16: convert_ltx2_weights.py has NO fp8 handling, so any
 F8_E4M3 payload left in the source would be written straight through into
-the converted repo, where FastVideo's DiT loader (which expects bf16 and
-quantizes at load time) cannot use it. Every fp8 weight is therefore
+EVERY component of the converted repo. Every fp8 weight is therefore
 dequantized here with its `weight_scale` sibling, and the `weight_scale` /
-`comfy_quant` sidecars are dropped. The base's safetensors metadata is kept
+`comfy_quant` sidecars are dropped. (For a DiT that should STAY fp8-scaled
+— FastVideo now loads that format directly — use
+convert_ltx23_transformer.py on the DiT export instead of this + the full
+converter.) The base's safetensors metadata is kept
 because the converter reads its `config` JSON.
 
 Streaming: peak RAM is one tensor, not the ~29 GB total.
