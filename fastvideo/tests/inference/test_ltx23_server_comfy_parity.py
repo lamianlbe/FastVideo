@@ -140,6 +140,41 @@ def test_cfg_values_may_outnumber_sigmas():
     ))
 
 
+# --- Stage-2 refine transformer resolution -----------------------------------
+
+
+def test_resolve_stage2_transformer(tmp_path):
+    # No override, no conventional dir -> None (share stage 1's weights).
+    assert engine.resolve_stage2_transformer(str(tmp_path)) is None
+    # Conventional <model>/transformer_stage2 is auto-detected.
+    d = tmp_path / "transformer_stage2"
+    d.mkdir()
+    (d / "config.json").write_text("{}")
+    assert engine.resolve_stage2_transformer(str(tmp_path)) == str(d)
+    # A relative override resolves inside the model root; absolute passes through.
+    d2 = tmp_path / "custom_dit"
+    d2.mkdir()
+    (d2 / "config.json").write_text("{}")
+    assert engine.resolve_stage2_transformer(str(tmp_path), "custom_dit") == str(d2)
+    assert engine.resolve_stage2_transformer(str(tmp_path), str(d2)) == str(d2)
+    # An explicit override that does not exist fails at startup, not mid-request.
+    with pytest.raises(FileNotFoundError):
+        engine.resolve_stage2_transformer(str(tmp_path), "missing_dir")
+
+
+def test_transformer_refine_uses_the_transformer_loader():
+    """Regression: transformer_refine used to fall through to the
+    GenericComponentLoader, which cannot build FastVideo DiTs, so a separate
+    stage-2 transformer could never actually load."""
+    from fastvideo.models.loader.component_loader import (
+        ComponentLoader,
+        TransformerLoader,
+    )
+
+    loader = ComponentLoader.for_module_type("transformer_refine", "diffusers")
+    assert isinstance(loader, TransformerLoader)
+
+
 # --- Guide-image geometry ----------------------------------------------------
 
 

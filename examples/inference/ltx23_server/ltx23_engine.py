@@ -114,6 +114,15 @@ class Ltx23ServerConfig:
     model_path: str
     modes: list[Ltx23Mode]
     upsampler_path: str = ""  # "" = auto-detect <model>/spatial_upscaler|spatial_upsampler
+    # Stage-2 (refine) transformer directory. The two ComfyUI passes run
+    # DIFFERENT models (the distilled LoRA is merged at different strengths:
+    # stage 1 at 0.88 video/other + 0.9 audio/cross, stage 2 at 0.58 + 1.0),
+    # so sharing stage 1's weights in the refine pass visibly degrades the
+    # result. "" = auto-detect <model>/transformer_stage2 (or the repo's
+    # model_index.json "fastvideo_refine_transformer_path"), falling back to
+    # the shared stage-1 transformer. Relative paths resolve inside the model
+    # root. Both transformers stay resident on the GPU.
+    stage2_transformer_path: str = ""
     quant: str = "nvfp4"  # nvfp4 | none
     num_gpus: int = 1
     # Which physical GPU(s) this instance runs on, e.g. "1" or "0,1".
@@ -430,6 +439,26 @@ def match_mode(
     return min(modes, key=distance), False
 
 
+def resolve_stage2_transformer(model_root: str, override: str = "") -> str | None:
+    """Stage-2 transformer directory, or None to share stage 1's.
+
+    An explicit override must exist (fail at startup, not mid-request);
+    otherwise probe the conventional <model>/transformer_stage2 directory.
+    The repo-level model_index.json "fastvideo_refine_transformer_path" key
+    is handled by the pipeline itself and needs no engine plumbing."""
+    if override:
+        candidate = Path(override)
+        if not candidate.is_absolute():
+            candidate = Path(model_root) / override
+        if not (candidate / "config.json").is_file():
+            raise FileNotFoundError(f"stage2_transformer_path {override!r}: no config.json under {candidate}")
+        return str(candidate)
+    candidate = Path(model_root) / "transformer_stage2"
+    if (candidate / "config.json").is_file():
+        return str(candidate)
+    return None
+
+
 def resolve_upsampler(model_root: str, override: str = "") -> str:
     candidates = ([override] if override else []) + [
         str(Path(model_root) / "spatial_upscaler"),
@@ -461,6 +490,12 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
 
     model_root = maybe_download_model(cfg.model_path)
     upsampler_path = resolve_upsampler(model_root, cfg.upsampler_path)
+    stage2_transformer_path = resolve_stage2_transformer(model_root, cfg.stage2_transformer_path)
+    if stage2_transformer_path is not None:
+        print(f"[engine] stage-2 refine transformer: {stage2_transformer_path} "
+              "(stage 1 and stage 2 run different merged DiTs)")
+    else:
+        print("[engine] stage-2 refine transformer: shared with stage 1")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
     # Linear quantization ladder (loss high -> none): nvfp4 (e2m1, fastest),
@@ -511,6 +546,7 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
         **compile_kwargs,
         ltx2_refine_enabled=True,
         ltx2_refine_upsampler_path=upsampler_path,
+        ltx2_refine_transformer_path=stage2_transformer_path,
         ltx2_refine_lora_path="",
         ltx2_refine_guidance_scale=1.0,
         ltx2_refine_add_noise=True,

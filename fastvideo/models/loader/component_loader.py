@@ -85,6 +85,10 @@ class ComponentLoader(ABC):
             "audio_scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
             "transformer_ref": (TransformerLoader, "diffusers"),
+            # LTX-2 stage-2 refine transformer (a separately merged DiT for
+            # the second pass). Without this entry the module falls to the
+            # GenericComponentLoader, which cannot build FastVideo DiTs.
+            "transformer_refine": (TransformerLoader, "diffusers"),
             "sr_transformer": (TransformerLoader, "diffusers"),
             "transformer_2": (TransformerLoader, "diffusers"),
             "transformer_3": (TransformerLoader, "diffusers"),
