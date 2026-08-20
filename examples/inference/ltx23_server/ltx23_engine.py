@@ -49,12 +49,15 @@ DEFAULT_LAST_FRAME_STRENGTH = 0.8
 # that is still >= that sigma and reads the cfg at that entry's index. The
 # node's list is the workflow's RAW ManualSigmas, while the sampler runs the
 # eased schedule, so the effective per-step list has to be derived — see
-# derive_stage1_cfg_values(). These are the optimized workflow's raw values
-# (node 926:944; the cfg list is longer than the sigma list there, which is
-# fine — only indices reachable from the sigma list are ever read). Shipped
-# for reference; the config knobs default to empty (off).
+# derive_stage1_cfg_values(). These are the PRODUCTION guider lists (node
+# 926:944 of the original all_in_one_v2 workflow). The near-1.0 entries
+# (0.99375/0.9875/0.98125) are load-bearing: they confine cfg 2 to the
+# first three eased steps. The trimmed "optimized" workflow dropped them by
+# accident, which silently widened cfg>1 from 4 steps to 6 (every eased
+# sigma above 0.9550 then maps to index 0). Shipped for reference; the
+# config knobs default to empty (off).
 WORKFLOW_CFG_SIGMA_LIST = [
-    1.0, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0
+    1.0, 0.99375, 0.9875, 0.98125, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0
 ]
 WORKFLOW_CFG_VALUES = [2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 # Guide-image longer edge of the workflow's ResizeImageMaskNode (node

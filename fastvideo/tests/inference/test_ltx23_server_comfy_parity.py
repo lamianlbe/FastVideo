@@ -28,9 +28,10 @@ def _load_engine():
 
 engine = _load_engine()
 
-# The production stage-1 schedule = the optimized workflow's own sampling
-# schedule: its raw ManualSigmas (WORKFLOW_CFG_SIGMA_LIST) through the
-# Sigmas Easing node (cubic in_out, strength 0.7), 10 steps.
+# The production stage-1 schedule: the raw 10-step ManualSigmas through the
+# Sigmas Easing node (cubic in_out, strength 0.7). The guider's own sigma
+# list (WORKFLOW_CFG_SIGMA_LIST) is longer — it keeps near-1.0 entries
+# precisely to confine cfg 2 to the first three eased steps.
 PRODUCTION_STAGE1_SIGMAS = [
     1.0, 0.99987238, 0.99820748, 0.99001548, 0.96332988, 0.89394948, 0.744596, 0.47298248, 0.20186216, 0.04708576, 0.0
 ]
@@ -50,13 +51,14 @@ def _base_config(**overrides):
 
 
 def test_cfg_derivation_matches_workflow_on_production_schedule():
-    """The load-bearing assertion: the optimized workflow's guider lists
-    mapped onto the shipped 10-step schedule. Steps 1-4 keep cfg 2 because
-    their eased sigmas (0.99987 .. 0.96333) are still above the guider's
-    second entry (0.9550) — a step-index zip would give 1.5/1.0 there."""
+    """The load-bearing assertion: the production guider lists mapped onto
+    the shipped 10-step schedule. Steps 2 and 3 keep cfg 2 because their
+    eased sigmas (0.99987, 0.99821) are still above the guider's second
+    entry (0.99375) — a step-index zip would give 1.5/1.0 there — while the
+    near-1.0 guider entries stop cfg 2 from leaking past step 3."""
     derived = engine.derive_stage1_cfg_values(PRODUCTION_STAGE1_SIGMAS, engine.WORKFLOW_CFG_SIGMA_LIST,
                                               engine.WORKFLOW_CFG_VALUES)
-    assert derived == [2.0, 2.0, 2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0]
+    assert derived == [2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 
 def test_cfg_derivation_lookup_rules():
@@ -82,7 +84,7 @@ def test_resolve_stage1_cfg_values_off_by_default():
         stage1_cfg_sigma_list=engine.WORKFLOW_CFG_SIGMA_LIST,
         stage1_cfg_values_by_sigma=engine.WORKFLOW_CFG_VALUES,
     )
-    assert engine.resolve_stage1_cfg_values(cfg) == [2.0, 2.0, 2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0]
+    assert engine.resolve_stage1_cfg_values(cfg) == [2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 
 # --- Config validation ------------------------------------------------------
@@ -132,11 +134,12 @@ def test_parity_config_rejects_bad_values(overrides):
 
 
 def test_cfg_values_may_outnumber_sigmas():
-    # The optimized workflow's node ships 13 cfg values for 11 sigmas; the
-    # unreachable tail entries must not fail validation.
+    # ComfyUI tolerates a cfg list longer than the sigma list (the extra
+    # tail entries are unreachable); pasting such node strings must not
+    # fail validation.
     engine.validate_parity_config(_base_config(
-        stage1_cfg_sigma_list=engine.WORKFLOW_CFG_SIGMA_LIST,
-        stage1_cfg_values_by_sigma=engine.WORKFLOW_CFG_VALUES,
+        stage1_cfg_sigma_list=[1.0, 0.5, 0.0],
+        stage1_cfg_values_by_sigma=[2.0, 1.5, 1.0, 1.0, 1.0],
     ))
 
 

@@ -140,14 +140,15 @@ modes:
 #    is the RAW ManualSigmas while the sampler runs the eased schedule. Paste
 #    the node's two strings; the engine derives the per-step list for
 #    whatever stage1_sigmas is in force and logs it at startup. For the
-#    production 10-step eased schedule the optimized workflow's lists derive
-#    [2, 2, 2, 2, 2, 1.5, 1, 1, 1, 1]. The node ships more cfg values than
-#    sigmas — the unreachable tail is fine and validated as such.
+#    production 10-step eased schedule these lists derive
+#    [2, 2, 2, 1.5, 1, 1, 1, 1, 1, 1] — the near-1.0 sigma entries confine
+#    cfg 2 to the first three steps; dropping them (as the trimmed
+#    "optimized" workflow accidentally did) widens cfg>1 to six steps.
 #    (STG itself stays off: the workflow's stg_layers_indices are all [9999],
 #    so its perturbed pass is a no-op. The node's cfg_star_rescale=true is
 #    NOT ported yet and matters only on the cfg>1 steps.)
-# stage1_cfg_sigma_list: [1.0, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824,
-#                         0.3618, 0.2412, 0.1206, 0.0]
+# stage1_cfg_sigma_list: [1.0, 0.99375, 0.9875, 0.98125, 0.9550, 0.8925, 0.8120,
+#                         0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0]
 # stage1_cfg_values_by_sigma: [2, 1.5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 #
 # 3. Guide-image geometry. The workflow lanczos-resizes the upload so its
