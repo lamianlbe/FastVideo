@@ -321,6 +321,42 @@ aspect is squashed, not cropped. `comfy_lanczos_stretch` reproduces both
 steps by pre-resizing to exactly the mode resolution, which makes the
 pipeline's own resize + center crop a no-op.
 
+## Weights: two-stage transformers & fp8
+
+The ComfyUI reference runs **different DiTs in the two passes** — the
+distilled LoRA is merged at different strengths per stage (stage 1: 0.88
+video/other + 0.90 audio/cross; stage 2: 0.58 + 1.00). Serving both passes
+from one merged transformer visibly degrades the refine output, so the
+repo can carry a second DiT:
+
+```
+<model>/
+  transformer/          stage-1 merged DiT
+  transformer_stage2/   stage-2 merged DiT   <- auto-detected (or set stage2_transformer_path)
+  ...
+```
+
+Build both from ComfyUI `ModelSave` exports of the two merged models:
+
+```bash
+python scripts/checkpoint_conversion/convert_ltx23_transformer.py \
+    --dit stage1_00001_.safetensors --repo <model> --component transformer
+python scripts/checkpoint_conversion/convert_ltx23_transformer.py \
+    --dit stage2_00001_.safetensors --repo <model> --component transformer_stage2 \
+    --set-refine-path --check-connectors-against stage1_00001_.safetensors
+```
+
+The converter keeps ComfyUI's **fp8-scaled** storage verbatim (fp8 e4m3
+payloads + per-tensor scales for the learned mixed-precision subset, bf16
+for the rest): ~21 GB per DiT instead of ~38 GB, and the loader runs those
+layers quantized with ComfyUI's exact runtime recipe (input scale 1.0 +
+saturating cast, bias fused into the fp8 GEMM) — the same numerics that
+produced the reference videos. `--dequant` emits plain bf16 instead. With
+fp8 repos set `quant: none`; any other `quant` value is ignored per
+component with a warning, because a pre-quantized checkpoint dictates its
+own format. Audit the result with
+`scripts/checkpoint_conversion/verify_ltx23_conversion.py`.
+
 ## Concurrency & recompilation
 
 One GPU pipeline; **generation** is strictly serial (a queue forms under
