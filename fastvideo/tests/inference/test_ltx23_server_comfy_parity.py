@@ -165,6 +165,12 @@ def test_resolve_stage2_transformer(tmp_path):
         engine.resolve_stage2_transformer(str(tmp_path), "missing_dir")
 
 
+def test_stage2_can_be_disabled():
+    cfg = _base_config(stage2_enabled=False)
+    engine.validate_parity_config(cfg)  # no interaction with the parity knobs
+    assert _base_config().stage2_enabled is True  # two-stage remains the default
+
+
 def test_transformer_refine_uses_the_transformer_loader():
     """Regression: transformer_refine used to fall through to the
     GenericComponentLoader, which cannot build FastVideo DiTs, so a separate

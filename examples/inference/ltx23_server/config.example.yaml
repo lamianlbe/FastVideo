@@ -105,6 +105,10 @@ modes:
 # at DIFFERENT strengths per stage, so the two passes are different models).
 # "" auto-detects <model>/transformer_stage2, else shares stage 1's weights.
 # stage2_transformer_path: transformer_stage2
+# Stage-1-only A/B mode: skip upsample + refine, return the decoded stage-1
+# video. Modes are then FINAL resolutions (list the stage-1 dims, e.g.
+# 896x512 instead of 1344x768 for the x1.5 flow).
+# stage2_enabled: false
 # image_crf: 35.0          # stage-1 conditioning CRF ("motion strength")
 # image_crf_stage2: 0.0    # stage-2 re-anchor CRF (0 = sharp final first frame)
 # last_frame_strength: 0.8

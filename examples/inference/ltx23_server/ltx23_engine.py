@@ -126,6 +126,14 @@ class Ltx23ServerConfig:
     # the shared stage-1 transformer. Relative paths resolve inside the model
     # root. Both transformers stay resident on the GPU.
     stage2_transformer_path: str = ""
+    # Stage-1-only mode (A/B & debugging): skip the latent upsample + stage-2
+    # refine pass entirely and return the DECODED STAGE-1 RESULT. The modes
+    # are then the FINAL output resolutions — list the stage-1 resolutions
+    # (e.g. 896x512 for what the x1.5 two-stage flow renders at 1344x768).
+    # The upsampler and the stage-2 transformer are not loaded. Stage-1
+    # graphs are shape-identical to the two-stage flow's stage 1, so the
+    # compile cache mostly hits; only the decode shape is new.
+    stage2_enabled: bool = True
     quant: str = "nvfp4"  # nvfp4 | none
     num_gpus: int = 1
     # Which physical GPU(s) this instance runs on, e.g. "1" or "0,1".
@@ -492,13 +500,19 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
     from fastvideo.utils import maybe_download_model
 
     model_root = maybe_download_model(cfg.model_path)
-    upsampler_path = resolve_upsampler(model_root, cfg.upsampler_path)
-    stage2_transformer_path = resolve_stage2_transformer(model_root, cfg.stage2_transformer_path)
-    if stage2_transformer_path is not None:
-        print(f"[engine] stage-2 refine transformer: {stage2_transformer_path} "
-              "(stage 1 and stage 2 run different merged DiTs)")
+    upsampler_path = None
+    stage2_transformer_path = None
+    if cfg.stage2_enabled:
+        upsampler_path = resolve_upsampler(model_root, cfg.upsampler_path)
+        stage2_transformer_path = resolve_stage2_transformer(model_root, cfg.stage2_transformer_path)
+        if stage2_transformer_path is not None:
+            print(f"[engine] stage-2 refine transformer: {stage2_transformer_path} "
+                  "(stage 1 and stage 2 run different merged DiTs)")
+        else:
+            print("[engine] stage-2 refine transformer: shared with stage 1")
     else:
-        print("[engine] stage-2 refine transformer: shared with stage 1")
+        print("[engine] STAGE 1 ONLY: refine pass disabled — modes are final resolutions, "
+              "upsampler and stage-2 transformer are not loaded")
 
     pipeline_config = PipelineConfig.from_pretrained(model_root)
     # Linear quantization ladder (loss high -> none): nvfp4 (e2m1, fastest),
@@ -547,7 +561,7 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
         num_gpus=cfg.num_gpus,
         pipeline_config=pipeline_config,
         **compile_kwargs,
-        ltx2_refine_enabled=True,
+        ltx2_refine_enabled=cfg.stage2_enabled,
         ltx2_refine_upsampler_path=upsampler_path,
         ltx2_refine_transformer_path=stage2_transformer_path,
         ltx2_refine_lora_path="",
