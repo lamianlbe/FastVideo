@@ -360,28 +360,6 @@ def test_reference_prefix_timestep_scale(tiny_ltx2_model):
                                                      ref_zero_timesteps=True))
 
 
-def test_latent_anchor_with_reference_prefix(tiny_ltx2_model):
-    """The ComfyUI parity recipe runs the anchor AND the guide prefix at the
-    same time, so the anchor's token_offset must skip the prefix (the DiT
-    rejects a mismatch instead of silently misaligning the grid)."""
-    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext
-
-    ref_latent = torch.randn(1, 4, 1, 2, 2, dtype=torch.float32)
-    n_ref_tokens = 1 * 2 * 2
-    ctx = LatentAnchorContext(strength=0.5, blocks=[0, 1], frames=2, height_tokens=2, width_tokens=2,
-                              energy_threshold=0.0, token_offset=n_ref_tokens)
-    with_both = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, latent_anchor=ctx)
-    ref_only = _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent)
-    assert with_both.shape == ref_only.shape
-    assert not torch.allclose(with_both, ref_only)
-    # A stale offset (the pre-prefix default) is a hard error, not a silent
-    # off-by-N over the token grid.
-    stale = LatentAnchorContext(strength=0.5, blocks=[0, 1], frames=2, height_tokens=2, width_tokens=2,
-                                energy_threshold=0.0)
-    with pytest.raises(ValueError):
-        _forward_tiny(tiny_ltx2_model, ref_latent=ref_latent, latent_anchor=stale)
-
-
 def test_reference_guide_strength_validation():
     args = _make_args(ltx2_reference_guide_strength=0.8)
     assert args.ltx2_reference_guide_strength == 0.8
@@ -421,26 +399,6 @@ def test_guide_prefix_noise_level_matches_comfy_at_sigma_one():
     # As sigma falls the prefix converges on the clean guide latent.
     late = noise * (mask * 0.05) + clean * (1.0 - mask * 0.05)
     assert (late - clean).abs().max() < (ours - clean).abs().max()
-
-
-def test_anchor_reference_image_path_precedence():
-    """The anchor's energy image is resolved separately from the guide so the
-    ComfyUI workflow's two different resizes can both be honoured."""
-    from types import SimpleNamespace
-
-    from fastvideo.pipelines.basic.ltx2.stages.ltx2_image_conditioning import (
-        resolve_ltx2_anchor_reference_image_path, )
-    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
-
-    args = SimpleNamespace(ltx2_anchor_reference_image_path="engine_anchor.png")
-    batch = ForwardBatch(data_type="dummy")
-    assert resolve_ltx2_anchor_reference_image_path(batch, args) == "engine_anchor.png"
-    batch.ltx2_anchor_reference_image_path = "request_anchor.png"
-    assert resolve_ltx2_anchor_reference_image_path(batch, args) == "request_anchor.png"
-    # Unset everywhere -> "" so the caller falls back to the reference image.
-    batch.ltx2_anchor_reference_image_path = None
-    args.ltx2_anchor_reference_image_path = ""
-    assert resolve_ltx2_anchor_reference_image_path(batch, args) == ""
 
 
 # --- Refine init stage: scale-aware stage-1 resolution -------------------------
@@ -488,151 +446,6 @@ def test_refine_init_stage_rejects_bad_dims(scale, target):
         LTX2RefineInitStage(spatial_scale=scale).forward(_refine_batch(*target), _refine_args())
 
 
-# --- All-in-one workflow ports: block ranges, text amp, latent anchor ---------
-
-
-def test_parse_block_range():
-    from fastvideo.pipelines.basic.ltx2.stages.ltx2_denoising import parse_block_range
-    assert parse_block_range("36-48", 48) == list(range(36, 48))  # clamped to 47
-    assert parse_block_range("10-30", 48) == list(range(10, 31))
-    assert parse_block_range("1,3,5", 48) == [1, 3, 5]
-    with pytest.raises(ValueError):
-        parse_block_range("50-60", 48)
-
-
-def test_build_text_amp_weight_matches_comfy_math():
-    from fastvideo.pipelines.basic.ltx2.stages.ltx2_denoising import build_text_amp_weight
-    frames, h, w = 2, 5, 7
-    # Uniform path.
-    uni = build_text_amp_weight(scale=1.3, spatial_focus=0.0, frames=frames, height_tokens=h, width_tokens=w,
-                                device=torch.device("cpu"), dtype=torch.float32)
-    assert uni.shape == (1, frames * h * w, 1)
-    assert torch.allclose(uni, torch.full_like(uni, 1.3))
-    # Spatial path: reference math inline (comfy _build_spatial_weight).
-    amp = build_text_amp_weight(scale=1.3, spatial_focus=0.15, frames=frames, height_tokens=h, width_tokens=w,
-                                device=torch.device("cpu"), dtype=torch.float32)
-    sigma_g = max(0.3, 1.0 - 0.7 * 0.15) * min(h, w)
-    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
-    dy = torch.arange(h, dtype=torch.float32) - cy
-    dx = torch.arange(w, dtype=torch.float32) - cx
-    dist_sq = dy[:, None]**2 + dx[None, :]**2
-    g = torch.exp(-dist_sq / (2 * sigma_g * sigma_g))
-    g = (g - g.min()) / (g.max() - g.min() + 1e-6)
-    expected = (1.0 + 0.3 * g).reshape(-1).repeat(frames).reshape(1, -1, 1)
-    torch.testing.assert_close(amp, expected)
-    # Center gets full amplification, farthest corner none, all frames equal.
-    grid0 = amp[0, :h * w, 0].reshape(h, w)
-    grid1 = amp[0, h * w:, 0].reshape(h, w)
-    torch.testing.assert_close(grid0, grid1)
-    assert grid0[h // 2, w // 2] == pytest.approx(1.3, abs=1e-5)
-    assert grid0[0, 0] == pytest.approx(1.0, abs=1e-5)
-
-
-def _ref_anchor_pull(x_grid, anchor_flat, anchor_mean, *, strength, sim_thr, decay, anchor_idx, energy=None,
-                     energy_thr=0.0):
-    """Inline reference of the ComfyUI anchor math for a [1,F,H,W,D] grid."""
-    b, f, h, w, d = x_grid.shape
-    n = f * h * w
-    frame_mean = x_grid.mean(dim=(2, 3), keepdim=True)
-    centered_all = (x_grid - frame_mean).reshape(b, n, d)
-    centered_anchor = anchor_flat - anchor_mean
-    import torch.nn.functional as TF
-    sim = torch.bmm(TF.normalize(centered_all, dim=-1, eps=1e-6),
-                    TF.normalize(centered_anchor, dim=-1, eps=1e-6).transpose(1, 2))
-    best_sim, best_idx = sim.max(dim=-1)
-    gathered = torch.gather(anchor_flat, 1, best_idx.unsqueeze(-1).expand(-1, -1, d))
-    mask = torch.sigmoid((best_sim - sim_thr) * 8.0).reshape(b, f, h, w, 1)
-    if energy is not None and energy_thr > 0:
-        mask = mask * torch.sigmoid((energy - energy_thr) * 16.0).reshape(1, 1, h, w, 1)
-    dist = (torch.arange(f, dtype=torch.float32) - anchor_idx).abs() / max(1, f - 1)
-    fs = strength * (1.0 - decay * dist).clamp(min=0.0)
-    fs[anchor_idx] = 0.0
-    diff = gathered.reshape(b, f, h, w, d) - x_grid
-    return x_grid + fs.view(1, f, 1, 1, 1) * mask * diff
-
-
-def test_latent_anchor_matches_reference_math():
-    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext, apply_latent_anchor
-    torch.manual_seed(SEED + 10)
-    f, h, w, d = 4, 3, 5, 8
-    x = torch.randn(1, f * h * w, d, dtype=torch.float32)
-    energy = torch.rand(h, w)
-    ctx = LatentAnchorContext(strength=0.11, blocks=[0], frames=f, height_tokens=h, width_tokens=w,
-                              energy_grid=energy, energy_threshold=0.3)
-    out = apply_latent_anchor(x, ctx, block_idx=0)
-
-    grid = x.reshape(1, f, h, w, d)
-    anchor_flat = grid[:, 0].reshape(1, h * w, d)
-    anchor_mean = anchor_flat.mean(dim=1, keepdim=True)
-    expected = _ref_anchor_pull(grid, anchor_flat, anchor_mean, strength=0.11, sim_thr=0.5, decay=0.15, anchor_idx=0,
-                                energy=energy, energy_thr=0.3).reshape(1, -1, d)
-    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
-    # Anchor frame itself is never pulled.
-    torch.testing.assert_close(out[0, :h * w], x[0, :h * w])
-
-
-def test_latent_anchor_snapshot_cache():
-    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext, apply_latent_anchor
-    torch.manual_seed(SEED + 11)
-    f, h, w, d = 3, 2, 2, 4
-    k = h * w
-    # Compile-safe cache: preallocated buffers + 0-d bool tensor flags.
-    ctx = LatentAnchorContext(strength=0.2, blocks=[5], frames=f, height_tokens=h, width_tokens=w,
-                              energy_threshold=0.0, slot_of={5: 0},
-                              anchor_buf=torch.zeros(1, k, d), anchor_mean_buf=torch.zeros(1, 1, d))
-    # Capture step (use_cache False, capture True): freeze x1's anchor frame.
-    x1 = torch.randn(1, f * k, d)
-    ctx.capture = torch.tensor(True)
-    ctx.use_cache = torch.tensor(False)
-    apply_latent_anchor(x1, ctx, block_idx=5)
-    snap = x1.reshape(1, f, h, w, d)[:, 0].reshape(1, k, d)
-    torch.testing.assert_close(ctx.anchor_buf[0], snap[0])  # buffer holds x1's anchor tokens
-    # Later step (use_cache True, capture False): pull toward the SNAPSHOT,
-    # not x2's own anchor frame.
-    x2 = torch.randn(1, f * k, d)
-    ctx.capture = torch.tensor(False)
-    ctx.use_cache = torch.tensor(True)
-    out2 = apply_latent_anchor(x2, ctx, block_idx=5)
-    grid2 = x2.reshape(1, f, h, w, d)
-    expected = _ref_anchor_pull(grid2, snap, snap.mean(dim=1, keepdim=True), strength=0.2, sim_thr=0.5,
-                                decay=0.15, anchor_idx=0).reshape(1, -1, d)
-    torch.testing.assert_close(out2, expected, rtol=1e-5, atol=1e-6)
-    # Buffer untouched by the use-step (capture False).
-    torch.testing.assert_close(ctx.anchor_buf[0], snap[0])
-
-
-def test_latent_anchor_prefix_and_mismatch():
-    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext, apply_latent_anchor
-    torch.manual_seed(SEED + 12)
-    f, h, w, d = 2, 2, 3, 4
-    n_ref = h * w
-    ctx = LatentAnchorContext(strength=0.3, blocks=[0], frames=f, height_tokens=h, width_tokens=w,
-                              energy_threshold=0.0, token_offset=n_ref)
-    x = torch.randn(1, n_ref + f * h * w, d)
-    out = apply_latent_anchor(x, ctx, block_idx=0)
-    torch.testing.assert_close(out[:, :n_ref], x[:, :n_ref])  # prefix untouched
-    assert not torch.allclose(out[:, n_ref:], x[:, n_ref:])
-    # Grid mismatch -> silent passthrough.
-    bad = torch.randn(1, 7, d)
-    ctx2 = LatentAnchorContext(strength=0.3, blocks=[0], frames=f, height_tokens=h, width_tokens=w)
-    torch.testing.assert_close(apply_latent_anchor(bad, ctx2, block_idx=0), bad)
-
-
-def test_tiny_dit_accepts_amp_and_anchor(tiny_ltx2_model):
-    from fastvideo.models.dits.ltx2_anchor import LatentAnchorContext
-    base = _forward_tiny(tiny_ltx2_model)
-    amp = torch.full((1, 8, 1), 1.5, dtype=torch.float32)
-    out_amp = _forward_tiny(tiny_ltx2_model, text_amp_weight=amp, text_amp_blocks=[0, 1])
-    assert out_amp.shape == base.shape
-    assert not torch.allclose(out_amp, base)
-
-    ctx = LatentAnchorContext(strength=0.5, blocks=[0, 1], frames=2, height_tokens=2, width_tokens=2,
-                              energy_threshold=0.0)
-    out_anchor = _forward_tiny(tiny_ltx2_model, latent_anchor=ctx)
-    assert out_anchor.shape == base.shape
-    assert not torch.allclose(out_anchor, base)
-
-
 def test_stage1_cfg_values_validation():
     args = _make_args(ltx2_stage1_cfg_values=[2.0, 1.5, 1.0])
     assert args.ltx2_stage1_cfg_values == [2.0, 1.5, 1.0]
@@ -640,10 +453,6 @@ def test_stage1_cfg_values_validation():
         _make_args(ltx2_stage1_cfg_values=[0.5])
     with pytest.raises(ValueError):
         _make_args(ltx2_stage1_cfg_values=[])
-    with pytest.raises(ValueError):
-        _make_args(ltx2_text_amp_stage="stage3")
-    with pytest.raises(ValueError):
-        _make_args(ltx2_anchor_strength=-0.1)
 
 
 def test_ancestral_repin_preserves_conditioned_frame():

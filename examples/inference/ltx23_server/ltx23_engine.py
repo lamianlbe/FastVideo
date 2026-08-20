@@ -49,10 +49,12 @@ DEFAULT_LAST_FRAME_STRENGTH = 0.8
 # that is still >= that sigma and reads the cfg at that entry's index. The
 # node's list is the workflow's RAW ManualSigmas, while the sampler runs the
 # eased schedule, so the effective per-step list has to be derived — see
-# derive_stage1_cfg_values(). These are the workflow's raw values (node
-# 926:944), shipped for reference; the config knobs default to empty (off).
+# derive_stage1_cfg_values(). These are the optimized workflow's raw values
+# (node 926:944; the cfg list is longer than the sigma list there, which is
+# fine — only indices reachable from the sigma list are ever read). Shipped
+# for reference; the config knobs default to empty (off).
 WORKFLOW_CFG_SIGMA_LIST = [
-    1.0, 0.99375, 0.9875, 0.98125, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0
+    1.0, 0.9550, 0.8925, 0.8120, 0.7150, 0.6030, 0.4824, 0.3618, 0.2412, 0.1206, 0.0
 ]
 WORKFLOW_CFG_VALUES = [2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 # Guide-image longer edge of the workflow's ResizeImageMaskNode (node
@@ -221,19 +223,6 @@ class Ltx23ServerConfig:
     #     is squashed rather than cropped when the aspect differs.
     guide_resize: str = "cover_crop"
     guide_longer_size: int = DEFAULT_GUIDE_LONGER_SIZE
-    # Latent anchor (LTXLatentAnchorAware, stage 1). 0.0 = off.
-    anchor_strength: float = 0.0
-    anchor_blocks: str = "10-30"
-    anchor_cache_at_step: int = 2
-    anchor_similarity_threshold: float = 0.5
-    anchor_decay_with_distance: float = 0.15
-    anchor_energy_threshold: float = 0.3
-    anchor_frame: int = 0
-    # Text cross-attention amplifier (LTXTextAttentionAmplifier). 1.0 = off.
-    text_amp_scale: float = 1.0
-    text_amp_blocks: str = "36-48"
-    text_amp_spatial_focus: float = 0.15
-    text_amp_stage: str = "refine"  # base | refine | both
 
 
 @dataclass
@@ -346,25 +335,17 @@ def validate_parity_config(cfg: Ltx23ServerConfig, source: str = "config") -> No
         if any(v < 1.0 for v in cfg.stage1_cfg_values_by_sigma):
             raise ValueError(f"{source}: stage1_cfg_values_by_sigma entries must be >= 1.0, got "
                              f"{cfg.stage1_cfg_values_by_sigma}")
-        if len(cfg.stage1_cfg_values_by_sigma) not in (len(sig), len(sig) - 1):
-            raise ValueError(f"{source}: stage1_cfg_values_by_sigma must have len(stage1_cfg_sigma_list) or one "
-                             f"less ({len(sig)} or {len(sig) - 1}), got {len(cfg.stage1_cfg_values_by_sigma)}")
+        if len(cfg.stage1_cfg_values_by_sigma) < len(sig) - 1:
+            # The workflow's node ships MORE cfg values than sigmas (extra
+            # tail entries are unreachable) — that is fine. Fewer than
+            # len(sigmas) - 1 would leave reachable indices unmapped.
+            raise ValueError(f"{source}: stage1_cfg_values_by_sigma needs at least len(stage1_cfg_sigma_list) - 1 "
+                             f"entries ({len(sig) - 1}), got {len(cfg.stage1_cfg_values_by_sigma)}")
     if cfg.guide_resize not in ("cover_crop", "comfy_lanczos_stretch"):
         raise ValueError(f"{source}: guide_resize must be cover_crop | comfy_lanczos_stretch, "
                          f"got {cfg.guide_resize!r}")
     if cfg.guide_longer_size < 64:
         raise ValueError(f"{source}: guide_longer_size must be >= 64, got {cfg.guide_longer_size}")
-    if cfg.anchor_strength < 0.0:
-        raise ValueError(f"{source}: anchor_strength must be >= 0, got {cfg.anchor_strength}")
-    if cfg.anchor_cache_at_step < 0:
-        raise ValueError(f"{source}: anchor_cache_at_step must be >= 0, got {cfg.anchor_cache_at_step}")
-    if cfg.anchor_strength > 0.0 and cfg.anchor_cache_at_step >= len(cfg.stage1_sigmas) - 1:
-        raise ValueError(f"{source}: anchor_cache_at_step={cfg.anchor_cache_at_step} is past the last stage-1 step "
-                         f"({len(cfg.stage1_sigmas) - 2}); the snapshot would never be used")
-    if cfg.text_amp_scale <= 0.0:
-        raise ValueError(f"{source}: text_amp_scale must be > 0, got {cfg.text_amp_scale}")
-    if cfg.text_amp_stage not in ("base", "refine", "both"):
-        raise ValueError(f"{source}: text_amp_stage must be base | refine | both, got {cfg.text_amp_stage!r}")
 
 
 def setup_environment(cfg: Ltx23ServerConfig) -> None:
@@ -425,23 +406,6 @@ def preprocess_guide_image(src: str | Path, dst: str | Path, width: int, height:
     tensor = F.interpolate(tensor, size=(height, width), mode="bilinear")
     array = (tensor[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
     Image.fromarray(array).save(dst)
-    return str(dst)
-
-
-def preprocess_anchor_image(src: str | Path, dst: str | Path, width: int, height: int) -> str:
-    """Write the latent anchor's own reference resize to ``dst``.
-
-    The workflow gives the anchor a SEPARATE ImageResizeKJv2 (output WxH,
-    upscale_method=area, keep_proportion=crop, crop_position=center,
-    divisible_by 32) — a cover crop, not the guide's stretch. Area resampling
-    is PIL's BOX filter; the mode dims are already the divisible-by-32
-    output size, so no extra rounding is needed here.
-    """
-    from PIL import Image, ImageOps
-
-    image = Image.open(src).convert("RGB")
-    image = ImageOps.fit(image, (width, height), method=Image.Resampling.BOX, centering=(0.5, 0.5))
-    image.save(dst)
     return str(dst)
 
 
@@ -540,13 +504,6 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
     if guide_strength is not None:
         print(f"[engine] stage-1 conditioning: guide_only (append-style guide tokens at "
               f"strength {guide_strength}, no in-place frame-0 pin)")
-    if cfg.anchor_strength > 0.0:
-        print(f"[engine] latent anchor on: strength={cfg.anchor_strength} blocks={cfg.anchor_blocks} "
-              f"cache_at_step={cfg.anchor_cache_at_step}")
-    if cfg.text_amp_scale != 1.0:
-        print(f"[engine] text amplifier on: x{cfg.text_amp_scale} blocks={cfg.text_amp_blocks} "
-              f"stage={cfg.text_amp_stage}")
-
     return VideoGenerator.from_pretrained(
         model_root,
         num_gpus=cfg.num_gpus,
@@ -569,17 +526,6 @@ def create_generator(cfg: Ltx23ServerConfig) -> Any:
         # None keeps the clean strength-scaled prefix; a float switches
         # stage 1 to comfy's append_keyframe guide semantics.
         ltx2_reference_guide_strength=guide_strength,
-        ltx2_anchor_strength=cfg.anchor_strength,
-        ltx2_anchor_blocks=cfg.anchor_blocks,
-        ltx2_anchor_cache_at_step=cfg.anchor_cache_at_step,
-        ltx2_anchor_similarity_threshold=cfg.anchor_similarity_threshold,
-        ltx2_anchor_decay_with_distance=cfg.anchor_decay_with_distance,
-        ltx2_anchor_energy_threshold=cfg.anchor_energy_threshold,
-        ltx2_anchor_frame=cfg.anchor_frame,
-        ltx2_text_amp_scale=cfg.text_amp_scale,
-        ltx2_text_amp_blocks=cfg.text_amp_blocks,
-        ltx2_text_amp_spatial_focus=cfg.text_amp_spatial_focus,
-        ltx2_text_amp_stage=cfg.text_amp_stage,
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
         vae_cpu_offload=False,
@@ -609,19 +555,12 @@ def generate_for_mode(
     workdir = Path(output_path).parent
     first_path = request.first_frame_path
     last_path = request.last_frame_path
-    # The anchor's energy map keeps the workflow's own cover-crop of the
-    # ORIGINAL upload even when the guide is stretched (two different resize
-    # nodes feed the two consumers there).
-    anchor_path = ""
     if cfg.guide_resize == "comfy_lanczos_stretch":
         first_path = preprocess_guide_image(request.first_frame_path, workdir / "guide_first.png", mode.width,
                                             mode.height, cfg.guide_longer_size)
         if last_path:
             last_path = preprocess_guide_image(last_path, workdir / "guide_last.png", mode.width, mode.height,
                                                cfg.guide_longer_size)
-        if cfg.anchor_strength > 0.0:
-            anchor_path = preprocess_anchor_image(request.first_frame_path, workdir / "anchor_ref.png", mode.width,
-                                                  mode.height)
 
     first_keyframe = (first_path, 0, 1.0)
     tail_keyframe = ((last_path, last_latent_idx, request.last_frame_strength) if last_path else None)
@@ -665,7 +604,6 @@ def generate_for_mode(
         # stage1_conditioning=guide_only this prefix IS the first-frame
         # conditioning (comfy's appended guide keyframe).
         ltx2_reference_image_path=first_path,
-        ltx2_anchor_reference_image_path=anchor_path or None,
         ltx2_stg_scale_video=0.0,
         ltx2_stg_scale_audio=0.0,
         ltx2_cfg_scale_video=1.0,

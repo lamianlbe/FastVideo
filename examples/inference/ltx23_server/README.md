@@ -270,19 +270,21 @@ connection-refused.
 
 ## ComfyUI-parity knobs
 
-The reference `ltx2.3_all_in_one_v2` ComfyUI workflow differs from this
-server in four places beyond the sigma schedules. Each difference is a
-config knob whose **default is the server's existing behaviour**, so they
-can be A/B'd one at a time; `config.example.yaml` ships them as one
-commented block that can be uncommented wholesale. None of them change the
-compiled shapes.
+The reference ComfyUI workflow (`optimized.json`, the trimmed successor of
+`ltx2.3_all_in_one_v2`) differs from this server in three places beyond the
+sigma schedules. Each difference is a config knob whose **default is the
+server's existing behaviour**, so they can be A/B'd one at a time;
+`config.example.yaml` ships them as one commented block that can be
+uncommented wholesale. None of them change the compiled shapes. (The old
+workflow's LatentAnchorAware / TextAttentionAmplifier ports were removed
+after A/B showed no visible effect; the optimized workflow drops both
+nodes.)
 
 | Knob | Default | ComfyUI-parity value |
 |---|---|---|
 | `stage1_conditioning` / `stage1_guide_strength` | `inplace_and_reference` | `guide_only` / `0.8` |
+| `guide_attention_bias` | `false` | `true` (log-strength self-attn bias) |
 | `stage1_cfg_sigma_list` + `stage1_cfg_values_by_sigma` | empty (flat cfg) | the guider node's two lists |
-| `anchor_strength` … `anchor_frame` | `0.0` (off) | `0.11`, blocks `10-30`, cache step `2` |
-| `text_amp_scale` … `text_amp_stage` | `1.0` (off) | `1.3`, blocks `36-48`, focus `0.15`, `refine` |
 | `guide_resize` / `guide_longer_size` | `cover_crop` | `comfy_lanczos_stretch` / `1536` |
 
 **Stage-1 conditioning.** The workflow's `LTXPlusBatchAddGuide` calls comfy
@@ -295,9 +297,10 @@ prefix to guide semantics (unscaled latent, per-step noise level
 `(1 - strength) * sigma`, matching per-token timestep). Stage 2 keeps its
 in-place keyframe at 1.0 either way — that already matches
 `LTXVImgToVideoInplace`. FLF (`last_frame`) requests keep the tail anchor
-in stage 1 unchanged. Not ported: comfy additionally applies a
-`log(strength)` additive self-attention bias between guide and non-guide
-tokens, which needs an O(seq²) mask the FlashAttention path cannot take.
+in stage 1 unchanged. Comfy additionally applies a `log(strength)` additive
+self-attention bias between guide and non-guide tokens; `guide_attention_bias:
+true` ports it, at the cost of routing stage-1 attn1 through masked SDPA
+instead of FA4 (O(seq²) bias tensor).
 
 **Per-step CFG.** `STGGuiderAdvanced` selects cfg by *sigma lookup* — the
 smallest sigma in its own list that is still ≥ the sampler's current sigma
@@ -306,21 +309,9 @@ sampler runs. Paste the node's two strings into
 `stage1_cfg_sigma_list` / `stage1_cfg_values_by_sigma`; the engine derives
 the per-step list for whatever `stage1_sigmas` is configured and prints it
 at startup. STG itself stays off — the workflow's `stg_layers_indices` are
-all `[9999]`, so its perturbed pass is a numerical no-op.
-
-**Anchor + text amplifier.** `anchor_cache_at_step` is a *sampler step*
-index, whereas the ComfyUI node counts model calls per block: its
-`cache_at_step: 6` with `forwards_per_step: 1` freezes on the 7th forward,
-and the workflow's guider issues three forwards per cfg>1 step (positive,
-negative, STG-perturbed), so the freeze lands on the first forward of step
-2. Copying `6` across would freeze far later here, since this pipeline has
-no perturbed pass. The node's remaining advanced knobs need no equivalent:
-`cache_mode: schedule` + `forwards_per_step: 1` *is* the step-index
-mapping, `cache_warmup: 432` is dead when a sigma list is wired, and
-`depth_curve: flat` is the identity per-block multiplier already used. The
-anchor's energy reference keeps the workflow's own cover crop of the
-upload even when `guide_resize` is set, matching the two separate resize
-nodes there.
+all `[9999]`, so its perturbed pass is a numerical no-op. The node's
+`cfg_star_rescale: true` is not ported yet; it only affects the cfg>1
+steps.
 
 **Guide geometry.** The workflow lanczos-resizes the upload so its *longer*
 edge is 1536 (aspect preserved, nothing cropped) and then lets

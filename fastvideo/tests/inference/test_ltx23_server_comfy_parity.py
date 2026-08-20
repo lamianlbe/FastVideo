@@ -28,15 +28,11 @@ def _load_engine():
 
 engine = _load_engine()
 
-# The user's production stage-1 schedule: the workflow's 14-value eased list
-# with the three redundant ~1.0 entries dropped (10 steps).
+# The production stage-1 schedule = the optimized workflow's own sampling
+# schedule: its raw ManualSigmas (WORKFLOW_CFG_SIGMA_LIST) through the
+# Sigmas Easing node (cubic in_out, strength 0.7), 10 steps.
 PRODUCTION_STAGE1_SIGMAS = [
     1.0, 0.99987238, 0.99820748, 0.99001548, 0.96332988, 0.89394948, 0.744596, 0.47298248, 0.20186216, 0.04708576, 0.0
-]
-# The full eased schedule the workflow itself samples (13 steps).
-WORKFLOW_EASED_SIGMAS = [
-    1.0, 0.99999966, 0.99999731, 0.99999088, 0.99987238, 0.99820755, 0.99001548, 0.96332759, 0.89394745, 0.74462,
-    0.4729813, 0.20186096, 0.04708573, 0.0
 ]
 
 
@@ -54,19 +50,13 @@ def _base_config(**overrides):
 
 
 def test_cfg_derivation_matches_workflow_on_production_schedule():
-    """The load-bearing assertion: the workflow's guider lists mapped onto
-    the shipped 10-step schedule. Steps 1 and 2 keep cfg 2 because their
-    sigmas (0.99987, 0.99821) are still above the guider's second entry
-    (0.99375) — a step-index zip would give 1.5 and 1.0 there."""
+    """The load-bearing assertion: the optimized workflow's guider lists
+    mapped onto the shipped 10-step schedule. Steps 1-4 keep cfg 2 because
+    their eased sigmas (0.99987 .. 0.96333) are still above the guider's
+    second entry (0.9550) — a step-index zip would give 1.5/1.0 there."""
     derived = engine.derive_stage1_cfg_values(PRODUCTION_STAGE1_SIGMAS, engine.WORKFLOW_CFG_SIGMA_LIST,
                                               engine.WORKFLOW_CFG_VALUES)
-    assert derived == [2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-
-
-def test_cfg_derivation_matches_workflow_on_its_own_schedule():
-    derived = engine.derive_stage1_cfg_values(WORKFLOW_EASED_SIGMAS, engine.WORKFLOW_CFG_SIGMA_LIST,
-                                              engine.WORKFLOW_CFG_VALUES)
-    assert derived == [2.0] * 6 + [1.5] + [1.0] * 6
+    assert derived == [2.0, 2.0, 2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0]
 
 
 def test_cfg_derivation_lookup_rules():
@@ -92,7 +82,7 @@ def test_resolve_stage1_cfg_values_off_by_default():
         stage1_cfg_sigma_list=engine.WORKFLOW_CFG_SIGMA_LIST,
         stage1_cfg_values_by_sigma=engine.WORKFLOW_CFG_VALUES,
     )
-    assert engine.resolve_stage1_cfg_values(cfg) == [2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    assert engine.resolve_stage1_cfg_values(cfg) == [2.0, 2.0, 2.0, 2.0, 2.0, 1.5, 1.0, 1.0, 1.0, 1.0]
 
 
 # --- Config validation ------------------------------------------------------
@@ -104,8 +94,6 @@ def test_shipped_defaults_keep_todays_behaviour():
     assert cfg.stage1_conditioning == "inplace_and_reference"
     assert cfg.stage1_cfg_sigma_list == [] and cfg.stage1_cfg_values_by_sigma == []
     assert cfg.guide_resize == "cover_crop"
-    assert cfg.anchor_strength == 0.0  # anchor off
-    assert cfg.text_amp_scale == 1.0  # amplifier off
     assert cfg.stage1_sigmas == engine.DEFAULT_STAGE1_SIGMAS
     assert cfg.stage2_sigmas == engine.DEFAULT_STAGE2_SIGMAS
     assert cfg.image_crf == engine.DEFAULT_IMAGE_CRF
@@ -118,8 +106,6 @@ def test_full_parity_config_validates():
         stage1_cfg_sigma_list=engine.WORKFLOW_CFG_SIGMA_LIST,
         stage1_cfg_values_by_sigma=engine.WORKFLOW_CFG_VALUES,
         guide_resize="comfy_lanczos_stretch",
-        anchor_strength=0.11,
-        text_amp_scale=1.3,
     )
     engine.validate_parity_config(cfg)
 
@@ -135,13 +121,9 @@ def test_full_parity_config_validates():
         {"stage1_cfg_sigma_list": [0.5, 1.0], "stage1_cfg_values_by_sigma": [2.0]},   # not decreasing
         {"stage1_cfg_sigma_list": [1.0, 0.0], "stage1_cfg_values_by_sigma": [0.5]},   # cfg < 1
         {"stage1_cfg_sigma_list": [1.0, 0.5, 0.0], "stage1_cfg_values_by_sigma": []},  # empty pair half
+        {"stage1_cfg_sigma_list": [1.0, 0.5, 0.2, 0.0], "stage1_cfg_values_by_sigma": [2.0, 1.5]},  # too few values
         {"guide_resize": "letterbox"},                          # unknown mode
         {"guide_longer_size": 32},                              # too small
-        {"anchor_strength": -0.1},                              # negative
-        {"anchor_cache_at_step": -1},                           # negative
-        {"anchor_strength": 0.11, "anchor_cache_at_step": 9},   # past the last step
-        {"text_amp_scale": 0.0},                                # must be > 0
-        {"text_amp_stage": "stage3"},                           # unknown stage
     ],
 )
 def test_parity_config_rejects_bad_values(overrides):
@@ -149,12 +131,13 @@ def test_parity_config_rejects_bad_values(overrides):
         engine.validate_parity_config(_base_config(**overrides))
 
 
-def test_anchor_cache_step_bound_tracks_the_schedule():
-    # The default schedule has 10 sigmas = 9 steps (indices 0..8), so a
-    # capture at index 9 would never be read back.
-    engine.validate_parity_config(_base_config(anchor_strength=0.11, anchor_cache_at_step=8))
-    with pytest.raises(ValueError):
-        engine.validate_parity_config(_base_config(anchor_strength=0.11, anchor_cache_at_step=9))
+def test_cfg_values_may_outnumber_sigmas():
+    # The optimized workflow's node ships 13 cfg values for 11 sigmas; the
+    # unreachable tail entries must not fail validation.
+    engine.validate_parity_config(_base_config(
+        stage1_cfg_sigma_list=engine.WORKFLOW_CFG_SIGMA_LIST,
+        stage1_cfg_values_by_sigma=engine.WORKFLOW_CFG_VALUES,
+    ))
 
 
 # --- Guide-image geometry ----------------------------------------------------
@@ -193,17 +176,6 @@ def test_guide_resize_stretches_without_cropping(tmp_path):
     assert result.shape == (768, 1344, 3)
     assert result[0, 0, 0] > result[0, 0, 1]  # red marker still in the corner
     assert result[0, -1, 1] > result[0, -1, 0]  # green marker still in the corner
-
-
-def test_anchor_resize_cover_crops(tmp_path):
-    np = pytest.importorskip("numpy")
-    from PIL import Image
-
-    src = tmp_path / "src.png"
-    Image.fromarray(_checker(1200, 600)).save(src)
-    out = engine.preprocess_anchor_image(src, tmp_path / "anchor.png", 1344, 768)
-    result = np.asarray(Image.open(out).convert("RGB"))
-    assert result.shape == (768, 1344, 3)
 
 
 def test_guide_resize_is_identity_for_matching_aspect(tmp_path):
